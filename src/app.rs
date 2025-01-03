@@ -12,8 +12,10 @@ pub(crate) fn run(process_mode: ProcessMode) -> windows::core::Result<()> {
 
     match process_mode {
         ProcessMode::Main => {
-            let _message_window = MessageWindow::create()?;
-            println!("CursorPeek main/STA foundation initialized with a message-only window.");
+            let message_window = MessageWindow::create()?;
+            message_window.request_shutdown()?;
+            message_window.run_message_loop()?;
+            println!("CursorPeek main/STA foundation processed its message loop.");
         }
         ProcessMode::PreviewWorker => {
             println!(

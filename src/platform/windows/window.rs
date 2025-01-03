@@ -10,19 +10,21 @@ use windows::{
         Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
         System::LibraryLoader::GetModuleHandleW,
         UI::WindowsAndMessaging::{
-            CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, UnregisterClassW,
-            HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
+            CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
+            PostMessageW, RegisterClassW, TranslateMessage, UnregisterClassW, HWND_MESSAGE, MSG,
+            WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WNDCLASSW,
         },
     },
 };
 
 #[cfg(test)]
-use windows::Win32::UI::WindowsAndMessaging::{IsWindow, SendMessageW, WM_APP};
+use windows::Win32::UI::WindowsAndMessaging::IsWindow;
 
 const CLASS_NAME: PCWSTR = w!("CursorPeek.MessageWindow");
+const SHUTDOWN_MESSAGE: u32 = WM_APP + 1;
 
 #[cfg(test)]
-const TEST_PANIC_MESSAGE: u32 = WM_APP + 1;
+const TEST_PANIC_MESSAGE: u32 = WM_APP + 2;
 
 pub(crate) struct MessageWindow {
     hwnd: HWND,
@@ -59,6 +61,39 @@ impl MessageWindow {
             _class: class,
             _thread_affinity: PhantomData,
         })
+    }
+
+    pub(crate) fn request_shutdown(&self) -> Result<()> {
+        // SAFETY: `self.hwnd` is owned by this live MessageWindow. The private message carries no
+        // pointers or borrowed data, so its parameters remain valid until the queue processes it.
+        unsafe { PostMessageW(self.hwnd, SHUTDOWN_MESSAGE, WPARAM(0), LPARAM(0)) }
+    }
+
+    pub(crate) fn run_message_loop(self) -> Result<()> {
+        let mut message = MSG::default();
+
+        loop {
+            // SAFETY: `message` is valid writable storage for the duration of the call. No HWND or
+            // range filter is used, so this thread's complete queue is serviced.
+            let status = unsafe { GetMessageW(&mut message, None, 0, 0) };
+            if status.0 < 0 {
+                return Err(Error::from_win32());
+            }
+            if status.0 == 0 {
+                return Ok(());
+            }
+
+            if message.hwnd == self.hwnd && message.message == SHUTDOWN_MESSAGE {
+                return Ok(());
+            }
+
+            // SAFETY: `message` was populated by a successful GetMessageW call and remains valid
+            // through translation and synchronous dispatch on this owning thread.
+            unsafe {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
     }
 
     #[cfg(test)]
@@ -143,7 +178,7 @@ fn dispatch_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) ->
 
 #[cfg(test)]
 mod tests {
-    use super::{IsWindow, MessageWindow, SendMessageW, LRESULT, TEST_PANIC_MESSAGE};
+    use super::{IsWindow, MessageWindow, PostMessageW, LPARAM, TEST_PANIC_MESSAGE, WPARAM};
     use std::thread;
 
     #[test]
@@ -155,13 +190,17 @@ mod tests {
             // SAFETY: `first_handle` belongs to the live window on this test thread.
             assert!(unsafe { IsWindow(first_handle).as_bool() });
 
-            // SAFETY: The synchronous test message is sent to a live window on this thread. The
-            // callback deliberately panics inside its catch_unwind boundary and must return zero.
-            let panic_result =
-                unsafe { SendMessageW(first_handle, TEST_PANIC_MESSAGE, None, None) };
-            assert_eq!(panic_result, LRESULT(0));
-
-            drop(first);
+            // SAFETY: The live window owns the receiving queue and this private message carries
+            // only zero-valued parameters. Dispatch deliberately panics inside the WNDPROC's
+            // catch_unwind boundary.
+            unsafe { PostMessageW(first_handle, TEST_PANIC_MESSAGE, WPARAM(0), LPARAM(0)) }
+                .expect("the callback test message should be queued");
+            first
+                .request_shutdown()
+                .expect("the shutdown message should be queued");
+            first
+                .run_message_loop()
+                .expect("the queued messages should be pumped");
 
             // SAFETY: Checking a stale HWND with IsWindow is the documented validity probe.
             assert!(!unsafe { IsWindow(first_handle).as_bool() });
