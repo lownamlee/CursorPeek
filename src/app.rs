@@ -1,6 +1,6 @@
 use crate::{
     mode::ProcessMode,
-    platform::{ApartmentKind, ComApartment},
+    platform::{ApartmentKind, ComApartment, MessageWindow},
 };
 
 pub(crate) fn run(process_mode: ProcessMode) -> windows::core::Result<()> {
@@ -12,7 +12,8 @@ pub(crate) fn run(process_mode: ProcessMode) -> windows::core::Result<()> {
 
     match process_mode {
         ProcessMode::Main => {
-            println!("CursorPeek foundation initialized in main/STA mode.");
+            let _message_window = MessageWindow::create()?;
+            println!("CursorPeek main/STA foundation initialized with a message-only window.");
         }
         ProcessMode::PreviewWorker => {
             println!(
