@@ -4,6 +4,10 @@ use std::{
     rc::Rc,
 };
 
+#[cfg(test)]
+use super::input::registered_raw_mouse;
+use super::input::RawMouseInputRegistration;
+
 use windows::{
     core::{w, Error, Result, PCWSTR},
     Win32::{
@@ -28,6 +32,7 @@ const TEST_PANIC_MESSAGE: u32 = WM_APP + 2;
 
 pub(crate) struct MessageWindow {
     hwnd: HWND,
+    raw_mouse_input: Option<RawMouseInputRegistration>,
     _class: RegisteredWindowClass,
     _thread_affinity: PhantomData<Rc<()>>,
 }
@@ -56,11 +61,15 @@ impl MessageWindow {
             )?
         };
 
-        Ok(Self {
+        let mut window = Self {
             hwnd,
+            raw_mouse_input: None,
             _class: class,
             _thread_affinity: PhantomData,
-        })
+        };
+        window.raw_mouse_input = Some(RawMouseInputRegistration::register(hwnd)?);
+
+        Ok(window)
     }
 
     pub(crate) fn request_shutdown(&self) -> Result<()> {
@@ -104,8 +113,11 @@ impl MessageWindow {
 
 impl Drop for MessageWindow {
     fn drop(&mut self) {
-        // SAFETY: The owner is !Send and therefore drops on the creating thread. The HWND was
-        // returned by CreateWindowExW and is destroyed before `_class` is dropped/unregistered.
+        drop(self.raw_mouse_input.take());
+
+        // SAFETY: The owner is !Send and therefore drops on the creating thread. Raw Input has
+        // already been unregistered, and the HWND returned by CreateWindowExW is destroyed before
+        // `_class` is dropped/unregistered.
         unsafe {
             let _ = DestroyWindow(self.hwnd);
         }
@@ -178,8 +190,12 @@ fn dispatch_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) ->
 
 #[cfg(test)]
 mod tests {
-    use super::{IsWindow, MessageWindow, PostMessageW, LPARAM, TEST_PANIC_MESSAGE, WPARAM};
+    use super::{
+        registered_raw_mouse, IsWindow, MessageWindow, PostMessageW, LPARAM, TEST_PANIC_MESSAGE,
+        WPARAM,
+    };
     use std::thread;
+    use windows::Win32::UI::Input::RIDEV_INPUTSINK;
 
     #[test]
     fn message_window_lifecycle_and_callback_boundary_are_sound() {
@@ -189,6 +205,11 @@ mod tests {
 
             // SAFETY: `first_handle` belongs to the live window on this test thread.
             assert!(unsafe { IsWindow(first_handle).as_bool() });
+            let first_registration = registered_raw_mouse()
+                .expect("the process registration should be queryable")
+                .expect("the raw mouse should be registered");
+            assert_eq!(first_registration.hwndTarget, first_handle);
+            assert_eq!(first_registration.dwFlags, RIDEV_INPUTSINK);
 
             // SAFETY: The live window owns the receiving queue and this private message carries
             // only zero-valued parameters. Dispatch deliberately panics inside the WNDPROC's
@@ -204,6 +225,12 @@ mod tests {
 
             // SAFETY: Checking a stale HWND with IsWindow is the documented validity probe.
             assert!(!unsafe { IsWindow(first_handle).as_bool() });
+            assert!(
+                registered_raw_mouse()
+                    .expect("the process registration should be queryable")
+                    .is_none(),
+                "raw mouse input should be unregistered before window teardown"
+            );
 
             for _ in 0..100 {
                 let window = MessageWindow::create()
@@ -212,10 +239,21 @@ mod tests {
 
                 // SAFETY: `handle` belongs to the live window on this test thread.
                 assert!(unsafe { IsWindow(handle).as_bool() });
+                let registration = registered_raw_mouse()
+                    .expect("the process registration should be queryable")
+                    .expect("the raw mouse should be registered");
+                assert_eq!(registration.hwndTarget, handle);
+                assert_eq!(registration.dwFlags, RIDEV_INPUTSINK);
                 drop(window);
 
                 // SAFETY: Checking a stale HWND with IsWindow is the documented validity probe.
                 assert!(!unsafe { IsWindow(handle).as_bool() });
+                assert!(
+                    registered_raw_mouse()
+                        .expect("the process registration should be queryable")
+                        .is_none(),
+                    "raw mouse input should be removed on every lifecycle"
+                );
             }
         })
         .join()
