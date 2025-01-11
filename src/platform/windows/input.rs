@@ -1,22 +1,89 @@
-use std::{marker::PhantomData, mem::size_of, rc::Rc};
+use std::{
+    marker::PhantomData,
+    mem::{size_of, MaybeUninit},
+    rc::Rc,
+};
 
 use windows::{
-    core::Result,
+    core::{Error, Result},
     Win32::{
-        Foundation::HWND,
+        Foundation::{HWND, LPARAM},
         UI::Input::{
-            RegisterRawInputDevices, RAWINPUTDEVICE, RAWINPUTDEVICE_FLAGS, RIDEV_INPUTSINK,
-            RIDEV_REMOVE,
+            GetRawInputData, RegisterRawInputDevices, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT,
+            RAWINPUTDEVICE, RAWINPUTDEVICE_FLAGS, RAWINPUTHEADER, RAWMOUSE, RIDEV_INPUTSINK,
+            RIDEV_REMOVE, RID_INPUT, RIM_TYPEMOUSE,
         },
     },
 };
 
 #[cfg(test)]
-use windows::{core::Error, Win32::UI::Input::GetRegisteredRawInputDevices};
+use windows::Win32::UI::Input::GetRegisteredRawInputDevices;
 
 const GENERIC_DESKTOP_USAGE_PAGE: u16 = 0x01;
 const MOUSE_USAGE: u16 = 0x02;
 const RAW_INPUT_DEVICE_SIZE: u32 = size_of::<RAWINPUTDEVICE>() as u32;
+const RAW_INPUT_SIZE: u32 = size_of::<RAWINPUT>() as u32;
+const RAW_INPUT_HEADER_SIZE: u32 = size_of::<RAWINPUTHEADER>() as u32;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct RawMouseActivity {
+    moved: bool,
+    button_or_wheel: bool,
+}
+
+impl RawMouseActivity {
+    fn from_mouse(mouse: RAWMOUSE) -> Self {
+        // SAFETY: RAWMOUSE defines `Anonymous.Anonymous` as the active view of the buttons
+        // union. Reading it does not depend on a separate tag, and the complete RAWMOUSE value
+        // was initialized before this classifier is called.
+        let button_flags = unsafe { mouse.Anonymous.Anonymous.usButtonFlags };
+
+        Self {
+            moved: mouse.usFlags.0 & MOUSE_MOVE_ABSOLUTE.0 != 0
+                || mouse.lLastX != 0
+                || mouse.lLastY != 0,
+            button_or_wheel: button_flags != 0,
+        }
+    }
+}
+
+pub(super) fn read_raw_mouse_activity(lparam: LPARAM) -> Result<Option<RawMouseActivity>> {
+    let handle = HRAWINPUT(lparam.0 as _);
+    let mut raw_input = MaybeUninit::<RAWINPUT>::uninit();
+    let mut buffer_size = RAW_INPUT_SIZE;
+
+    // SAFETY: WM_INPUT supplies `lparam` as a borrowed HRAWINPUT valid while this callback runs.
+    // `raw_input` is correctly aligned, has RAW_INPUT_SIZE writable bytes, and remains alive for
+    // the call. `buffer_size` is initialized to that capacity, and RAW_INPUT_HEADER_SIZE is the
+    // exact generated header size. The returned byte count is checked before initialization.
+    let copied = unsafe {
+        GetRawInputData(
+            handle,
+            RID_INPUT,
+            Some(raw_input.as_mut_ptr().cast()),
+            &mut buffer_size,
+            RAW_INPUT_HEADER_SIZE,
+        )
+    };
+
+    if copied == u32::MAX {
+        return Err(Error::from_win32());
+    }
+    if copied != RAW_INPUT_SIZE || buffer_size != RAW_INPUT_SIZE {
+        return Ok(None);
+    }
+
+    // SAFETY: GetRawInputData reported that it initialized every byte of the fixed RAWINPUT
+    // destination. Short writes were rejected above.
+    let raw_input = unsafe { raw_input.assume_init() };
+    if raw_input.header.dwSize != RAW_INPUT_SIZE || raw_input.header.dwType != RIM_TYPEMOUSE.0 {
+        return Ok(None);
+    }
+
+    // SAFETY: The validated RAWINPUT header identifies the active union member as RAWMOUSE.
+    let mouse = unsafe { raw_input.data.mouse };
+    Ok(Some(RawMouseActivity::from_mouse(mouse)))
+}
 
 pub(super) struct RawMouseInputRegistration {
     _thread_affinity: PhantomData<Rc<()>>,
@@ -92,5 +159,95 @@ pub(super) fn registered_raw_mouse() -> Result<Option<RAWINPUTDEVICE>> {
             return Err(error);
         }
         capacity = count;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RawMouseActivity;
+    use windows::Win32::UI::{
+        Input::{MOUSE_MOVE_ABSOLUTE, MOUSE_MOVE_RELATIVE, RAWMOUSE, RAWMOUSE_0, RAWMOUSE_0_0},
+        WindowsAndMessaging::{RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_WHEEL},
+    };
+
+    #[test]
+    fn empty_relative_packet_has_no_activity() {
+        assert_eq!(
+            RawMouseActivity::from_mouse(raw_mouse(MOUSE_MOVE_RELATIVE, 0, 0, 0)),
+            RawMouseActivity::default()
+        );
+    }
+
+    #[test]
+    fn relative_and_absolute_packets_report_movement() {
+        assert_eq!(
+            RawMouseActivity::from_mouse(raw_mouse(MOUSE_MOVE_RELATIVE, -4, 7, 0)),
+            RawMouseActivity {
+                moved: true,
+                button_or_wheel: false,
+            }
+        );
+        assert_eq!(
+            RawMouseActivity::from_mouse(raw_mouse(MOUSE_MOVE_ABSOLUTE, 0, 0, 0)),
+            RawMouseActivity {
+                moved: true,
+                button_or_wheel: false,
+            },
+            "zero is a valid absolute desktop coordinate"
+        );
+    }
+
+    #[test]
+    fn button_and_wheel_packets_report_interruption() {
+        for button_flags in [RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_WHEEL] {
+            assert_eq!(
+                RawMouseActivity::from_mouse(raw_mouse(
+                    MOUSE_MOVE_RELATIVE,
+                    0,
+                    0,
+                    button_flags as u16,
+                )),
+                RawMouseActivity {
+                    moved: false,
+                    button_or_wheel: true,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn combined_packet_preserves_both_classifications() {
+        assert_eq!(
+            RawMouseActivity::from_mouse(raw_mouse(
+                MOUSE_MOVE_RELATIVE,
+                1,
+                0,
+                RI_MOUSE_LEFT_BUTTON_DOWN as u16,
+            )),
+            RawMouseActivity {
+                moved: true,
+                button_or_wheel: true,
+            }
+        );
+    }
+
+    fn raw_mouse(
+        state: windows::Win32::UI::Input::MOUSE_STATE,
+        x: i32,
+        y: i32,
+        button_flags: u16,
+    ) -> RAWMOUSE {
+        RAWMOUSE {
+            usFlags: state,
+            Anonymous: RAWMOUSE_0 {
+                Anonymous: RAWMOUSE_0_0 {
+                    usButtonFlags: button_flags,
+                    usButtonData: 0,
+                },
+            },
+            lLastX: x,
+            lLastY: y,
+            ..Default::default()
+        }
     }
 }

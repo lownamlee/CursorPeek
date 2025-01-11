@@ -6,7 +6,7 @@ use std::{
 
 #[cfg(test)]
 use super::input::registered_raw_mouse;
-use super::input::RawMouseInputRegistration;
+use super::input::{read_raw_mouse_activity, RawMouseInputRegistration};
 
 use windows::{
     core::{w, Error, Result, PCWSTR},
@@ -16,7 +16,7 @@ use windows::{
         UI::WindowsAndMessaging::{
             CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
             PostMessageW, RegisterClassW, TranslateMessage, UnregisterClassW, HWND_MESSAGE, MSG,
-            WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WNDCLASSW,
+            WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_INPUT, WNDCLASSW,
         },
     },
 };
@@ -183,8 +183,12 @@ fn dispatch_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) ->
         panic!("intentional callback panic for containment testing");
     }
 
+    if message == WM_INPUT {
+        let _ = read_raw_mouse_activity(lparam);
+    }
+
     // SAFETY: These are the untouched parameters supplied by Windows to this window procedure.
-    // Unhandled messages are delegated to the system default procedure as required.
+    // Every WM_INPUT is also delegated because foreground raw input requires system cleanup.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
 
