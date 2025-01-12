@@ -7,12 +7,13 @@ use std::{
 use windows::{
     core::{Error, Result},
     Win32::{
-        Foundation::{HWND, LPARAM},
+        Foundation::{HWND, LPARAM, POINT},
         UI::Input::{
             GetRawInputData, RegisterRawInputDevices, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT,
             RAWINPUTDEVICE, RAWINPUTDEVICE_FLAGS, RAWINPUTHEADER, RAWMOUSE, RIDEV_INPUTSINK,
             RIDEV_REMOVE, RID_INPUT, RIM_TYPEMOUSE,
         },
+        UI::WindowsAndMessaging::GetPhysicalCursorPos,
     },
 };
 
@@ -32,6 +33,10 @@ pub(super) struct RawMouseActivity {
 }
 
 impl RawMouseActivity {
+    pub(super) fn is_relevant(self) -> bool {
+        self.moved || self.button_or_wheel
+    }
+
     fn from_mouse(mouse: RAWMOUSE) -> Self {
         // SAFETY: RAWMOUSE defines `Anonymous.Anonymous` as the active view of the buttons
         // union. Reading it does not depend on a separate tag, and the complete RAWMOUSE value
@@ -45,6 +50,19 @@ impl RawMouseActivity {
             button_or_wheel: button_flags != 0,
         }
     }
+}
+
+pub(super) fn physical_cursor_position() -> Result<POINT> {
+    let mut point = POINT::default();
+
+    // SAFETY: `point` is valid writable storage for the duration of the call. Windows writes one
+    // complete POINT in physical screen coordinates or returns an error without transferring
+    // ownership.
+    unsafe {
+        GetPhysicalCursorPos(&mut point)?;
+    }
+
+    Ok(point)
 }
 
 pub(super) fn read_raw_mouse_activity(lparam: LPARAM) -> Result<Option<RawMouseActivity>> {
