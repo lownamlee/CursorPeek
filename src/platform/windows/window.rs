@@ -8,7 +8,8 @@ use std::{
 #[cfg(test)]
 use super::input::registered_raw_mouse;
 use super::input::{
-    physical_cursor_position, read_raw_mouse_activity, RawMouseActivity, RawMouseInputRegistration,
+    physical_cursor_position, read_raw_mouse_activity, system_hover_rectangle, RawMouseActivity,
+    RawMouseInputRegistration,
 };
 
 use crate::hover::{DwellTimerEvent, HoverState, PhysicalScreenPoint, DEFAULT_DWELL_DELAY};
@@ -182,9 +183,24 @@ impl MessageWindow {
                     self.cancel_dwell();
                 }
             }
-            DwellTimerEvent::Ready { generation, point } => {
-                // The resolver handoff will consume this owned generation/point pair in the next
-                // Milestone 1 slice.
+            DwellTimerEvent::Candidate(candidate) => {
+                let ready = physical_cursor_position()
+                    .map(|point| PhysicalScreenPoint::new(point.x, point.y))
+                    .and_then(|current| {
+                        let rectangle = system_hover_rectangle(candidate.anchor())?;
+                        Ok(candidate.validate(current, rectangle))
+                    })
+                    .ok()
+                    .flatten();
+
+                let Some(ready) = ready else {
+                    self.cancel_dwell();
+                    return;
+                };
+
+                // The resolver handoff will consume this validated generation/current-point pair
+                // in the next Milestone 1 slice.
+                let (generation, point) = ready.into_parts();
                 let PhysicalScreenPoint { x, y } = point;
                 let _ = (generation, x, y);
             }

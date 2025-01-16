@@ -1,3 +1,5 @@
 mod state;
 
-pub(crate) use state::{DwellTimerEvent, HoverState, PhysicalScreenPoint, DEFAULT_DWELL_DELAY};
+pub(crate) use state::{
+    DwellTimerEvent, HoverRectangle, HoverState, PhysicalScreenPoint, DEFAULT_DWELL_DELAY,
+};
