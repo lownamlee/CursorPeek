@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use super::explorer::is_explorer_window_at;
 #[cfg(test)]
 use super::input::registered_raw_mouse;
 use super::input::{
@@ -201,6 +202,11 @@ impl MessageWindow {
                 // The resolver handoff will consume this validated generation/current-point pair
                 // in the next Milestone 1 slice.
                 let (generation, point) = ready.into_parts();
+                if !is_explorer_window_at(point) {
+                    self.cancel_dwell();
+                    return;
+                }
+
                 let PhysicalScreenPoint { x, y } = point;
                 let _ = (generation, x, y);
             }
@@ -372,6 +378,7 @@ mod tests {
         DWELL_TIMER_ID, LPARAM, TEST_PANIC_MESSAGE, WM_TIMER, WPARAM,
     };
     use crate::hover::PhysicalScreenPoint;
+    use crate::platform::windows::explorer::is_explorer_window;
     use std::{
         thread,
         time::{Duration, Instant},
@@ -387,6 +394,10 @@ mod tests {
 
             // SAFETY: `first_handle` belongs to the live window on this test thread.
             assert!(unsafe { IsWindow(first_handle).as_bool() });
+            assert!(
+                !is_explorer_window(first_handle),
+                "the private message window must fail the Explorer candidate gate"
+            );
             let first_registration = registered_raw_mouse()
                 .expect("the process registration should be queryable")
                 .expect("the raw mouse should be registered");

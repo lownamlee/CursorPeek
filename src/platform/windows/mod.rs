@@ -1,4 +1,5 @@
 mod com;
+mod explorer;
 mod input;
 mod window;
 
