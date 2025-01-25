@@ -5,12 +5,14 @@ CursorPeek - lightweight Windows Explorer hover preview
 
 Usage:
   CursorPeek
+  CursorPeek --input-diagnostics
   CursorPeek --help
   CursorPeek --version
 
 Options:
-  -h, --help       Show this help text
-  -V, --version    Show the program version
+  --input-diagnostics  Measure Raw Input coverage over foreground Explorer for 30 seconds
+  -h, --help           Show this help text
+  -V, --version        Show the program version
 
 The --preview-worker mode is private and reserved for a child process.
 ";
@@ -18,6 +20,7 @@ The --preview-worker mode is private and reserved for a child process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProcessMode {
     Main,
+    InputDiagnostics,
     PreviewWorker,
 }
 
@@ -42,6 +45,7 @@ impl Command {
         let command = match first.to_str() {
             Some("-h" | "--help") => Self::Help,
             Some("-V" | "--version") => Self::Version,
+            Some("--input-diagnostics") => Self::Run(ProcessMode::InputDiagnostics),
             Some("--preview-worker") => Self::Run(ProcessMode::PreviewWorker),
             _ => return Err(ParseError::UnexpectedArgument(first)),
         };
@@ -101,6 +105,14 @@ mod tests {
         assert_eq!(
             Command::parse(["--preview-worker"]),
             Ok(Command::Run(ProcessMode::PreviewWorker))
+        );
+    }
+
+    #[test]
+    fn diagnostic_switch_selects_input_measurement_mode() {
+        assert_eq!(
+            Command::parse(["--input-diagnostics"]),
+            Ok(Command::Run(ProcessMode::InputDiagnostics))
         );
     }
 

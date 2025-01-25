@@ -49,6 +49,14 @@ impl RawMouseActivity {
         self.moved || self.button_or_wheel
     }
 
+    pub(super) fn moved(self) -> bool {
+        self.moved
+    }
+
+    pub(super) fn interrupted(self) -> bool {
+        self.button_or_wheel
+    }
+
     fn from_mouse(mouse: RAWMOUSE) -> Self {
         // SAFETY: RAWMOUSE defines `Anonymous.Anonymous` as the active view of the buttons
         // union. Reading it does not depend on a separate tag, and the complete RAWMOUSE value

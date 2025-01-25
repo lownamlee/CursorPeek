@@ -24,6 +24,7 @@ portability, and a simple offline experience.
 ```powershell
 cargo run
 cargo run -- --help
+cargo run -- --input-diagnostics
 cargo run -- --preview-worker
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings

@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::explorer::is_explorer_window_at;
+use super::explorer::{is_explorer_window_at, is_foreground_explorer_window_at};
 #[cfg(test)]
 use super::input::registered_raw_mouse;
 use super::input::{
@@ -13,7 +13,10 @@ use super::input::{
     RawMouseInputRegistration,
 };
 
-use crate::hover::{DwellTimerEvent, HoverState, PhysicalScreenPoint, DEFAULT_DWELL_DELAY};
+use crate::hover::{
+    DwellTimerEvent, HoverState, InputCoverage, InputCoverageReport, PhysicalScreenPoint,
+    DEFAULT_DWELL_DELAY, INPUT_SAMPLE_INTERVAL,
+};
 
 use windows::{
     core::{w, Error, Result, PCWSTR},
@@ -35,14 +38,17 @@ use windows::Win32::UI::WindowsAndMessaging::IsWindow;
 const CLASS_NAME: PCWSTR = w!("CursorPeek.MessageWindow");
 const SHUTDOWN_MESSAGE: u32 = WM_APP + 1;
 const DWELL_TIMER_ID: usize = 1;
+const INPUT_SAMPLE_TIMER_ID: usize = 2;
+const INPUT_DIAGNOSTIC_DEADLINE_TIMER_ID: usize = 3;
 
 #[cfg(test)]
 const TEST_PANIC_MESSAGE: u32 = WM_APP + 2;
 
 pub(crate) struct MessageWindow {
     hwnd: HWND,
-    dwell_timer: Option<WindowDwellTimer>,
+    dwell_timer: Option<WindowTimer>,
     hover_state: HoverState,
+    input_diagnostics: Option<InputDiagnostics>,
     raw_mouse_input: Option<RawMouseInputRegistration>,
     _class: RegisteredWindowClass,
     _thread_affinity: PhantomData<Rc<()>>,
@@ -74,8 +80,9 @@ impl MessageWindow {
 
         let mut window = Self {
             hwnd,
-            dwell_timer: Some(WindowDwellTimer::new(hwnd)),
+            dwell_timer: Some(WindowTimer::new(hwnd, DWELL_TIMER_ID)),
             hover_state: HoverState::new(DEFAULT_DWELL_DELAY),
+            input_diagnostics: None,
             raw_mouse_input: None,
             _class: class,
             _thread_affinity: PhantomData,
@@ -92,6 +99,26 @@ impl MessageWindow {
     }
 
     pub(crate) fn run_message_loop(mut self) -> Result<()> {
+        let _ = self.run_loop()?;
+        Ok(())
+    }
+
+    pub(crate) fn run_input_diagnostics(
+        mut self,
+        duration: Duration,
+    ) -> Result<InputCoverageReport> {
+        self.input_diagnostics = Some(InputDiagnostics::start(self.hwnd, duration)?);
+
+        match self.run_loop()? {
+            MessageLoopExit::Shutdown => Ok(self
+                .input_diagnostics
+                .as_mut()
+                .map_or_else(InputCoverageReport::default, InputDiagnostics::finish)),
+            MessageLoopExit::InputDiagnostics(report) => Ok(report),
+        }
+    }
+
+    fn run_loop(&mut self) -> Result<MessageLoopExit> {
         let mut message = MSG::default();
 
         loop {
@@ -102,11 +129,30 @@ impl MessageWindow {
                 return Err(Error::from_win32());
             }
             if status.0 == 0 {
-                return Ok(());
+                return Ok(MessageLoopExit::Shutdown);
             }
 
             if message.hwnd == self.hwnd && message.message == SHUTDOWN_MESSAGE {
-                return Ok(());
+                return Ok(MessageLoopExit::Shutdown);
+            }
+
+            if message.hwnd == self.hwnd
+                && message.message == WM_TIMER
+                && message.wParam.0 == INPUT_DIAGNOSTIC_DEADLINE_TIMER_ID
+            {
+                let report = self
+                    .input_diagnostics
+                    .as_mut()
+                    .map_or_else(InputCoverageReport::default, InputDiagnostics::finish);
+                return Ok(MessageLoopExit::InputDiagnostics(report));
+            }
+
+            if message.hwnd == self.hwnd
+                && message.message == WM_TIMER
+                && message.wParam.0 == INPUT_SAMPLE_TIMER_ID
+            {
+                self.handle_input_diagnostic_sample();
+                continue;
             }
 
             if message.hwnd == self.hwnd
@@ -137,6 +183,11 @@ impl MessageWindow {
     }
 
     fn handle_raw_mouse(&mut self, raw_mouse: Result<Option<RawMouseActivity>>) {
+        if self.input_diagnostics.is_some() {
+            self.handle_input_diagnostic_raw(raw_mouse);
+            return;
+        }
+
         match raw_mouse {
             Ok(Some(activity)) if activity.is_relevant() => match physical_cursor_position() {
                 Ok(point) => {
@@ -146,6 +197,61 @@ impl MessageWindow {
             },
             Ok(Some(_)) => {}
             Ok(None) | Err(_) => self.cancel_dwell(),
+        }
+    }
+
+    fn handle_input_diagnostic_raw(&mut self, raw_mouse: Result<Option<RawMouseActivity>>) {
+        let Ok(Some(activity)) = raw_mouse else {
+            self.suspend_input_diagnostics();
+            return;
+        };
+        if !activity.is_relevant() {
+            return;
+        }
+
+        let Ok(point) = physical_cursor_position() else {
+            self.suspend_input_diagnostics();
+            return;
+        };
+        let point = PhysicalScreenPoint::new(point.x, point.y);
+        if !is_foreground_explorer_window_at(point) {
+            self.suspend_input_diagnostics();
+            return;
+        }
+
+        let Some(diagnostics) = self.input_diagnostics.as_mut() else {
+            return;
+        };
+        diagnostics
+            .coverage
+            .observe_raw(point, activity.moved(), activity.interrupted());
+        if !diagnostics.sample_timer.is_armed()
+            && diagnostics.sample_timer.arm(INPUT_SAMPLE_INTERVAL).is_err()
+        {
+            diagnostics.coverage.suspend();
+        }
+    }
+
+    fn handle_input_diagnostic_sample(&mut self) {
+        let Ok(point) = physical_cursor_position() else {
+            self.suspend_input_diagnostics();
+            return;
+        };
+        let point = PhysicalScreenPoint::new(point.x, point.y);
+        if !is_foreground_explorer_window_at(point) {
+            self.suspend_input_diagnostics();
+            return;
+        }
+
+        if let Some(diagnostics) = self.input_diagnostics.as_mut() {
+            diagnostics.coverage.observe_sample(point);
+        }
+    }
+
+    fn suspend_input_diagnostics(&mut self) {
+        if let Some(diagnostics) = self.input_diagnostics.as_mut() {
+            diagnostics.coverage.suspend();
+            let _ = diagnostics.sample_timer.stop();
         }
     }
 
@@ -220,19 +326,18 @@ impl MessageWindow {
 
     #[cfg(test)]
     fn dwell_timer_is_armed(&self) -> bool {
-        self.dwell_timer
-            .as_ref()
-            .is_some_and(WindowDwellTimer::is_armed)
+        self.dwell_timer.as_ref().is_some_and(WindowTimer::is_armed)
     }
 }
 
 impl Drop for MessageWindow {
     fn drop(&mut self) {
+        drop(self.input_diagnostics.take());
         drop(self.dwell_timer.take());
         drop(self.raw_mouse_input.take());
 
-        // SAFETY: The owner is !Send and therefore drops on the creating thread. The dwell timer
-        // has been stopped and Raw Input unregistered. The HWND returned by CreateWindowExW is
+        // SAFETY: The owner is !Send and therefore drops on the creating thread. All timers have
+        // been stopped and Raw Input unregistered. The HWND returned by CreateWindowExW is
         // destroyed before `_class` is dropped/unregistered.
         unsafe {
             let _ = DestroyWindow(self.hwnd);
@@ -240,16 +345,50 @@ impl Drop for MessageWindow {
     }
 }
 
-struct WindowDwellTimer {
+enum MessageLoopExit {
+    Shutdown,
+    InputDiagnostics(InputCoverageReport),
+}
+
+struct InputDiagnostics {
+    coverage: InputCoverage,
+    sample_timer: WindowTimer,
+    deadline_timer: WindowTimer,
+}
+
+impl InputDiagnostics {
+    fn start(hwnd: HWND, duration: Duration) -> Result<Self> {
+        let mut diagnostics = Self {
+            coverage: InputCoverage::default(),
+            sample_timer: WindowTimer::new(hwnd, INPUT_SAMPLE_TIMER_ID),
+            deadline_timer: WindowTimer::new(hwnd, INPUT_DIAGNOSTIC_DEADLINE_TIMER_ID),
+        };
+        diagnostics.deadline_timer.arm(duration)?;
+        Ok(diagnostics)
+    }
+
+    fn finish(&mut self) -> InputCoverageReport {
+        let _ = self.sample_timer.stop();
+        let _ = self.deadline_timer.stop();
+        self.coverage.suspend();
+        self.coverage.report()
+    }
+}
+
+struct WindowTimer {
     hwnd: HWND,
+    id: usize,
     armed: bool,
     _thread_affinity: PhantomData<Rc<()>>,
 }
 
-impl WindowDwellTimer {
-    fn new(hwnd: HWND) -> Self {
+impl WindowTimer {
+    fn new(hwnd: HWND, id: usize) -> Self {
+        debug_assert_ne!(id, 0);
+
         Self {
             hwnd,
+            id,
             armed: false,
             _thread_affinity: PhantomData,
         }
@@ -261,7 +400,7 @@ impl WindowDwellTimer {
         // SAFETY: `hwnd` is a live window owned by this calling UI thread. The fixed nonzero ID
         // belongs only to that window, the interval is clamped to Windows' documented range, and
         // no callback pointer is supplied, so expiry is delivered as WM_TIMER.
-        let timer = unsafe { SetTimer(self.hwnd, DWELL_TIMER_ID, interval_ms, None) };
+        let timer = unsafe { SetTimer(self.hwnd, self.id, interval_ms, None) };
         if timer == 0 {
             let error = Error::from_win32();
             let _ = self.stop();
@@ -279,20 +418,19 @@ impl WindowDwellTimer {
 
         // SAFETY: This uses the same live owning HWND and fixed ID passed to SetTimer. The token
         // never leaves the UI thread and retries in Drop if Windows reports a failure.
-        let result = unsafe { KillTimer(self.hwnd, DWELL_TIMER_ID) };
+        let result = unsafe { KillTimer(self.hwnd, self.id) };
         if result.is_ok() {
             self.armed = false;
         }
         result
     }
 
-    #[cfg(test)]
     fn is_armed(&self) -> bool {
         self.armed
     }
 }
 
-impl Drop for WindowDwellTimer {
+impl Drop for WindowTimer {
     fn drop(&mut self) {
         let _ = self.stop();
     }
@@ -437,6 +575,24 @@ mod tests {
                     .expect("the process registration should be queryable")
                     .is_none(),
                 "raw mouse input should be unregistered before window teardown"
+            );
+
+            let diagnostic =
+                MessageWindow::create().expect("the diagnostic message window should be created");
+            let diagnostic_handle = diagnostic.handle();
+            let report = diagnostic
+                .run_input_diagnostics(Duration::from_nanos(1))
+                .expect("the minimum bounded diagnostic should finish");
+            assert!(report.unmatched_changes() <= report.changed_samples());
+            assert!(report.changed_samples() <= report.active_samples());
+
+            // SAFETY: The consuming diagnostic loop has dropped its owned HWND.
+            assert!(!unsafe { IsWindow(diagnostic_handle).as_bool() });
+            assert!(
+                registered_raw_mouse()
+                    .expect("the process registration should be queryable")
+                    .is_none(),
+                "diagnostic timers and Raw Input should stop before window teardown"
             );
 
             for _ in 0..100 {

@@ -9,7 +9,8 @@ use windows::{
             PROCESS_QUERY_LIMITED_INFORMATION,
         },
         UI::WindowsAndMessaging::{
-            GetAncestor, GetClassNameW, GetWindowThreadProcessId, WindowFromPhysicalPoint, GA_ROOT,
+            GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId,
+            WindowFromPhysicalPoint, GA_ROOT,
         },
     },
 };
@@ -21,23 +22,52 @@ const EXPLORE_WINDOW_CLASS: &[u8] = b"ExploreWClass";
 const EXPLORER_IMAGE_NAME: &[u8] = b"explorer.exe";
 
 pub(super) fn is_explorer_window_at(point: PhysicalScreenPoint) -> bool {
+    is_explorer_window(window_at(point))
+}
+
+pub(super) fn is_foreground_explorer_window_at(point: PhysicalScreenPoint) -> bool {
+    let Some(point_root) = root_window(window_at(point)) else {
+        return false;
+    };
+
+    // SAFETY: This has no pointer or ownership requirements. The returned HWND is borrowed and
+    // may be null while activation is changing, which fails this diagnostic eligibility check.
+    let foreground = unsafe { GetForegroundWindow() };
+    let Some(foreground_root) = root_window(foreground) else {
+        return false;
+    };
+
+    point_root == foreground_root && is_explorer_root(point_root)
+}
+
+pub(super) fn is_explorer_window(window: HWND) -> bool {
+    root_window(window).is_some_and(is_explorer_root)
+}
+
+fn window_at(point: PhysicalScreenPoint) -> HWND {
     // SAFETY: `point` contains physical screen coordinates sampled by GetPhysicalCursorPos.
-    // The returned HWND is borrowed and used only for synchronous queries in this function.
-    let window = unsafe {
+    // The returned HWND is borrowed and used only for synchronous queries.
+    unsafe {
         WindowFromPhysicalPoint(POINT {
             x: point.x,
             y: point.y,
         })
-    };
-
-    !window.0.is_null() && is_explorer_window(window)
+    }
 }
 
-pub(super) fn is_explorer_window(window: HWND) -> bool {
+fn root_window(window: HWND) -> Option<HWND> {
+    if window.0.is_null() {
+        return None;
+    }
+
     // SAFETY: `window` is a borrowed HWND supplied by Windows. GA_ROOT performs a synchronous
     // parent-chain lookup and returns another borrowed HWND or null on failure.
     let root = unsafe { GetAncestor(window, GA_ROOT) };
-    if root.0.is_null() || !has_explorer_frame_class(root) {
+    (!root.0.is_null()).then_some(root)
+}
+
+fn is_explorer_root(root: HWND) -> bool {
+    if !has_explorer_frame_class(root) {
         return false;
     }
 
