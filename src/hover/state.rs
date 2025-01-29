@@ -19,6 +19,16 @@ impl PhysicalScreenPoint {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Generation(u64);
 
+impl Generation {
+    pub(crate) const fn from_raw(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub(crate) const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HoverRectangle {
     width: u32,

@@ -1,10 +1,13 @@
+use std::{error::Error, fmt, io};
+
 use crate::{
     hover::INPUT_DIAGNOSTIC_DURATION,
     mode::ProcessMode,
     platform::{ApartmentKind, ComApartment, MessageWindow},
+    worker::{self, WorkerSessionError},
 };
 
-pub(crate) fn run(process_mode: ProcessMode) -> windows::core::Result<()> {
+pub(crate) fn run(process_mode: ProcessMode) -> Result<(), AppError> {
     let apartment_kind = match process_mode {
         ProcessMode::Main | ProcessMode::InputDiagnostics => ApartmentKind::SingleThreaded,
         ProcessMode::PreviewWorker => ApartmentKind::MultiThreaded,
@@ -31,11 +34,47 @@ pub(crate) fn run(process_mode: ProcessMode) -> windows::core::Result<()> {
             );
         }
         ProcessMode::PreviewWorker => {
-            println!(
-                "CursorPeek preview-worker/MTA foundation initialized; protocol is not active."
-            );
+            let stdin = io::stdin();
+            let stdout = io::stdout();
+            worker::run_diagnostic_session(&mut stdin.lock(), &mut stdout.lock())?;
         }
     }
 
     Ok(())
+}
+
+#[derive(Debug)]
+pub(crate) enum AppError {
+    Windows(windows::core::Error),
+    Worker(WorkerSessionError),
+}
+
+impl fmt::Display for AppError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Windows(error) => write!(formatter, "{error}"),
+            Self::Worker(error) => write!(formatter, "worker protocol: {error}"),
+        }
+    }
+}
+
+impl Error for AppError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Windows(error) => Some(error),
+            Self::Worker(error) => Some(error),
+        }
+    }
+}
+
+impl From<windows::core::Error> for AppError {
+    fn from(error: windows::core::Error) -> Self {
+        Self::Windows(error)
+    }
+}
+
+impl From<WorkerSessionError> for AppError {
+    fn from(error: WorkerSessionError) -> Self {
+        Self::Worker(error)
+    }
 }
