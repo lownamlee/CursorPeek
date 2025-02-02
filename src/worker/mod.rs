@@ -1,3 +1,4 @@
+mod manager;
 mod protocol;
 
 use std::{
@@ -7,6 +8,8 @@ use std::{
 };
 
 use protocol::{ProtocolStreamError, ResolverStatus, WorkerMessage};
+
+pub(crate) use manager::{run_launch_diagnostic, run_timeout_diagnostic, WorkerManagerError};
 
 pub(crate) fn run_diagnostic_session<R, W>(
     reader: &mut R,

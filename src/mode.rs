@@ -6,21 +6,25 @@ CursorPeek - lightweight Windows Explorer hover preview
 Usage:
   CursorPeek
   CursorPeek --input-diagnostics
+  CursorPeek --worker-diagnostics
   CursorPeek --help
   CursorPeek --version
 
 Options:
   --input-diagnostics  Measure Raw Input coverage over foreground Explorer for 30 seconds
+  --worker-diagnostics Verify contained worker launch, handshake, request, and teardown
   -h, --help           Show this help text
   -V, --version        Show the program version
 
-The --preview-worker mode is private and reserved for a child process.
+The preview-worker and timeout-diagnostic modes are private.
 ";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProcessMode {
     Main,
     InputDiagnostics,
+    WorkerDiagnostics,
+    WorkerTimeoutDiagnostics,
     PreviewWorker,
 }
 
@@ -46,6 +50,10 @@ impl Command {
             Some("-h" | "--help") => Self::Help,
             Some("-V" | "--version") => Self::Version,
             Some("--input-diagnostics") => Self::Run(ProcessMode::InputDiagnostics),
+            Some("--worker-diagnostics") => Self::Run(ProcessMode::WorkerDiagnostics),
+            Some("--worker-timeout-diagnostics") => {
+                Self::Run(ProcessMode::WorkerTimeoutDiagnostics)
+            }
             Some("--preview-worker") => Self::Run(ProcessMode::PreviewWorker),
             _ => return Err(ParseError::UnexpectedArgument(first)),
         };
@@ -113,6 +121,18 @@ mod tests {
         assert_eq!(
             Command::parse(["--input-diagnostics"]),
             Ok(Command::Run(ProcessMode::InputDiagnostics))
+        );
+    }
+
+    #[test]
+    fn worker_diagnostic_switches_select_parent_modes() {
+        assert_eq!(
+            Command::parse(["--worker-diagnostics"]),
+            Ok(Command::Run(ProcessMode::WorkerDiagnostics))
+        );
+        assert_eq!(
+            Command::parse(["--worker-timeout-diagnostics"]),
+            Ok(Command::Run(ProcessMode::WorkerTimeoutDiagnostics))
         );
     }
 

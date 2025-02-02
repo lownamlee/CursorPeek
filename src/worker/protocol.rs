@@ -18,7 +18,6 @@ const MAX_PREVIEW_PAYLOAD_LEN: u32 = 4 * 1024 * 1024;
 pub(super) struct SessionNonce([u8; NONCE_LEN]);
 
 impl SessionNonce {
-    #[cfg(test)]
     pub(super) const fn from_bytes(bytes: [u8; NONCE_LEN]) -> Self {
         Self(bytes)
     }

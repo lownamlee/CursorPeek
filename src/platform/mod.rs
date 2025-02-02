@@ -5,4 +5,6 @@ compile_error!("CursorPeek currently supports only Windows.");
 mod windows;
 
 #[cfg(windows)]
-pub(crate) use self::windows::{ApartmentKind, ComApartment, MessageWindow};
+pub(crate) use self::windows::{
+    ApartmentKind, ComApartment, ContainedWorker, MessageWindow, ProcessError, WorkerPipes,
+};

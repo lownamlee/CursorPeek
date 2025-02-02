@@ -4,12 +4,15 @@ use crate::{
     hover::INPUT_DIAGNOSTIC_DURATION,
     mode::ProcessMode,
     platform::{ApartmentKind, ComApartment, MessageWindow},
-    worker::{self, WorkerSessionError},
+    worker::{self, WorkerManagerError, WorkerSessionError},
 };
 
 pub(crate) fn run(process_mode: ProcessMode) -> Result<(), AppError> {
     let apartment_kind = match process_mode {
-        ProcessMode::Main | ProcessMode::InputDiagnostics => ApartmentKind::SingleThreaded,
+        ProcessMode::Main
+        | ProcessMode::InputDiagnostics
+        | ProcessMode::WorkerDiagnostics
+        | ProcessMode::WorkerTimeoutDiagnostics => ApartmentKind::SingleThreaded,
         ProcessMode::PreviewWorker => ApartmentKind::MultiThreaded,
     };
     let _apartment = ComApartment::initialize(apartment_kind)?;
@@ -33,6 +36,13 @@ pub(crate) fn run(process_mode: ProcessMode) -> Result<(), AppError> {
                 "Unmatched changes are candidate coverage gaps, not an automatic support result."
             );
         }
+        ProcessMode::WorkerDiagnostics => {
+            println!("{}", worker::run_launch_diagnostic()?);
+        }
+        ProcessMode::WorkerTimeoutDiagnostics => {
+            worker::run_timeout_diagnostic()?;
+            println!("Contained worker timeout cleanup completed.");
+        }
         ProcessMode::PreviewWorker => {
             let stdin = io::stdin();
             let stdout = io::stdout();
@@ -46,6 +56,7 @@ pub(crate) fn run(process_mode: ProcessMode) -> Result<(), AppError> {
 #[derive(Debug)]
 pub(crate) enum AppError {
     Windows(windows::core::Error),
+    WorkerManager(WorkerManagerError),
     Worker(WorkerSessionError),
 }
 
@@ -53,6 +64,7 @@ impl fmt::Display for AppError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Windows(error) => write!(formatter, "{error}"),
+            Self::WorkerManager(error) => write!(formatter, "worker manager: {error}"),
             Self::Worker(error) => write!(formatter, "worker protocol: {error}"),
         }
     }
@@ -62,6 +74,7 @@ impl Error for AppError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Windows(error) => Some(error),
+            Self::WorkerManager(error) => Some(error),
             Self::Worker(error) => Some(error),
         }
     }
@@ -76,5 +89,11 @@ impl From<windows::core::Error> for AppError {
 impl From<WorkerSessionError> for AppError {
     fn from(error: WorkerSessionError) -> Self {
         Self::Worker(error)
+    }
+}
+
+impl From<WorkerManagerError> for AppError {
+    fn from(error: WorkerManagerError) -> Self {
+        Self::WorkerManager(error)
     }
 }
