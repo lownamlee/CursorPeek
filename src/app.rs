@@ -46,7 +46,7 @@ pub(crate) fn run(process_mode: ProcessMode) -> Result<(), AppError> {
         ProcessMode::PreviewWorker => {
             let stdin = io::stdin();
             let stdout = io::stdout();
-            worker::run_diagnostic_session(&mut stdin.lock(), &mut stdout.lock())?;
+            worker::run_session(&mut stdin.lock(), &mut stdout.lock())?;
         }
     }
 
