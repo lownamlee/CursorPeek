@@ -10,6 +10,10 @@ publish = false
 name = "CursorPeek"
 path = "src/main.rs"
 
+[features]
+default = []
+resolver-corpus = []
+
 [dependencies]
 windows = { version = "=0.62.2", features = [
     "Win32_Foundation",
@@ -19,11 +23,15 @@ windows = { version = "=0.62.2", features = [
     "Win32_System_Com",
     "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
+    "Win32_System_Ole",
     "Win32_System_Pipes",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_UI_Accessibility",
     "Win32_UI_HiDpi",
     "Win32_UI_Input",
+    "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
 

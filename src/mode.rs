@@ -26,6 +26,8 @@ pub(crate) enum ProcessMode {
     WorkerDiagnostics,
     WorkerTimeoutDiagnostics,
     PreviewWorker,
+    #[cfg(feature = "resolver-corpus")]
+    ResolverCorpusProbe,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,6 +57,8 @@ impl Command {
                 Self::Run(ProcessMode::WorkerTimeoutDiagnostics)
             }
             Some("--preview-worker") => Self::Run(ProcessMode::PreviewWorker),
+            #[cfg(feature = "resolver-corpus")]
+            Some("--resolver-corpus-probe") => Self::Run(ProcessMode::ResolverCorpusProbe),
             _ => return Err(ParseError::UnexpectedArgument(first)),
         };
 
@@ -113,6 +117,15 @@ mod tests {
         assert_eq!(
             Command::parse(["--preview-worker"]),
             Ok(Command::Run(ProcessMode::PreviewWorker))
+        );
+    }
+
+    #[cfg(feature = "resolver-corpus")]
+    #[test]
+    fn private_switch_selects_resolver_corpus_probe() {
+        assert_eq!(
+            Command::parse(["--resolver-corpus-probe"]),
+            Ok(Command::Run(ProcessMode::ResolverCorpusProbe))
         );
     }
 

@@ -1,0 +1,39 @@
+scenario	expectation	layout	notes
+file_icon	resolve	extra_large_icons	Center and edge of an ordinary local file icon
+file_icon	resolve	large_icons	Center and edge of an ordinary local file icon
+file_icon	resolve	medium_icons	Center and edge of an ordinary local file icon
+file_icon	resolve	small_icons	Center and edge of an ordinary local file icon
+file_row	resolve	list	Icon and visible label regions of an ordinary local file
+file_row	resolve	details	Icon, name, and non-name columns in the same file row
+file_tile	resolve	tiles	Icon and visible metadata regions of an ordinary local file
+file_content	resolve	content	Icon, name, and visible metadata regions of an ordinary local file
+grouped_file	resolve	details_grouped	Files in the first, middle, and last expanded groups
+sorted_file	resolve	details_sorted	Files before and after changing the sort direction
+scrolled_file	resolve	details_scrolled	Files near the top and bottom edges after scrolling
+hidden_extension_collision	resolve	details_hidden_extensions	Two different extensions with the same visible stem
+case_variant_name	resolve	details	Mixed-case local path and display name
+unicode_name	resolve	details	Non-ASCII BMP and supplementary-plane filename
+long_name	resolve	details	A long but valid local filename
+renamed_file	resolve	details	File renamed while the prepared session is refreshed
+rapid_tab_switch	resolve	active_tab	The same point sampled after alternating active Explorer tabs
+background_tab	fail_closed	background_tab	Point belonging only to an inactive Explorer tab
+multiple_windows	resolve	multiple_windows	Equivalent coordinates in distinct foreground Explorer windows
+blank_items_view	fail_closed	all	Blank area inside the active items view
+navigation_tree	fail_closed	all	Folder entry in the navigation sidebar
+address_bar	fail_closed	all	Address-bar breadcrumb and editable text
+command_bar	fail_closed	all	Command bar buttons and overflow menu
+column_header	fail_closed	details	Column header and separator
+group_header	fail_closed	details_grouped	Group header and collapse affordance
+tab_strip	fail_closed	multiple_tabs	Active tab, inactive tab, and new-tab button
+preview_pane	fail_closed	preview_pane	Preview pane content and splitter
+details_pane	fail_closed	details_pane	Details pane content and splitter
+search_results	fail_closed	search	Filesystem-looking and virtual search results
+quick_access	fail_closed	quick_access	Pinned, recent, and frequent entries
+this_pc	fail_closed	this_pc	Drive, device, and known-folder entries
+recycle_bin	fail_closed	recycle_bin	Deleted item and blank area
+network_location	fail_closed	network	UNC and network namespace items
+cloud_placeholder	fail_closed	cloud	Offline or recall-on-access placeholder
+folder_item	fail_closed	all	Filesystem folder in the items view
+desktop_file	resolve	desktop	Local file icon on the Windows desktop
+desktop_control	fail_closed	desktop	This PC, Recycle Bin, and blank desktop
+explorer_restart	resolve	details	Prepared file after Explorer is restarted

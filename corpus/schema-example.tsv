@@ -1,0 +1,2 @@
+case_id	os	build	dpi	layout	scenario	x	y	expectation	expected_path
+1	windows10	example	100	details	schema_example_not_evidence	0	0	fail_closed	

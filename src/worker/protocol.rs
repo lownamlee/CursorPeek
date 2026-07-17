@@ -454,6 +454,26 @@ mod tests {
     }
 
     #[test]
+    fn every_resolver_status_round_trips_without_payload_growth() {
+        for status in [
+            ResolverStatus::Resolved,
+            ResolverStatus::Unsupported,
+            ResolverStatus::Ambiguous,
+            ResolverStatus::Unavailable,
+            ResolverStatus::TimedOut,
+        ] {
+            let message = WorkerMessage::ResolverResult {
+                generation: Generation::from_raw(9),
+                status,
+            };
+            let encoded = encode_message(message);
+
+            assert_eq!(encoded.as_bytes().len(), HEADER_LEN + 4);
+            assert_eq!(decode_frame(encoded.as_bytes()), Ok(message));
+        }
+    }
+
+    #[test]
     fn encoding_has_a_stable_little_endian_layout() {
         let encoded = encode_message(messages()[2]);
         let bytes = encoded.as_bytes();
