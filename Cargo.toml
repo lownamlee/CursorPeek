@@ -1,8 +1,8 @@
 [package]
 name = "windows-cursorpeek"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.83"
+edition = "2024"
+rust-version = "1.97.1"
 description = "A lightweight native hover-preview utility for Windows File Explorer"
 publish = false
 
@@ -11,7 +11,7 @@ name = "CursorPeek"
 path = "src/main.rs"
 
 [dependencies]
-windows = { version = "=0.58.0", features = [
+windows = { version = "=0.62.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_Security",

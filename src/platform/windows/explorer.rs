@@ -1,18 +1,18 @@
 use crate::hover::PhysicalScreenPoint;
 
 use windows::{
-    core::{Owned, PWSTR},
     Win32::{
         Foundation::{HANDLE, HWND, POINT},
         System::Threading::{
-            OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-            PROCESS_QUERY_LIMITED_INFORMATION,
+            OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+            QueryFullProcessImageNameW,
         },
         UI::WindowsAndMessaging::{
-            GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId,
-            WindowFromPhysicalPoint, GA_ROOT,
+            GA_ROOT, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId,
+            WindowFromPhysicalPoint,
         },
     },
+    core::{Owned, PWSTR},
 };
 
 const CLASS_NAME_CAPACITY: usize = 64;
@@ -171,8 +171,8 @@ fn ascii_lowercase(character: u16) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::{
-        process_image_is_explorer, wide_ascii_eq_ignore_case, wide_path_basename_matches,
-        CABINET_WINDOW_CLASS, EXPLORER_IMAGE_NAME, EXPLORE_WINDOW_CLASS,
+        CABINET_WINDOW_CLASS, EXPLORE_WINDOW_CLASS, EXPLORER_IMAGE_NAME, process_image_is_explorer,
+        wide_ascii_eq_ignore_case, wide_path_basename_matches,
     };
     use windows::Win32::System::Threading::GetCurrentProcessId;
 

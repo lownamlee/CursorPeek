@@ -13,31 +13,31 @@ use std::{
 };
 
 use windows::{
-    core::{Error as WindowsError, PCWSTR, PWSTR},
     Win32::{
         Foundation::{
-            SetHandleInformation, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT, WAIT_FAILED,
+            HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation, WAIT_FAILED,
             WAIT_OBJECT_0, WAIT_TIMEOUT,
         },
         Security::SECURITY_ATTRIBUTES,
         System::{
             JobObjects::{
-                CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
-                TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-                JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-                JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+                CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+                SetInformationJobObject, TerminateJobObject,
             },
             Pipes::CreatePipe,
             Threading::{
-                CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
-                InitializeProcThreadAttributeList, ResumeThread, UpdateProcThreadAttribute,
-                WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED,
-                EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
+                CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessW, DeleteProcThreadAttributeList,
+                EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
+                InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
                 PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST,
-                STARTF_USESTDHANDLES, STARTUPINFOEXW,
+                PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+                UpdateProcThreadAttribute, WaitForSingleObject,
             },
         },
     },
+    core::{Error as WindowsError, PCWSTR, PWSTR},
 };
 
 const WORKER_MEMORY_LIMIT: usize = 384 * 1024 * 1024;
@@ -94,7 +94,7 @@ impl ContainedWorker {
         unsafe {
             CreateProcessW(
                 PCWSTR(application_name.as_ptr()),
-                PWSTR(command_line.as_mut_ptr()),
+                Some(PWSTR(command_line.as_mut_ptr())),
                 None,
                 None,
                 true,
@@ -125,7 +125,7 @@ impl ContainedWorker {
         let previous_suspend_count = unsafe { ResumeThread(as_windows_handle(&thread)) };
         if previous_suspend_count != 1 {
             let error = if previous_suspend_count == u32::MAX {
-                ProcessError::Native(WindowsError::from_win32())
+                ProcessError::Native(WindowsError::from_thread())
             } else {
                 ProcessError::UnexpectedSuspendCount(previous_suspend_count)
             };
@@ -199,17 +199,11 @@ impl AttributeList {
         let mut required_bytes = 0_usize;
         // SAFETY: a null list is the documented size-query form. required_bytes is valid writable
         // storage, the reserved flags value is zero, and two is the exact maximum attribute count.
-        let size_query = unsafe {
-            InitializeProcThreadAttributeList(
-                LPPROC_THREAD_ATTRIBUTE_LIST::default(),
-                2,
-                0,
-                &mut required_bytes,
-            )
-        };
+        let size_query =
+            unsafe { InitializeProcThreadAttributeList(None, 2, None, &mut required_bytes) };
         if required_bytes == 0 {
             return Err(ProcessError::Native(
-                size_query.err().unwrap_or_else(WindowsError::from_win32),
+                size_query.err().unwrap_or_else(WindowsError::from_thread),
             ));
         }
 
@@ -225,7 +219,7 @@ impl AttributeList {
         // SAFETY: storage is writable, usize-aligned, and at least the byte count returned by the
         // size query. list points to that stable boxed allocation, and initialized_bytes is valid.
         unsafe {
-            InitializeProcThreadAttributeList(list, 2, 0, &mut initialized_bytes)?;
+            InitializeProcThreadAttributeList(Some(list), 2, None, &mut initialized_bytes)?;
         }
 
         let result = (|| {
@@ -372,7 +366,7 @@ fn wait_for_process(process: &OwnedHandle, timeout: Duration) -> Result<bool, Pr
     match result {
         WAIT_OBJECT_0 => Ok(true),
         WAIT_TIMEOUT => Ok(false),
-        WAIT_FAILED => Err(ProcessError::Native(WindowsError::from_win32())),
+        WAIT_FAILED => Err(ProcessError::Native(WindowsError::from_thread())),
         other => Err(ProcessError::UnexpectedWaitResult(other.0)),
     }
 }

@@ -13,8 +13,10 @@ fn contained_worker_completes_the_control_exchange() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(output.stderr.is_empty());
-    assert!(String::from_utf8_lossy(&output.stdout)
-        .contains("Contained worker diagnostic completed: generation=1, status=Unavailable"));
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("Contained worker diagnostic completed: generation=1, status=Unavailable")
+    );
 }
 
 #[test]

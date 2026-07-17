@@ -1,6 +1,6 @@
 use std::{
     marker::PhantomData,
-    panic::{catch_unwind, AssertUnwindSafe},
+    panic::{AssertUnwindSafe, catch_unwind},
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -9,27 +9,27 @@ use super::explorer::{is_explorer_window_at, is_foreground_explorer_window_at};
 #[cfg(test)]
 use super::input::registered_raw_mouse;
 use super::input::{
-    physical_cursor_position, read_raw_mouse_activity, system_hover_rectangle, RawMouseActivity,
-    RawMouseInputRegistration,
+    RawMouseActivity, RawMouseInputRegistration, physical_cursor_position, read_raw_mouse_activity,
+    system_hover_rectangle,
 };
 
 use crate::hover::{
-    DwellTimerEvent, HoverState, InputCoverage, InputCoverageReport, PhysicalScreenPoint,
-    DEFAULT_DWELL_DELAY, INPUT_SAMPLE_INTERVAL,
+    DEFAULT_DWELL_DELAY, DwellTimerEvent, HoverState, INPUT_SAMPLE_INTERVAL, InputCoverage,
+    InputCoverageReport, PhysicalScreenPoint,
 };
 
 use windows::{
-    core::{w, Error, Result, PCWSTR},
     Win32::{
         Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
         System::LibraryLoader::GetModuleHandleW,
         UI::WindowsAndMessaging::{
             CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-            KillTimer, PostMessageW, RegisterClassW, SetTimer, TranslateMessage, UnregisterClassW,
-            HWND_MESSAGE, MSG, USER_TIMER_MAXIMUM, USER_TIMER_MINIMUM, WINDOW_EX_STYLE,
+            HWND_MESSAGE, KillTimer, MSG, PostMessageW, RegisterClassW, SetTimer, TranslateMessage,
+            USER_TIMER_MAXIMUM, USER_TIMER_MINIMUM, UnregisterClassW, WINDOW_EX_STYLE,
             WINDOW_STYLE, WM_APP, WM_INPUT, WM_TIMER, WNDCLASSW,
         },
     },
+    core::{Error, PCWSTR, Result, w},
 };
 
 #[cfg(test)]
@@ -71,9 +71,9 @@ impl MessageWindow {
                 0,
                 0,
                 0,
-                HWND_MESSAGE,
+                Some(HWND_MESSAGE),
                 None,
-                class.instance,
+                Some(class.instance),
                 None,
             )?
         };
@@ -95,7 +95,7 @@ impl MessageWindow {
     pub(crate) fn request_shutdown(&self) -> Result<()> {
         // SAFETY: `self.hwnd` is owned by this live MessageWindow. The private message carries no
         // pointers or borrowed data, so its parameters remain valid until the queue processes it.
-        unsafe { PostMessageW(self.hwnd, SHUTDOWN_MESSAGE, WPARAM(0), LPARAM(0)) }
+        unsafe { PostMessageW(Some(self.hwnd), SHUTDOWN_MESSAGE, WPARAM(0), LPARAM(0)) }
     }
 
     pub(crate) fn run_message_loop(mut self) -> Result<()> {
@@ -126,7 +126,7 @@ impl MessageWindow {
             // range filter is used, so this thread's complete queue is serviced.
             let status = unsafe { GetMessageW(&mut message, None, 0, 0) };
             if status.0 < 0 {
-                return Err(Error::from_win32());
+                return Err(Error::from_thread());
             }
             if status.0 == 0 {
                 return Ok(MessageLoopExit::Shutdown);
@@ -400,9 +400,9 @@ impl WindowTimer {
         // SAFETY: `hwnd` is a live window owned by this calling UI thread. The fixed nonzero ID
         // belongs only to that window, the interval is clamped to Windows' documented range, and
         // no callback pointer is supplied, so expiry is delivered as WM_TIMER.
-        let timer = unsafe { SetTimer(self.hwnd, self.id, interval_ms, None) };
+        let timer = unsafe { SetTimer(Some(self.hwnd), self.id, interval_ms, None) };
         if timer == 0 {
-            let error = Error::from_win32();
+            let error = Error::from_thread();
             let _ = self.stop();
             return Err(error);
         }
@@ -418,7 +418,7 @@ impl WindowTimer {
 
         // SAFETY: This uses the same live owning HWND and fixed ID passed to SetTimer. The token
         // never leaves the UI thread and retries in Drop if Windows reports a failure.
-        let result = unsafe { KillTimer(self.hwnd, self.id) };
+        let result = unsafe { KillTimer(Some(self.hwnd), self.id) };
         if result.is_ok() {
             self.armed = false;
         }
@@ -465,7 +465,7 @@ impl RegisteredWindowClass {
         // valid for the registration lifetime, and registration occurs on the owning thread.
         let atom = unsafe { RegisterClassW(&window_class) };
         if atom == 0 {
-            return Err(Error::from_win32());
+            return Err(Error::from_thread());
         }
 
         Ok(Self {
@@ -480,7 +480,7 @@ impl Drop for RegisteredWindowClass {
         // SAFETY: MessageWindow destroys its only HWND before this field is dropped. The class
         // name and borrowed process instance are the same values used during registration.
         unsafe {
-            let _ = UnregisterClassW(CLASS_NAME, self.instance);
+            let _ = UnregisterClassW(CLASS_NAME, Some(self.instance));
         }
     }
 }
@@ -512,8 +512,8 @@ fn dispatch_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        registered_raw_mouse, timer_interval_ms, IsWindow, MessageWindow, PostMessageW,
-        DWELL_TIMER_ID, LPARAM, TEST_PANIC_MESSAGE, WM_TIMER, WPARAM,
+        DWELL_TIMER_ID, IsWindow, LPARAM, MessageWindow, PostMessageW, TEST_PANIC_MESSAGE,
+        WM_TIMER, WPARAM, registered_raw_mouse, timer_interval_ms,
     };
     use crate::hover::PhysicalScreenPoint;
     use crate::platform::windows::explorer::is_explorer_window;
@@ -531,7 +531,7 @@ mod tests {
             let first_handle = first.handle();
 
             // SAFETY: `first_handle` belongs to the live window on this test thread.
-            assert!(unsafe { IsWindow(first_handle).as_bool() });
+            assert!(unsafe { IsWindow(Some(first_handle)).as_bool() });
             assert!(
                 !is_explorer_window(first_handle),
                 "the private message window must fail the Explorer candidate gate"
@@ -553,13 +553,20 @@ mod tests {
             // SAFETY: This posts an early message using the live window's owned timer ID and no
             // callback pointer. The monotonic state must re-arm the remaining dwell instead of
             // treating message arrival alone as expiry.
-            unsafe { PostMessageW(first_handle, WM_TIMER, WPARAM(DWELL_TIMER_ID), LPARAM(0)) }
-                .expect("the early timer message should be queued");
+            unsafe {
+                PostMessageW(
+                    Some(first_handle),
+                    WM_TIMER,
+                    WPARAM(DWELL_TIMER_ID),
+                    LPARAM(0),
+                )
+            }
+            .expect("the early timer message should be queued");
 
             // SAFETY: The live window owns the receiving queue and this private message carries
             // only zero-valued parameters. Dispatch deliberately panics inside the WNDPROC's
             // catch_unwind boundary.
-            unsafe { PostMessageW(first_handle, TEST_PANIC_MESSAGE, WPARAM(0), LPARAM(0)) }
+            unsafe { PostMessageW(Some(first_handle), TEST_PANIC_MESSAGE, WPARAM(0), LPARAM(0)) }
                 .expect("the callback test message should be queued");
             first
                 .request_shutdown()
@@ -569,7 +576,7 @@ mod tests {
                 .expect("the queued messages should be pumped");
 
             // SAFETY: Checking a stale HWND with IsWindow is the documented validity probe.
-            assert!(!unsafe { IsWindow(first_handle).as_bool() });
+            assert!(!unsafe { IsWindow(Some(first_handle)).as_bool() });
             assert!(
                 registered_raw_mouse()
                     .expect("the process registration should be queryable")
@@ -587,7 +594,7 @@ mod tests {
             assert!(report.changed_samples() <= report.active_samples());
 
             // SAFETY: The consuming diagnostic loop has dropped its owned HWND.
-            assert!(!unsafe { IsWindow(diagnostic_handle).as_bool() });
+            assert!(!unsafe { IsWindow(Some(diagnostic_handle)).as_bool() });
             assert!(
                 registered_raw_mouse()
                     .expect("the process registration should be queryable")
@@ -601,7 +608,7 @@ mod tests {
                 let handle = window.handle();
 
                 // SAFETY: `handle` belongs to the live window on this test thread.
-                assert!(unsafe { IsWindow(handle).as_bool() });
+                assert!(unsafe { IsWindow(Some(handle)).as_bool() });
                 let registration = registered_raw_mouse()
                     .expect("the process registration should be queryable")
                     .expect("the raw mouse should be registered");
@@ -610,7 +617,7 @@ mod tests {
                 drop(window);
 
                 // SAFETY: Checking a stale HWND with IsWindow is the documented validity probe.
-                assert!(!unsafe { IsWindow(handle).as_bool() });
+                assert!(!unsafe { IsWindow(Some(handle)).as_bool() });
                 assert!(
                     registered_raw_mouse()
                         .expect("the process registration should be queryable")

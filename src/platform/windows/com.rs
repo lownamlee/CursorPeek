@@ -1,11 +1,11 @@
 use std::{marker::PhantomData, rc::Rc};
 
 use windows::{
-    core::Result,
     Win32::System::Com::{
-        CoInitializeEx, CoUninitialize, COINIT, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
-        COINIT_MULTITHREADED,
+        COINIT, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, COINIT_MULTITHREADED,
+        CoInitializeEx, CoUninitialize,
     },
+    core::Result,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

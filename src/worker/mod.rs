@@ -9,7 +9,7 @@ use std::{
 
 use protocol::{ProtocolStreamError, ResolverStatus, WorkerMessage};
 
-pub(crate) use manager::{run_launch_diagnostic, run_timeout_diagnostic, WorkerManagerError};
+pub(crate) use manager::{WorkerManagerError, run_launch_diagnostic, run_timeout_diagnostic};
 
 pub(crate) fn run_diagnostic_session<R, W>(
     reader: &mut R,
@@ -90,7 +90,7 @@ impl From<ProtocolStreamError> for WorkerSessionError {
 
 #[cfg(test)]
 mod tests {
-    use super::{protocol, run_diagnostic_session, WorkerSessionError};
+    use super::{WorkerSessionError, protocol, run_diagnostic_session};
     use crate::hover::{Generation, PhysicalScreenPoint};
     use protocol::{ResolverStatus, SessionNonce, WorkerMessage};
     use std::io::Cursor;

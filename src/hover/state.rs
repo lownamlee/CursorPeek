@@ -177,8 +177,8 @@ fn contains_axis(anchor: i32, point: i32, extent: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        DwellCandidate, DwellTimerEvent, Generation, HoverRectangle, HoverState,
-        PhysicalScreenPoint, ReadyDwell, DEFAULT_DWELL_DELAY,
+        DEFAULT_DWELL_DELAY, DwellCandidate, DwellTimerEvent, Generation, HoverRectangle,
+        HoverState, PhysicalScreenPoint, ReadyDwell,
     };
     use std::time::{Duration, Instant};
 

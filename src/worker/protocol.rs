@@ -419,9 +419,8 @@ fn decode_frame(bytes: &[u8]) -> Result<WorkerMessage, ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_frame, encode_message, read_message, write_message, ProtocolError,
-        ProtocolStreamError, ResolverStatus, SessionNonce, WorkerMessage, HEADER_LEN, MAGIC,
-        VERSION,
+        HEADER_LEN, MAGIC, ProtocolError, ProtocolStreamError, ResolverStatus, SessionNonce,
+        VERSION, WorkerMessage, decode_frame, encode_message, read_message, write_message,
     };
     use crate::hover::{Generation, PhysicalScreenPoint};
     use std::io::{self, ErrorKind, Read, Write};

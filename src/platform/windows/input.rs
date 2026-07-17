@@ -1,32 +1,32 @@
 use std::{
     marker::PhantomData,
-    mem::{size_of, MaybeUninit},
+    mem::{MaybeUninit, size_of},
     rc::Rc,
 };
 
 use crate::hover::{HoverRectangle, PhysicalScreenPoint};
 
 use windows::{
-    core::{Error, Result},
     Win32::{
         Foundation::{HWND, LPARAM, POINT},
         UI::{
             HiDpi::{
-                GetDpiForWindow, SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT,
-                DPI_AWARENESS_CONTEXT_UNAWARE,
+                DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_UNAWARE, GetDpiForWindow,
+                SetThreadDpiAwarenessContext,
             },
             Input::{
-                GetRawInputData, RegisterRawInputDevices, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT,
-                RAWINPUTDEVICE, RAWINPUTDEVICE_FLAGS, RAWINPUTHEADER, RAWMOUSE, RIDEV_INPUTSINK,
-                RIDEV_REMOVE, RID_INPUT, RIM_TYPEMOUSE,
+                GetRawInputData, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT, RAWINPUTDEVICE,
+                RAWINPUTDEVICE_FLAGS, RAWINPUTHEADER, RAWMOUSE, RID_INPUT, RIDEV_INPUTSINK,
+                RIDEV_REMOVE, RIM_TYPEMOUSE, RegisterRawInputDevices,
             },
             WindowsAndMessaging::{
-                GetPhysicalCursorPos, SystemParametersInfoW, WindowFromPhysicalPoint,
-                SPI_GETMOUSEHOVERHEIGHT, SPI_GETMOUSEHOVERWIDTH,
-                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+                GetPhysicalCursorPos, SPI_GETMOUSEHOVERHEIGHT, SPI_GETMOUSEHOVERWIDTH,
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+                WindowFromPhysicalPoint,
             },
         },
     },
+    core::{Error, Result},
 };
 
 #[cfg(test)]
@@ -95,18 +95,18 @@ pub(super) fn system_hover_rectangle(anchor: PhysicalScreenPoint) -> Result<Hove
     // returned HWND is borrowed only long enough to query its DPI and is never released here.
     let target = unsafe { WindowFromPhysicalPoint(point) };
     if target.0.is_null() {
-        return Err(Error::from_win32());
+        return Err(Error::from_thread());
     }
 
     // SAFETY: `target` is the live borrowed HWND returned immediately above. A zero result is
     // documented as failure and is rejected before it reaches safe scaling arithmetic.
     let target_dpi = unsafe { GetDpiForWindow(target) };
     if target_dpi == 0 {
-        return Err(Error::from_win32());
+        return Err(Error::from_thread());
     }
 
     let (width, height) = hover_dimensions_at_96_dpi()?;
-    HoverRectangle::from_96_dpi(width, height, target_dpi).ok_or_else(Error::from_win32)
+    HoverRectangle::from_96_dpi(width, height, target_dpi).ok_or_else(Error::from_thread)
 }
 
 fn hover_dimensions_at_96_dpi() -> Result<(u32, u32)> {
@@ -160,7 +160,7 @@ pub(super) fn read_raw_mouse_activity(lparam: LPARAM) -> Result<Option<RawMouseA
     };
 
     if copied == u32::MAX {
-        return Err(Error::from_win32());
+        return Err(Error::from_thread());
     }
     if copied != RAW_INPUT_SIZE || buffer_size != RAW_INPUT_SIZE {
         return Ok(None);
@@ -189,7 +189,7 @@ impl ThreadDpiContext {
         // by this !Send guard and restored before the platform query returns.
         let previous = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE) };
         if previous.0.is_null() {
-            return Err(Error::from_win32());
+            return Err(Error::from_thread());
         }
 
         Ok(Self {
@@ -207,7 +207,7 @@ impl ThreadDpiContext {
         // consumed only after Windows reports that the prior context was restored.
         let replaced = unsafe { SetThreadDpiAwarenessContext(previous) };
         if replaced.0.is_null() {
-            return Err(Error::from_win32());
+            return Err(Error::from_thread());
         }
 
         self.previous = None;
@@ -296,7 +296,7 @@ pub(super) fn registered_raw_mouse() -> Result<Option<RAWINPUTDEVICE>> {
             }));
         }
 
-        let error = Error::from_win32();
+        let error = Error::from_thread();
         if count <= capacity || count > 1_024 {
             return Err(error);
         }
@@ -306,7 +306,7 @@ pub(super) fn registered_raw_mouse() -> Result<Option<RAWINPUTDEVICE>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{physical_cursor_position, system_hover_rectangle, RawMouseActivity};
+    use super::{RawMouseActivity, physical_cursor_position, system_hover_rectangle};
     use crate::hover::PhysicalScreenPoint;
     use windows::Win32::UI::{
         HiDpi::{AreDpiAwarenessContextsEqual, GetThreadDpiAwarenessContext},

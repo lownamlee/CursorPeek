@@ -9,11 +9,11 @@ use std::{
 };
 
 use windows::{
-    core::{Error as WindowsError, HRESULT},
     Win32::{
         Foundation::STATUS_SUCCESS,
-        Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG},
+        Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom},
     },
+    core::{Error as WindowsError, HRESULT},
 };
 
 use crate::{
@@ -345,7 +345,7 @@ impl From<ProtocolStreamError> for WorkerManagerError {
 
 #[cfg(test)]
 mod tests {
-    use super::{exchange, SessionKind, WorkerManagerError, DIAGNOSTIC_GENERATION};
+    use super::{DIAGNOSTIC_GENERATION, SessionKind, WorkerManagerError, exchange};
     use crate::{
         hover::Generation,
         worker::protocol::{self, ResolverStatus, SessionNonce, WorkerMessage},

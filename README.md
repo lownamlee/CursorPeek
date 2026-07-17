@@ -16,7 +16,7 @@ portability, and a simple offline experience.
 ## Requirements
 
 - Windows 10 or Windows 11 x64
-- Rust 1.83.0 with the MSVC target
+- Rust 1.97.1 with the MSVC target
 - Visual Studio Build Tools with the Desktop development with C++ workload
 
 ## Build and check
