@@ -1,4 +1,6 @@
 /target/
+/corpus/sessions/
+/corpus/results/
 *.user
 *.suo
 .idea/

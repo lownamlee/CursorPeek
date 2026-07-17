@@ -1,5 +1,7 @@
 use std::{error::Error, fmt, io};
 
+#[cfg(feature = "resolver-corpus")]
+use crate::corpus;
 use crate::{
     hover::INPUT_DIAGNOSTIC_DURATION,
     mode::ProcessMode,
@@ -17,6 +19,8 @@ pub(crate) fn run(process_mode: ProcessMode) -> Result<(), AppError> {
             Some(ComApartment::initialize(ApartmentKind::SingleThreaded)?)
         }
         ProcessMode::PreviewWorker => None,
+        #[cfg(feature = "resolver-corpus")]
+        ProcessMode::ResolverCorpusProbe => None,
     };
 
     match process_mode {
@@ -51,6 +55,12 @@ pub(crate) fn run(process_mode: ProcessMode) -> Result<(), AppError> {
             let mut resolver = ExplorerResolver::initialize()?;
             worker::run_session(&mut stdin.lock(), &mut stdout.lock(), &mut resolver)?;
         }
+        #[cfg(feature = "resolver-corpus")]
+        ProcessMode::ResolverCorpusProbe => {
+            let stdin = io::stdin();
+            let stdout = io::stdout();
+            corpus::run_probe(&mut stdin.lock(), &mut stdout.lock())?;
+        }
     }
 
     Ok(())
@@ -62,6 +72,8 @@ pub(crate) enum AppError {
     WorkerManager(WorkerManagerError),
     Worker(WorkerSessionError),
     Resolver(ResolverError),
+    #[cfg(feature = "resolver-corpus")]
+    Corpus(corpus::CorpusError),
 }
 
 impl fmt::Display for AppError {
@@ -71,6 +83,8 @@ impl fmt::Display for AppError {
             Self::WorkerManager(error) => write!(formatter, "worker manager: {error}"),
             Self::Worker(error) => write!(formatter, "worker protocol: {error}"),
             Self::Resolver(error) => write!(formatter, "Explorer resolver: {error}"),
+            #[cfg(feature = "resolver-corpus")]
+            Self::Corpus(error) => write!(formatter, "resolver corpus: {error}"),
         }
     }
 }
@@ -82,6 +96,8 @@ impl Error for AppError {
             Self::WorkerManager(error) => Some(error),
             Self::Worker(error) => Some(error),
             Self::Resolver(error) => Some(error),
+            #[cfg(feature = "resolver-corpus")]
+            Self::Corpus(error) => Some(error),
         }
     }
 }
@@ -107,5 +123,12 @@ impl From<WorkerManagerError> for AppError {
 impl From<ResolverError> for AppError {
     fn from(error: ResolverError) -> Self {
         Self::Resolver(error)
+    }
+}
+
+#[cfg(feature = "resolver-corpus")]
+impl From<corpus::CorpusError> for AppError {
+    fn from(error: corpus::CorpusError) -> Self {
+        Self::Corpus(error)
     }
 }

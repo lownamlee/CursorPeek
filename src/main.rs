@@ -1,6 +1,8 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod app;
+#[cfg(feature = "resolver-corpus")]
+mod corpus;
 mod hover;
 mod mode;
 mod platform;

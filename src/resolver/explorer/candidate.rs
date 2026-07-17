@@ -1,7 +1,9 @@
 use windows::{
     Win32::{
         Foundation::RECT,
-        UI::Accessibility::{UIA_DataItemControlTypeId, UIA_ListItemControlTypeId},
+        UI::Accessibility::{
+            UIA_DataItemControlTypeId, UIA_ListControlTypeId, UIA_ListItemControlTypeId,
+        },
     },
     core::BSTR,
 };
@@ -79,37 +81,66 @@ impl CandidateTrace {
             .inspected
             .iter()
             .skip(self.item_index + 1)
-            .any(|metadata| metadata.automation_id.equals_str("ItemsView"))
+            .any(|metadata| {
+                metadata.control_kind.is_items_container()
+                    || metadata.automation_id.equals_str("ItemsView")
+            })
         {
-            return Err(CandidateEvidenceError::MissingItemsViewAncestor);
+            return Err(CandidateEvidenceError::MissingItemsContainerAncestor);
         }
 
-        let legacy_value = item
-            .legacy_value
-            .as_ref()
-            .ok_or(CandidateEvidenceError::MissingLegacyValue)?;
-        let path_units = legacy_value
-            .complete_units()
-            .ok_or(CandidateEvidenceError::TruncatedLegacyValue)?;
+        let view_index = match item.item_index {
+            Some(index) if index > 0 => Some(
+                u32::try_from(index - 1)
+                    .expect("a positive UI Automation item index fits a zero-based u32 index"),
+            ),
+            Some(0) | None => None,
+            Some(index) => return Err(CandidateEvidenceError::InvalidItemIndex(index)),
+        };
+        let path_units = match item.legacy_value.as_ref() {
+            Some(value) => match value.complete_units() {
+                Some(units) => Some(units),
+                None if view_index.is_some() => None,
+                None => return Err(CandidateEvidenceError::TruncatedLegacyValue),
+            },
+            None => None,
+        };
+        if path_units.is_none() && view_index.is_none() {
+            return Err(CandidateEvidenceError::MissingItemIdentity);
+        }
 
         Ok(CandidateEvidence {
             path_units,
+            view_index,
             item_native_window: item.native_window,
+            item_bounds: item.bounds,
         })
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct CandidateEvidence<'a> {
-    pub(super) path_units: &'a [u16],
+    pub(super) path_units: Option<&'a [u16]>,
+    pub(super) view_index: Option<u32>,
     pub(super) item_native_window: usize,
+    pub(super) item_bounds: CachedRect,
+}
+
+impl CandidateEvidence<'_> {
+    pub(super) fn same_fingerprint(&self, other: &CandidateEvidence<'_>) -> bool {
+        self.path_units == other.path_units
+            && self.view_index == other.view_index
+            && self.item_native_window == other.item_native_window
+            && self.item_bounds == other.item_bounds
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CandidateEvidenceError {
-    MissingItemsViewAncestor,
-    MissingLegacyValue,
+    MissingItemsContainerAncestor,
+    MissingItemIdentity,
     TruncatedLegacyValue,
+    InvalidItemIndex(i32),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -199,6 +230,7 @@ pub(super) enum CachedProperty {
     BoundingRectangle,
     NativeWindowHandle,
     AutomationId,
+    ItemIndex,
 }
 
 #[allow(dead_code)] // Shell correlation consumes the HWND/pattern evidence in the next checkpoint.
@@ -212,6 +244,7 @@ pub(super) struct CachedElementMetadata {
     pub(super) automation_id: BoundedText,
     pub(super) has_legacy_pattern: bool,
     pub(super) legacy_value: Option<BoundedLegacyValue>,
+    pub(super) item_index: Option<i32>,
 }
 
 impl CachedElementMetadata {
@@ -224,13 +257,17 @@ impl CachedElementMetadata {
                 .as_ref()
                 .is_none_or(BoundedLegacyValue::invariant_holds)
             && match self.control_kind {
-                ControlKind::ListItem | ControlKind::DataItem | ControlKind::Other(_) => true,
+                ControlKind::List
+                | ControlKind::ListItem
+                | ControlKind::DataItem
+                | ControlKind::Other(_) => true,
             }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ControlKind {
+    List,
     ListItem,
     DataItem,
     Other(i32),
@@ -238,7 +275,9 @@ pub(super) enum ControlKind {
 
 impl ControlKind {
     pub(super) fn from_raw(value: i32) -> Self {
-        if value == UIA_ListItemControlTypeId.0 {
+        if value == UIA_ListControlTypeId.0 {
+            Self::List
+        } else if value == UIA_ListItemControlTypeId.0 {
             Self::ListItem
         } else if value == UIA_DataItemControlTypeId.0 {
             Self::DataItem
@@ -249,6 +288,10 @@ impl ControlKind {
 
     pub(super) fn is_item(self) -> bool {
         matches!(self, Self::ListItem | Self::DataItem)
+    }
+
+    fn is_items_container(self) -> bool {
+        self == Self::List
     }
 }
 
@@ -372,11 +415,16 @@ mod tests {
     };
     use crate::hover::PhysicalScreenPoint;
     use windows::Win32::UI::Accessibility::{
-        UIA_ButtonControlTypeId, UIA_DataItemControlTypeId, UIA_ListItemControlTypeId,
+        UIA_ButtonControlTypeId, UIA_DataItemControlTypeId, UIA_ListControlTypeId,
+        UIA_ListItemControlTypeId,
     };
 
     #[test]
     fn control_classification_accepts_only_explorer_item_shapes() {
+        assert_eq!(
+            ControlKind::from_raw(UIA_ListControlTypeId.0),
+            ControlKind::List
+        );
         assert_eq!(
             ControlKind::from_raw(UIA_ListItemControlTypeId.0),
             ControlKind::ListItem
@@ -463,11 +511,12 @@ mod tests {
             has_legacy_pattern: legacy_value.is_some(),
             legacy_value: legacy_value
                 .map(|value| BoundedLegacyValue::from_bstr(&windows::core::BSTR::from(value))),
+            item_index: None,
         }
     }
 
     #[test]
-    fn shell_evidence_requires_items_view_ancestry_and_complete_legacy_value() {
+    fn shell_evidence_requires_an_items_container_and_one_complete_identity() {
         let candidate = CandidateTrace {
             inspected: vec![
                 metadata(0, ControlKind::ListItem, "", Some(r"C:\preview.txt")),
@@ -485,23 +534,46 @@ mod tests {
         };
         let evidence = candidate.shell_evidence().unwrap();
         assert_eq!(
-            evidence.path_units,
+            evidence.path_units.unwrap(),
             r"C:\preview.txt".encode_utf16().collect::<Vec<_>>()
         );
+        assert_eq!(evidence.view_index, None);
         assert_eq!(evidence.item_native_window, 42);
 
-        let mut no_items_view = candidate.clone();
-        no_items_view.inspected[1].automation_id = BoundedText::from_units(&[]);
+        let mut list_container = candidate.clone();
+        list_container.inspected[1].automation_id = BoundedText::from_units(&[]);
+        list_container.inspected[1].control_kind = ControlKind::List;
+        assert!(list_container.shell_evidence().is_ok());
+
+        let mut no_items_container = candidate.clone();
+        no_items_container.inspected[1].automation_id = BoundedText::from_units(&[]);
         assert_eq!(
-            no_items_view.shell_evidence(),
-            Err(CandidateEvidenceError::MissingItemsViewAncestor)
+            no_items_container.shell_evidence(),
+            Err(CandidateEvidenceError::MissingItemsContainerAncestor)
         );
 
         let mut no_value = candidate;
         no_value.inspected[0].legacy_value = None;
         assert_eq!(
             no_value.shell_evidence(),
-            Err(CandidateEvidenceError::MissingLegacyValue)
+            Err(CandidateEvidenceError::MissingItemIdentity)
+        );
+
+        no_value.inspected[0].item_index = Some(0);
+        assert_eq!(
+            no_value.shell_evidence(),
+            Err(CandidateEvidenceError::MissingItemIdentity)
+        );
+
+        no_value.inspected[0].item_index = Some(1);
+        let index_evidence = no_value.shell_evidence().unwrap();
+        assert_eq!(index_evidence.path_units, None);
+        assert_eq!(index_evidence.view_index, Some(0));
+
+        no_value.inspected[0].item_index = Some(-1);
+        assert_eq!(
+            no_value.shell_evidence(),
+            Err(CandidateEvidenceError::InvalidItemIndex(-1))
         );
     }
 
@@ -526,5 +598,42 @@ mod tests {
             candidate.shell_evidence(),
             Err(CandidateEvidenceError::TruncatedLegacyValue)
         );
+
+        candidate.inspected[0].item_index = Some(2);
+        let evidence = candidate.shell_evidence().unwrap();
+        assert_eq!(evidence.path_units, None);
+        assert_eq!(evidence.view_index, Some(1));
+    }
+
+    #[test]
+    fn candidate_fingerprint_detects_identity_window_and_geometry_changes() {
+        let candidate = CandidateTrace {
+            inspected: vec![
+                metadata(0, ControlKind::ListItem, "", Some(r"C:\preview.txt")),
+                metadata(1, ControlKind::List, "", None),
+            ],
+            item_index: 0,
+            termination: WalkTermination::ParentLookupFailed {
+                after_depth: 1,
+                code: 0,
+            },
+        };
+        let original = candidate.shell_evidence().unwrap();
+        assert!(original.same_fingerprint(&original));
+
+        let mut changed = candidate.clone();
+        changed.inspected[0].item_index = Some(2);
+        let changed_index = changed.shell_evidence().unwrap();
+        assert!(!original.same_fingerprint(&changed_index));
+
+        changed.inspected[0].item_index = None;
+        changed.inspected[0].bounds.right += 1;
+        let changed_bounds = changed.shell_evidence().unwrap();
+        assert!(!original.same_fingerprint(&changed_bounds));
+
+        changed.inspected[0].bounds = candidate.inspected[0].bounds;
+        changed.inspected[0].native_window += 1;
+        let changed_window = changed.shell_evidence().unwrap();
+        assert!(!original.same_fingerprint(&changed_window));
     }
 }
