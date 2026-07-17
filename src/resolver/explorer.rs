@@ -1,12 +1,14 @@
 use std::{error::Error, fmt, time::Duration};
 
 mod candidate;
+mod shell;
 
 use candidate::{
-    BoundedText, CachedElementMetadata, CachedMetadataError, CachedProperty, CachedRect,
-    ControlKind, MAX_ANCESTORS, RejectedTrace, RejectionReason, ResolutionTrace, WalkTermination,
-    finish_trace,
+    BoundedLegacyValue, BoundedText, CachedElementMetadata, CachedMetadataError, CachedProperty,
+    CachedRect, CandidateEvidenceError, ControlKind, MAX_ANCESTORS, RejectedTrace, RejectionReason,
+    ResolutionTrace, WalkTermination, finish_trace,
 };
+use shell::{ShellOutcome, ShellTrace};
 use windows::{
     Win32::{
         Foundation::POINT,
@@ -35,7 +37,7 @@ pub(crate) struct ExplorerResolver {
     automation: IUIAutomation2,
     cache_request: IUIAutomationCacheRequest,
     control_walker: IUIAutomationTreeWalker,
-    last_trace: Option<ResolutionTrace>,
+    last_trace: Option<ExplorerTrace>,
     _apartment: ComApartment,
 }
 
@@ -205,6 +207,7 @@ impl ExplorerResolver {
             let control_type = element
                 .CachedControlType()
                 .map_err(|error| cached_error(depth, CachedProperty::ControlType, error))?;
+            let control_kind = ControlKind::from_raw(control_type.0);
             let name = element
                 .CachedName()
                 .map(|value| BoundedText::from_bstr(&value))
@@ -221,20 +224,29 @@ impl ExplorerResolver {
                 .CachedAutomationId()
                 .map(|value| BoundedText::from_bstr(&value))
                 .map_err(|error| cached_error(depth, CachedProperty::AutomationId, error))?;
-            let has_legacy_pattern = element
+            let legacy_pattern = element
                 .GetCachedPatternAs::<IUIAutomationLegacyIAccessiblePattern>(
                     UIA_LegacyIAccessiblePatternId,
                 )
-                .is_ok();
+                .ok();
+            let legacy_value = if control_kind.is_item() {
+                legacy_pattern
+                    .as_ref()
+                    .and_then(|pattern| pattern.CachedValue().ok())
+                    .map(|value| BoundedLegacyValue::from_bstr(&value))
+            } else {
+                None
+            };
 
             Ok(CachedElementMetadata {
                 depth,
-                control_kind: ControlKind::from_raw(control_type.0),
+                control_kind,
                 name,
                 bounds,
                 native_window,
                 automation_id,
-                has_legacy_pattern,
+                has_legacy_pattern: legacy_pattern.is_some(),
+                legacy_value,
             })
         }
     }
@@ -253,14 +265,72 @@ impl ExplorerResolver {
 
 impl PointResolver for ExplorerResolver {
     fn resolve(&mut self, point: PhysicalScreenPoint) -> ResolveOutcome {
-        let trace = self.inspect_point(point);
+        let uia = self.inspect_point(point);
+        let (outcome, shell) = match &uia {
+            ResolutionTrace::Rejected(_) => (
+                ResolveOutcome::Unavailable,
+                ShellStageTrace::NotAttemptedAfterUiaRejection,
+            ),
+            ResolutionTrace::Candidate(candidate) => match candidate.shell_evidence() {
+                Ok(evidence) => {
+                    let verification = shell::verify(point, evidence);
+                    let outcome = match verification.outcome {
+                        ShellOutcome::Resolved(target) => ResolveOutcome::Resolved(target),
+                        ShellOutcome::Unsupported => ResolveOutcome::Unsupported,
+                        ShellOutcome::Ambiguous => ResolveOutcome::Ambiguous,
+                        ShellOutcome::Unavailable => ResolveOutcome::Unavailable,
+                    };
+                    (outcome, ShellStageTrace::Attempted(verification.trace))
+                }
+                Err(reason) => {
+                    let outcome = match reason {
+                        CandidateEvidenceError::MissingItemsViewAncestor => {
+                            ResolveOutcome::Unsupported
+                        }
+                        CandidateEvidenceError::MissingLegacyValue
+                        | CandidateEvidenceError::TruncatedLegacyValue => {
+                            ResolveOutcome::Unavailable
+                        }
+                    };
+                    (outcome, ShellStageTrace::NotAttempted(reason))
+                }
+            },
+        };
+        let trace = ExplorerTrace { uia, shell };
         debug_assert!(trace.invariant_holds(point));
         self.last_trace = Some(trace);
-
-        // UI Automation metadata is evidence about a control, not a filesystem identity. The next
-        // checkpoint must correlate this bounded candidate with exactly one active Shell view/item.
-        ResolveOutcome::Unavailable
+        outcome
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExplorerTrace {
+    uia: ResolutionTrace,
+    shell: ShellStageTrace,
+}
+
+impl ExplorerTrace {
+    fn invariant_holds(&self, point: PhysicalScreenPoint) -> bool {
+        self.uia.invariant_holds(point)
+            && matches!(
+                (&self.uia, self.shell),
+                (
+                    ResolutionTrace::Rejected(_),
+                    ShellStageTrace::NotAttemptedAfterUiaRejection
+                ) | (
+                    ResolutionTrace::Candidate(_),
+                    ShellStageTrace::NotAttempted(_)
+                ) | (ResolutionTrace::Candidate(_), ShellStageTrace::Attempted(_))
+            )
+    }
+}
+
+#[allow(dead_code)] // Commit 6 emits the bounded stage trace through the corpus runner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShellStageTrace {
+    NotAttemptedAfterUiaRejection,
+    NotAttempted(CandidateEvidenceError),
+    Attempted(ShellTrace),
 }
 
 fn cached_error(
@@ -339,14 +409,19 @@ mod tests {
             );
 
             let point = PhysicalScreenPoint::new(0, 0);
-            assert_eq!(resolver.resolve(point), ResolveOutcome::Unavailable);
+            assert!(matches!(
+                resolver.resolve(point),
+                ResolveOutcome::Unavailable
+                    | ResolveOutcome::Unsupported
+                    | ResolveOutcome::Ambiguous
+            ));
             let trace = resolver
                 .last_trace
                 .as_ref()
                 .expect("a point request should leave one structured trace");
             assert!(trace.invariant_holds(point));
             assert!(matches!(
-                trace,
+                &trace.uia,
                 ResolutionTrace::Candidate(_) | ResolutionTrace::Rejected(_)
             ));
 

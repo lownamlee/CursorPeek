@@ -10,6 +10,7 @@ use crate::hover::PhysicalScreenPoint;
 
 pub(super) const MAX_ANCESTORS: usize = 8;
 const MAX_CACHED_TEXT_UNITS: usize = 256;
+const MAX_LEGACY_VALUE_UNITS: usize = 32_767;
 
 pub(super) fn finish_trace(
     inspected: Vec<CachedElementMetadata>,
@@ -68,6 +69,47 @@ impl CandidateTrace {
             && item.bounds.contains(point)
             && self.termination.invariant_holds(self.inspected.len())
     }
+
+    pub(super) fn shell_evidence(&self) -> Result<CandidateEvidence<'_>, CandidateEvidenceError> {
+        let item = self
+            .inspected
+            .get(self.item_index)
+            .expect("a valid candidate trace always retains its item");
+        if !self
+            .inspected
+            .iter()
+            .skip(self.item_index + 1)
+            .any(|metadata| metadata.automation_id.equals_str("ItemsView"))
+        {
+            return Err(CandidateEvidenceError::MissingItemsViewAncestor);
+        }
+
+        let legacy_value = item
+            .legacy_value
+            .as_ref()
+            .ok_or(CandidateEvidenceError::MissingLegacyValue)?;
+        let path_units = legacy_value
+            .complete_units()
+            .ok_or(CandidateEvidenceError::TruncatedLegacyValue)?;
+
+        Ok(CandidateEvidence {
+            path_units,
+            item_native_window: item.native_window,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CandidateEvidence<'a> {
+    pub(super) path_units: &'a [u16],
+    pub(super) item_native_window: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CandidateEvidenceError {
+    MissingItemsViewAncestor,
+    MissingLegacyValue,
+    TruncatedLegacyValue,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -169,6 +211,7 @@ pub(super) struct CachedElementMetadata {
     pub(super) native_window: usize,
     pub(super) automation_id: BoundedText,
     pub(super) has_legacy_pattern: bool,
+    pub(super) legacy_value: Option<BoundedLegacyValue>,
 }
 
 impl CachedElementMetadata {
@@ -176,6 +219,10 @@ impl CachedElementMetadata {
         self.depth == expected_depth
             && self.name.invariant_holds()
             && self.automation_id.invariant_holds()
+            && self
+                .legacy_value
+                .as_ref()
+                .is_none_or(BoundedLegacyValue::invariant_holds)
             && match self.control_kind {
                 ControlKind::ListItem | ControlKind::DataItem | ControlKind::Other(_) => true,
             }
@@ -270,6 +317,42 @@ impl BoundedText {
             && self.units.len() <= self.source_units
             && (!self.was_truncated() || self.source_units > self.units.len())
     }
+
+    fn equals_str(&self, expected: &str) -> bool {
+        !self.was_truncated() && self.units.iter().copied().eq(expected.encode_utf16())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct BoundedLegacyValue {
+    units: Box<[u16]>,
+    source_units: usize,
+}
+
+impl BoundedLegacyValue {
+    pub(super) fn from_bstr(value: &BSTR) -> Self {
+        let mut end = value.len().min(MAX_LEGACY_VALUE_UNITS);
+        if end < value.len()
+            && end > 0
+            && is_high_surrogate(value[end - 1])
+            && is_low_surrogate(value[end])
+        {
+            end -= 1;
+        }
+
+        Self {
+            units: value[..end].into(),
+            source_units: value.len(),
+        }
+    }
+
+    fn complete_units(&self) -> Option<&[u16]> {
+        (self.units.len() == self.source_units).then_some(&self.units)
+    }
+
+    fn invariant_holds(&self) -> bool {
+        self.units.len() <= MAX_LEGACY_VALUE_UNITS && self.units.len() <= self.source_units
+    }
 }
 
 fn is_high_surrogate(value: u16) -> bool {
@@ -282,7 +365,11 @@ fn is_low_surrogate(value: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{BoundedText, CachedRect, ControlKind, MAX_CACHED_TEXT_UNITS};
+    use super::{
+        BoundedLegacyValue, BoundedText, CachedElementMetadata, CachedRect, CandidateEvidenceError,
+        CandidateTrace, ControlKind, MAX_CACHED_TEXT_UNITS, MAX_LEGACY_VALUE_UNITS,
+        ResolutionTrace, WalkTermination,
+    };
     use crate::hover::PhysicalScreenPoint;
     use windows::Win32::UI::Accessibility::{
         UIA_ButtonControlTypeId, UIA_DataItemControlTypeId, UIA_ListItemControlTypeId,
@@ -351,5 +438,93 @@ mod tests {
         assert_eq!(text.source_units, source.len());
         assert!(!text.was_truncated());
         assert!(text.invariant_holds());
+    }
+
+    fn metadata(
+        depth: usize,
+        control_kind: ControlKind,
+        automation_id: &str,
+        legacy_value: Option<&str>,
+    ) -> CachedElementMetadata {
+        CachedElementMetadata {
+            depth,
+            control_kind,
+            name: BoundedText::from_units(&[]),
+            bounds: CachedRect {
+                left: 0,
+                top: 0,
+                right: 10,
+                bottom: 10,
+            },
+            native_window: 42,
+            automation_id: BoundedText::from_units(
+                &automation_id.encode_utf16().collect::<Vec<_>>(),
+            ),
+            has_legacy_pattern: legacy_value.is_some(),
+            legacy_value: legacy_value
+                .map(|value| BoundedLegacyValue::from_bstr(&windows::core::BSTR::from(value))),
+        }
+    }
+
+    #[test]
+    fn shell_evidence_requires_items_view_ancestry_and_complete_legacy_value() {
+        let candidate = CandidateTrace {
+            inspected: vec![
+                metadata(0, ControlKind::ListItem, "", Some(r"C:\preview.txt")),
+                metadata(1, ControlKind::Other(0), "ItemsView", None),
+            ],
+            item_index: 0,
+            termination: WalkTermination::ParentLookupFailed {
+                after_depth: 1,
+                code: 0,
+            },
+        };
+        let trace = ResolutionTrace::Candidate(candidate.clone());
+        let ResolutionTrace::Candidate(candidate) = trace else {
+            unreachable!();
+        };
+        let evidence = candidate.shell_evidence().unwrap();
+        assert_eq!(
+            evidence.path_units,
+            r"C:\preview.txt".encode_utf16().collect::<Vec<_>>()
+        );
+        assert_eq!(evidence.item_native_window, 42);
+
+        let mut no_items_view = candidate.clone();
+        no_items_view.inspected[1].automation_id = BoundedText::from_units(&[]);
+        assert_eq!(
+            no_items_view.shell_evidence(),
+            Err(CandidateEvidenceError::MissingItemsViewAncestor)
+        );
+
+        let mut no_value = candidate;
+        no_value.inspected[0].legacy_value = None;
+        assert_eq!(
+            no_value.shell_evidence(),
+            Err(CandidateEvidenceError::MissingLegacyValue)
+        );
+    }
+
+    #[test]
+    fn oversized_legacy_values_cannot_become_shell_path_evidence() {
+        let value =
+            windows::core::BSTR::from_wide(&vec![u16::from(b'a'); MAX_LEGACY_VALUE_UNITS + 1]);
+        let mut candidate = CandidateTrace {
+            inspected: vec![
+                metadata(0, ControlKind::DataItem, "", None),
+                metadata(1, ControlKind::Other(0), "ItemsView", None),
+            ],
+            item_index: 0,
+            termination: WalkTermination::ParentLookupFailed {
+                after_depth: 1,
+                code: 0,
+            },
+        };
+        candidate.inspected[0].legacy_value = Some(BoundedLegacyValue::from_bstr(&value));
+
+        assert_eq!(
+            candidate.shell_evidence(),
+            Err(CandidateEvidenceError::TruncatedLegacyValue)
+        );
     }
 }

@@ -34,10 +34,20 @@ where
             Some(_) => return Err(WorkerSessionError::ExpectedResolvePoint),
             None => return Ok(()),
         };
-        let status = match resolver.resolve(point) {
-            ResolveOutcome::Unavailable => ResolverStatus::Unavailable,
-        };
+        let status = resolver_status(resolver.resolve(point));
         protocol::write_message(writer, WorkerMessage::ResolverResult { generation, status })?;
+    }
+}
+
+fn resolver_status(outcome: ResolveOutcome) -> ResolverStatus {
+    match outcome {
+        ResolveOutcome::Resolved(target) => {
+            debug_assert!(target.path().is_absolute());
+            ResolverStatus::Resolved
+        }
+        ResolveOutcome::Unsupported => ResolverStatus::Unsupported,
+        ResolveOutcome::Ambiguous => ResolverStatus::Ambiguous,
+        ResolveOutcome::Unavailable => ResolverStatus::Unavailable,
     }
 }
 
@@ -79,11 +89,11 @@ impl From<ProtocolStreamError> for WorkerSessionError {
 
 #[cfg(test)]
 mod tests {
-    use super::{WorkerSessionError, protocol, run_session};
+    use super::{WorkerSessionError, protocol, resolver_status, run_session};
     use crate::hover::{Generation, PhysicalScreenPoint};
-    use crate::resolver::{PointResolver, ResolveOutcome};
+    use crate::resolver::{PointResolver, ResolveOutcome, ResolvedTarget};
     use protocol::{ResolverStatus, SessionNonce, WorkerMessage};
-    use std::io::Cursor;
+    use std::{io::Cursor, path::PathBuf};
 
     const NONCE: SessionNonce = SessionNonce::from_bytes([
         0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe, 0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23,
@@ -96,6 +106,28 @@ mod tests {
         fn resolve(&mut self, _point: PhysicalScreenPoint) -> ResolveOutcome {
             ResolveOutcome::Unavailable
         }
+    }
+
+    #[test]
+    fn resolver_outcomes_map_to_the_existing_typed_statuses() {
+        assert_eq!(
+            resolver_status(ResolveOutcome::Resolved(ResolvedTarget::new(
+                PathBuf::from(r"C:\preview.txt")
+            ))),
+            ResolverStatus::Resolved
+        );
+        assert_eq!(
+            resolver_status(ResolveOutcome::Unsupported),
+            ResolverStatus::Unsupported
+        );
+        assert_eq!(
+            resolver_status(ResolveOutcome::Ambiguous),
+            ResolverStatus::Ambiguous
+        );
+        assert_eq!(
+            resolver_status(ResolveOutcome::Unavailable),
+            ResolverStatus::Unavailable
+        );
     }
 
     #[test]
