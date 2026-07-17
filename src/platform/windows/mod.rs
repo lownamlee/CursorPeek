@@ -1,6 +1,7 @@
 mod com;
 mod explorer;
 mod input;
+mod mitigation;
 mod process;
 mod window;
 

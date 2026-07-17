@@ -32,13 +32,16 @@ use windows::{
                 EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
                 InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
                 PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST,
-                PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-                UpdateProcThreadAttribute, WaitForSingleObject,
+                PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, PROCESS_INFORMATION, ResumeThread,
+                STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute,
+                WaitForSingleObject,
             },
         },
     },
     core::{Error as WindowsError, PCWSTR, PWSTR},
 };
+
+use super::mitigation::{CreationMitigationPolicy, MitigationError};
 
 const WORKER_MEMORY_LIMIT: usize = 384 * 1024 * 1024;
 const TERMINATED_EXIT_CODE: u32 = 1;
@@ -59,6 +62,7 @@ pub(crate) struct ContainedWorker {
 
 impl ContainedWorker {
     pub(crate) fn spawn(executable: &Path) -> Result<Self, ProcessError> {
+        let mitigation_policy = CreationMitigationPolicy::required()?;
         let job = create_job()?;
         let stdin = PipePair::for_child_stdin()?;
         let stdout = PipePair::for_child_output()?;
@@ -70,7 +74,11 @@ impl ContainedWorker {
             as_windows_handle(&stderr.child),
         ];
         let assigned_jobs = [as_windows_handle(&job)];
-        let attributes = AttributeList::new(&inherited_handles, &assigned_jobs)?;
+        let attributes = AttributeList::new(
+            &inherited_handles,
+            &assigned_jobs,
+            mitigation_policy.as_raw(),
+        )?;
 
         let mut startup = STARTUPINFOEXW::default();
         startup.StartupInfo.cb =
@@ -88,9 +96,10 @@ impl ContainedWorker {
 
         // SAFETY: every pointer refers to live, correctly sized storage for this call. The
         // application path and mutable command line are NUL-terminated. STARTUPINFOEXW begins
-        // with STARTUPINFOW, its cb describes the extended structure, both attribute values stay
-        // alive through the call, and the only inheritable handles in the explicit list are the
-        // three valid child pipe ends. Process/thread security and environment pointers are null.
+        // with STARTUPINFOW, its cb describes the extended structure, all three attribute values
+        // stay alive through the call, and the only inheritable handles in the explicit list are
+        // the three valid child pipe ends. Process/thread security and environment pointers are
+        // null.
         unsafe {
             CreateProcessW(
                 PCWSTR(application_name.as_ptr()),
@@ -109,6 +118,11 @@ impl ContainedWorker {
         let process = own_handle(process_information.hProcess)?;
         let thread = own_handle(process_information.hThread)?;
 
+        if let Err(error) = mitigation_policy.verify_process(&process) {
+            terminate_and_wait_handles(&job, &process)?;
+            return Err(error.into());
+        }
+
         drop(attributes);
         let pipes = WorkerPipes {
             stdin: File::from(stdin.parent),
@@ -120,8 +134,9 @@ impl ContainedWorker {
         drop(stderr.child);
 
         // SAFETY: the thread handle is the owned initial thread returned by successful suspended
-        // process creation. The Job was assigned by PROC_THREAD_ATTRIBUTE_JOB_LIST before this
-        // call, and all parent copies of the worker pipe ends have already been closed.
+        // process creation. The Job and mitigation policy were assigned during process creation,
+        // the queryable mitigations were verified while this thread remained suspended, and all
+        // parent copies of the worker pipe ends have already been closed.
         let previous_suspend_count = unsafe { ResumeThread(as_windows_handle(&thread)) };
         if previous_suspend_count != 1 {
             let error = if previous_suspend_count == u32::MAX {
@@ -195,12 +210,16 @@ struct AttributeList {
 }
 
 impl AttributeList {
-    fn new(inherited_handles: &[HANDLE], assigned_jobs: &[HANDLE]) -> Result<Self, ProcessError> {
+    fn new(
+        inherited_handles: &[HANDLE],
+        assigned_jobs: &[HANDLE],
+        mitigation_policy: &u64,
+    ) -> Result<Self, ProcessError> {
         let mut required_bytes = 0_usize;
         // SAFETY: a null list is the documented size-query form. required_bytes is valid writable
-        // storage, the reserved flags value is zero, and two is the exact maximum attribute count.
+        // storage, the reserved flags value is zero, and three is the exact attribute count.
         let size_query =
-            unsafe { InitializeProcThreadAttributeList(None, 2, None, &mut required_bytes) };
+            unsafe { InitializeProcThreadAttributeList(None, 3, None, &mut required_bytes) };
         if required_bytes == 0 {
             return Err(ProcessError::Native(
                 size_query.err().unwrap_or_else(WindowsError::from_thread),
@@ -219,13 +238,14 @@ impl AttributeList {
         // SAFETY: storage is writable, usize-aligned, and at least the byte count returned by the
         // size query. list points to that stable boxed allocation, and initialized_bytes is valid.
         unsafe {
-            InitializeProcThreadAttributeList(Some(list), 2, None, &mut initialized_bytes)?;
+            InitializeProcThreadAttributeList(Some(list), 3, None, &mut initialized_bytes)?;
         }
 
         let result = (|| {
-            // SAFETY: the list was initialized for two entries. Both nonempty slices contain live
-            // valid handles and remain alive through CreateProcessW; the reserved/output pointers
-            // are null and the byte sizes exactly cover the arrays.
+            // SAFETY: the list was initialized for three entries. Both nonempty slices contain
+            // live valid handles, and the policy is one live u64. All three values remain alive
+            // through CreateProcessW; the reserved/output pointers are null and the byte sizes
+            // exactly cover their values.
             unsafe {
                 UpdateProcThreadAttribute(
                     list,
@@ -242,6 +262,15 @@ impl AttributeList {
                     PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
                     Some(assigned_jobs.as_ptr().cast()),
                     size_of_val(assigned_jobs),
+                    None,
+                    None,
+                )?;
+                UpdateProcThreadAttribute(
+                    list,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY as usize,
+                    Some((mitigation_policy as *const u64).cast()),
+                    size_of_val(mitigation_policy),
                     None,
                     None,
                 )?;
@@ -411,6 +440,7 @@ pub(crate) enum ProcessError {
     PipesAlreadyTaken,
     UnexpectedSuspendCount(u32),
     UnexpectedWaitResult(u32),
+    Mitigation(MitigationError),
     CleanupTimedOut,
 }
 
@@ -430,6 +460,7 @@ impl fmt::Display for ProcessError {
                     "process wait returned unexpected status {result:#x}"
                 )
             }
+            Self::Mitigation(error) => write!(formatter, "{error}"),
             Self::CleanupTimedOut => {
                 write!(
                     formatter,
@@ -444,6 +475,7 @@ impl Error for ProcessError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Native(error) => Some(error),
+            Self::Mitigation(error) => Some(error),
             Self::InvalidHandle
             | Self::SizeOverflow
             | Self::PipesAlreadyTaken
@@ -457,5 +489,11 @@ impl Error for ProcessError {
 impl From<WindowsError> for ProcessError {
     fn from(error: WindowsError) -> Self {
         Self::Native(error)
+    }
+}
+
+impl From<MitigationError> for ProcessError {
+    fn from(error: MitigationError) -> Self {
+        Self::Mitigation(error)
     }
 }

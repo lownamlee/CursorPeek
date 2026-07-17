@@ -12,7 +12,7 @@ Usage:
 
 Options:
   --input-diagnostics  Measure Raw Input coverage over foreground Explorer for 30 seconds
-  --worker-diagnostics Verify contained worker launch, handshake, request, and teardown
+  --worker-diagnostics Verify mitigated worker launch, handshake, request, and teardown
   -h, --help           Show this help text
   -V, --version        Show the program version
 
