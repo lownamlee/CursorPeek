@@ -4,6 +4,7 @@ mod app;
 mod hover;
 mod mode;
 mod platform;
+mod resolver;
 mod worker;
 
 use std::{env, process::ExitCode};
