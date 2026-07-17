@@ -1,7 +1,7 @@
 use std::process::Command;
 
 #[test]
-fn contained_worker_completes_the_control_exchange() {
+fn contained_worker_reuses_then_restarts_after_idle_expiry() {
     let output = Command::new(env!("CARGO_BIN_EXE_CursorPeek"))
         .arg("--worker-diagnostics")
         .output()
@@ -13,10 +13,11 @@ fn contained_worker_completes_the_control_exchange() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(output.stderr.is_empty());
-    assert!(
-        String::from_utf8_lossy(&output.stdout)
-            .contains("Contained worker diagnostic completed: generation=1, status=Unavailable")
-    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(
+        "Contained worker diagnostic completed: generation=1, status=Unavailable, requests=3, \
+         sessions=2, reuse=yes, idle_restart=yes"
+    ));
 }
 
 #[test]
