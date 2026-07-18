@@ -1,4 +1,5 @@
 use std::{
+    fmt,
     marker::PhantomData,
     panic::{AssertUnwindSafe, catch_unwind},
     rc::Rc,
@@ -17,16 +18,19 @@ use crate::hover::{
     DEFAULT_DWELL_DELAY, DwellTimerEvent, HoverState, INPUT_SAMPLE_INTERVAL, InputCoverage,
     InputCoverageReport, PhysicalScreenPoint,
 };
+use crate::preview::PreviewPlacement;
+
+use super::PreviewWindow;
 
 use windows::{
     Win32::{
         Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
         System::LibraryLoader::GetModuleHandleW,
         UI::WindowsAndMessaging::{
-            CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-            HWND_MESSAGE, KillTimer, MSG, PostMessageW, RegisterClassW, SetTimer, TranslateMessage,
-            USER_TIMER_MAXIMUM, USER_TIMER_MINIMUM, UnregisterClassW, WINDOW_EX_STYLE,
-            WINDOW_STYLE, WM_APP, WM_INPUT, WM_TIMER, WNDCLASSW,
+            CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow,
+            GetMessageW, HWND_MESSAGE, KillTimer, MSG, PostMessageW, RegisterClassW, SetTimer,
+            TranslateMessage, USER_TIMER_MAXIMUM, USER_TIMER_MINIMUM, UnregisterClassW,
+            WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_INPUT, WM_TIMER, WNDCLASSW,
         },
     },
     core::{Error, PCWSTR, Result, w},
@@ -40,6 +44,9 @@ const SHUTDOWN_MESSAGE: u32 = WM_APP + 1;
 const DWELL_TIMER_ID: usize = 1;
 const INPUT_SAMPLE_TIMER_ID: usize = 2;
 const INPUT_DIAGNOSTIC_DEADLINE_TIMER_ID: usize = 3;
+const PREVIEW_DIAGNOSTIC_DEADLINE_TIMER_ID: usize = 4;
+
+pub(crate) const PREVIEW_WINDOW_DIAGNOSTIC_DURATION: Duration = Duration::from_millis(1_500);
 
 #[cfg(test)]
 const TEST_PANIC_MESSAGE: u32 = WM_APP + 2;
@@ -49,6 +56,8 @@ pub(crate) struct MessageWindow {
     dwell_timer: Option<WindowTimer>,
     hover_state: HoverState,
     input_diagnostics: Option<InputDiagnostics>,
+    preview_diagnostics: Option<ActivePreviewDiagnostics>,
+    preview_window: Option<PreviewWindow>,
     raw_mouse_input: Option<RawMouseInputRegistration>,
     _class: RegisteredWindowClass,
     _thread_affinity: PhantomData<Rc<()>>,
@@ -83,6 +92,8 @@ impl MessageWindow {
             dwell_timer: Some(WindowTimer::new(hwnd, DWELL_TIMER_ID)),
             hover_state: HoverState::new(DEFAULT_DWELL_DELAY),
             input_diagnostics: None,
+            preview_diagnostics: None,
+            preview_window: None,
             raw_mouse_input: None,
             _class: class,
             _thread_affinity: PhantomData,
@@ -115,6 +126,51 @@ impl MessageWindow {
                 .as_mut()
                 .map_or_else(InputCoverageReport::default, InputDiagnostics::finish)),
             MessageLoopExit::InputDiagnostics(report) => Ok(report),
+            MessageLoopExit::PreviewDiagnostics(_) => {
+                unreachable!("input-coverage diagnostics cannot run a preview-window diagnostic")
+            }
+        }
+    }
+
+    pub(crate) fn run_preview_window_diagnostics(
+        mut self,
+        duration: Duration,
+    ) -> Result<PreviewWindowDiagnosticReport> {
+        let point = physical_cursor_position()?;
+        let anchor = PhysicalScreenPoint::new(point.x, point.y);
+        // SAFETY: This retrieves a borrowed window handle and transfers no ownership.
+        let foreground_before = unsafe { GetForegroundWindow() };
+        if foreground_before.0.is_null() {
+            return Err(Error::from_thread());
+        }
+
+        let preview = PreviewWindow::create()?;
+        let placement = preview.show_at(anchor)?;
+        let mouse_activation_eaten = preview.eats_mouse_activation();
+        // SAFETY: This is the same borrowed foreground-window query made after the no-activate
+        // show and synchronous mouse-activation policy probe.
+        let foreground_after = unsafe { GetForegroundWindow() };
+        let focus_preserved =
+            foreground_before == foreground_after && foreground_after.0 != preview.handle().0;
+
+        let mut deadline_timer = WindowTimer::new(self.hwnd, PREVIEW_DIAGNOSTIC_DEADLINE_TIMER_ID);
+        deadline_timer.arm(duration)?;
+        self.preview_window = Some(preview);
+        self.preview_diagnostics = Some(ActivePreviewDiagnostics {
+            focus_preserved,
+            mouse_activation_eaten,
+            placement,
+            _deadline_timer: deadline_timer,
+        });
+
+        match self.run_loop()? {
+            MessageLoopExit::PreviewDiagnostics(report) => Ok(report),
+            MessageLoopExit::Shutdown => {
+                Ok(self.finish_preview_diagnostics(PreviewWindowDismissal::Shutdown))
+            }
+            MessageLoopExit::InputDiagnostics(_) => {
+                unreachable!("the preview-window diagnostic cannot run input-coverage diagnostics")
+            }
         }
     }
 
@@ -149,6 +205,15 @@ impl MessageWindow {
 
             if message.hwnd == self.hwnd
                 && message.message == WM_TIMER
+                && message.wParam.0 == PREVIEW_DIAGNOSTIC_DEADLINE_TIMER_ID
+            {
+                return Ok(MessageLoopExit::PreviewDiagnostics(
+                    self.finish_preview_diagnostics(PreviewWindowDismissal::Timeout),
+                ));
+            }
+
+            if message.hwnd == self.hwnd
+                && message.message == WM_TIMER
                 && message.wParam.0 == INPUT_SAMPLE_TIMER_ID
             {
                 self.handle_input_diagnostic_sample();
@@ -177,8 +242,35 @@ impl MessageWindow {
             }
 
             if let Some(raw_mouse) = raw_mouse {
+                if preview_input_requires_dismissal(&raw_mouse)
+                    && self.preview_diagnostics.is_some()
+                {
+                    return Ok(MessageLoopExit::PreviewDiagnostics(
+                        self.finish_preview_diagnostics(PreviewWindowDismissal::Input),
+                    ));
+                }
                 self.handle_raw_mouse(raw_mouse);
             }
+        }
+    }
+
+    fn finish_preview_diagnostics(
+        &mut self,
+        dismissal: PreviewWindowDismissal,
+    ) -> PreviewWindowDiagnosticReport {
+        if let Some(preview) = self.preview_window.as_ref() {
+            let _ = preview.hide();
+        }
+
+        let diagnostics = self
+            .preview_diagnostics
+            .take()
+            .expect("a preview diagnostic exits only while active");
+        PreviewWindowDiagnosticReport {
+            focus_preserved: diagnostics.focus_preserved,
+            mouse_activation_eaten: diagnostics.mouse_activation_eaten,
+            placement: diagnostics.placement,
+            dismissal,
         }
     }
 
@@ -330,8 +422,17 @@ impl MessageWindow {
     }
 }
 
+fn preview_input_requires_dismissal(raw_mouse: &Result<Option<RawMouseActivity>>) -> bool {
+    match raw_mouse {
+        Ok(Some(activity)) => activity.is_relevant(),
+        Ok(None) | Err(_) => true,
+    }
+}
+
 impl Drop for MessageWindow {
     fn drop(&mut self) {
+        drop(self.preview_diagnostics.take());
+        drop(self.preview_window.take());
         drop(self.input_diagnostics.take());
         drop(self.dwell_timer.take());
         drop(self.raw_mouse_input.take());
@@ -348,6 +449,52 @@ impl Drop for MessageWindow {
 enum MessageLoopExit {
     Shutdown,
     InputDiagnostics(InputCoverageReport),
+    PreviewDiagnostics(PreviewWindowDiagnosticReport),
+}
+
+struct ActivePreviewDiagnostics {
+    focus_preserved: bool,
+    mouse_activation_eaten: bool,
+    placement: PreviewPlacement,
+    _deadline_timer: WindowTimer,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreviewWindowDismissal {
+    Input,
+    Timeout,
+    Shutdown,
+}
+
+pub(crate) struct PreviewWindowDiagnosticReport {
+    focus_preserved: bool,
+    mouse_activation_eaten: bool,
+    placement: PreviewPlacement,
+    dismissal: PreviewWindowDismissal,
+}
+
+impl fmt::Display for PreviewWindowDiagnosticReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let focus = if self.focus_preserved { "yes" } else { "no" };
+        let mouse_activation = if self.mouse_activation_eaten {
+            "eaten"
+        } else {
+            "passed"
+        };
+        let dismissal = match self.dismissal {
+            PreviewWindowDismissal::Input => "input",
+            PreviewWindowDismissal::Timeout => "timeout",
+            PreviewWindowDismissal::Shutdown => "shutdown",
+        };
+
+        write!(
+            formatter,
+            "No-activate preview diagnostic completed: focus_preserved={focus}, \
+             mouse_activation={mouse_activation}, dismissal={dismissal}, x={}, y={}, width={}, \
+             height={}",
+            self.placement.x, self.placement.y, self.placement.width, self.placement.height
+        )
+    }
 }
 
 struct InputDiagnostics {
@@ -513,15 +660,18 @@ fn dispatch_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) ->
 mod tests {
     use super::{
         DWELL_TIMER_ID, IsWindow, LPARAM, MessageWindow, PostMessageW, TEST_PANIC_MESSAGE,
-        WM_TIMER, WPARAM, registered_raw_mouse, timer_interval_ms,
+        WM_TIMER, WPARAM, preview_input_requires_dismissal, registered_raw_mouse,
+        timer_interval_ms,
     };
     use crate::hover::PhysicalScreenPoint;
     use crate::platform::windows::explorer::is_explorer_window;
+    use crate::platform::windows::input::RawMouseActivity;
     use std::{
         thread,
         time::{Duration, Instant},
     };
     use windows::Win32::UI::Input::RIDEV_INPUTSINK;
+    use windows::core::Error;
 
     #[test]
     fn message_window_lifecycle_and_callback_boundary_are_sound() {
@@ -636,5 +786,20 @@ mod tests {
         assert_eq!(timer_interval_ms(Duration::from_micros(10_001)), 11);
         assert_eq!(timer_interval_ms(Duration::from_millis(400)), 400);
         assert_eq!(timer_interval_ms(Duration::MAX), 2_147_483_647);
+    }
+
+    #[test]
+    fn preview_dismisses_on_relevant_or_unreadable_raw_input() {
+        assert!(!preview_input_requires_dismissal(&Ok(Some(
+            RawMouseActivity::for_test(false, false)
+        ))));
+        assert!(preview_input_requires_dismissal(&Ok(Some(
+            RawMouseActivity::for_test(true, false)
+        ))));
+        assert!(preview_input_requires_dismissal(&Ok(Some(
+            RawMouseActivity::for_test(false, true)
+        ))));
+        assert!(preview_input_requires_dismissal(&Ok(None)));
+        assert!(preview_input_requires_dismissal(&Err(Error::empty())));
     }
 }

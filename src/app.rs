@@ -7,7 +7,7 @@ use crate::{
     mode::ProcessMode,
     platform::{
         ApartmentKind, ComApartment, DPI_DIAGNOSTIC_SUCCESS, DpiAwarenessError, MessageWindow,
-        verify_per_monitor_v2,
+        PREVIEW_WINDOW_DIAGNOSTIC_DURATION, verify_per_monitor_v2,
     },
     resolver::{ExplorerResolver, ResolverError},
     worker::{self, WorkerManagerError, WorkerSessionError},
@@ -19,6 +19,7 @@ pub(crate) fn run(process_mode: ProcessMode) -> Result<(), AppError> {
     let _apartment = match process_mode {
         ProcessMode::Main
         | ProcessMode::InputDiagnostics
+        | ProcessMode::PreviewWindowDiagnostics
         | ProcessMode::WorkerDiagnostics
         | ProcessMode::WorkerTimeoutDiagnostics => {
             Some(ComApartment::initialize(ApartmentKind::SingleThreaded)?)
@@ -49,6 +50,11 @@ pub(crate) fn run(process_mode: ProcessMode) -> Result<(), AppError> {
         }
         ProcessMode::DpiDiagnostics => {
             println!("{DPI_DIAGNOSTIC_SUCCESS}");
+        }
+        ProcessMode::PreviewWindowDiagnostics => {
+            let report = MessageWindow::create()?
+                .run_preview_window_diagnostics(PREVIEW_WINDOW_DIAGNOSTIC_DURATION)?;
+            println!("{report}");
         }
         ProcessMode::WorkerDiagnostics => {
             println!("{}", worker::run_launch_diagnostic()?);
