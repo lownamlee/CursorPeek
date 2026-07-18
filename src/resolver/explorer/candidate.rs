@@ -226,7 +226,6 @@ pub(super) struct CachedMetadataError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CachedProperty {
     ControlType,
-    Name,
     BoundingRectangle,
     NativeWindowHandle,
     AutomationId,
@@ -238,7 +237,6 @@ pub(super) enum CachedProperty {
 pub(super) struct CachedElementMetadata {
     pub(super) depth: usize,
     pub(super) control_kind: ControlKind,
-    pub(super) name: BoundedText,
     pub(super) bounds: CachedRect,
     pub(super) native_window: usize,
     pub(super) automation_id: BoundedText,
@@ -250,7 +248,6 @@ pub(super) struct CachedElementMetadata {
 impl CachedElementMetadata {
     fn invariant_holds(&self, expected_depth: usize) -> bool {
         self.depth == expected_depth
-            && self.name.invariant_holds()
             && self.automation_id.invariant_holds()
             && self
                 .legacy_value
@@ -497,7 +494,6 @@ mod tests {
         CachedElementMetadata {
             depth,
             control_kind,
-            name: BoundedText::from_units(&[]),
             bounds: CachedRect {
                 left: 0,
                 top: 0,

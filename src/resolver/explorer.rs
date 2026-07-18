@@ -21,10 +21,10 @@ use windows::{
             IUIAutomationElement, IUIAutomationLegacyIAccessiblePattern, IUIAutomationRegistrar,
             IUIAutomationTreeWalker, TreeScope_Element, UIA_AutomationIdPropertyId,
             UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId,
-            UIA_LegacyIAccessiblePatternId, UIA_NamePropertyId, UIA_NativeWindowHandlePropertyId,
-            UIA_PROPERTY_ID, UIAutomationPropertyInfo, UIAutomationType_Int,
+            UIA_LegacyIAccessiblePatternId, UIA_NativeWindowHandlePropertyId, UIA_PROPERTY_ID,
+            UIAutomationPropertyInfo, UIAutomationType_Int,
         },
-        UI::Shell::ItemIndex_Property_GUID,
+        UI::Shell::{IShellWindows, ItemIndex_Property_GUID},
     },
     core::{Error as WindowsError, w},
 };
@@ -43,6 +43,8 @@ pub(crate) struct ExplorerResolver {
     automation: IUIAutomation2,
     cache_request: IUIAutomationCacheRequest,
     control_walker: IUIAutomationTreeWalker,
+    shell_windows: IShellWindows,
+    active_folder_view: Option<shell::ActiveFolderView>,
     item_index_property: UIA_PROPERTY_ID,
     last_trace: Option<ExplorerTrace>,
     _apartment: ComApartment,
@@ -106,7 +108,6 @@ impl ExplorerResolver {
             cache_request.SetTreeScope(TreeScope_Element)?;
             for property in [
                 UIA_ControlTypePropertyId,
-                UIA_NamePropertyId,
                 UIA_BoundingRectanglePropertyId,
                 UIA_NativeWindowHandlePropertyId,
                 UIA_AutomationIdPropertyId,
@@ -118,15 +119,36 @@ impl ExplorerResolver {
 
             (cache_request, automation.ControlViewWalker()?)
         };
+        let shell_windows = shell::create_collection()?;
 
         Ok(Self {
             automation,
             cache_request,
             control_walker,
+            shell_windows,
+            active_folder_view: None,
             item_index_property,
             last_trace: None,
             _apartment: apartment,
         })
+    }
+
+    fn select_active_view(
+        &mut self,
+        point: PhysicalScreenPoint,
+    ) -> Result<shell::ActiveFolderView, shell::ShellRejection> {
+        let first = shell::select(&self.shell_windows, &mut self.active_folder_view, point);
+        if !matches!(
+            first,
+            Err(shell::ShellRejection::ShellWindowsUnavailable(_))
+        ) {
+            return first;
+        }
+
+        self.shell_windows = shell::create_collection()
+            .map_err(|error| shell::ShellRejection::ShellWindowsUnavailable(error.code().0))?;
+        self.active_folder_view = None;
+        shell::select(&self.shell_windows, &mut self.active_folder_view, point)
     }
 
     fn inspect_point(&self, point: PhysicalScreenPoint) -> PointInspection {
@@ -288,10 +310,6 @@ impl ExplorerResolver {
                 .CachedControlType()
                 .map_err(|error| cached_error(depth, CachedProperty::ControlType, error))?;
             let control_kind = ControlKind::from_raw(control_type.0);
-            let name = element
-                .CachedName()
-                .map(|value| BoundedText::from_bstr(&value))
-                .map_err(|error| cached_error(depth, CachedProperty::Name, error))?;
             let bounds = element
                 .CachedBoundingRectangle()
                 .map(CachedRect::from)
@@ -330,7 +348,6 @@ impl ExplorerResolver {
             Ok(CachedElementMetadata {
                 depth,
                 control_kind,
-                name,
                 bounds,
                 native_window,
                 automation_id,
@@ -379,7 +396,7 @@ impl ExplorerResolver {
 
 impl PointResolver for ExplorerResolver {
     fn resolve(&mut self, point: PhysicalScreenPoint) -> ResolveOutcome {
-        let active_view = shell::select(point);
+        let active_view = self.select_active_view(point);
         let PointInspection {
             trace: uia,
             item_element,
@@ -585,7 +602,6 @@ fn walk_reason(termination: WalkTermination) -> CorpusReason {
 const fn cached_property_reason(property: CachedProperty) -> &'static str {
     match property {
         CachedProperty::ControlType => "uia.cached_control_type_failed",
-        CachedProperty::Name => "uia.cached_name_failed",
         CachedProperty::BoundingRectangle => "uia.cached_bounds_failed",
         CachedProperty::NativeWindowHandle => "uia.cached_native_window_failed",
         CachedProperty::AutomationId => "uia.cached_automation_id_failed",
@@ -802,6 +818,7 @@ mod tests {
         resolver::{PointResolver, ResolveOutcome},
     };
     use std::thread;
+    use windows::core::Interface;
 
     #[test]
     fn automation_is_configured_resolves_a_point_and_releases_inside_its_mta() {
@@ -815,12 +832,18 @@ mod tests {
             );
 
             let point = PhysicalScreenPoint::new(0, 0);
+            let shell_collection = Interface::as_raw(&resolver.shell_windows);
             assert!(matches!(
                 resolver.resolve(point),
                 ResolveOutcome::Unavailable
                     | ResolveOutcome::Unsupported
                     | ResolveOutcome::Ambiguous
             ));
+            assert_eq!(
+                Interface::as_raw(&resolver.shell_windows),
+                shell_collection,
+                "ordinary observations should reuse the apartment-local Shell collection"
+            );
             let trace = resolver
                 .last_trace
                 .as_ref()

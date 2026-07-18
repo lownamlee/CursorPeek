@@ -40,6 +40,7 @@ pub(super) struct ShellVerification {
     pub(super) trace: ShellTrace,
 }
 
+#[derive(Clone)]
 pub(super) struct ActiveFolderView {
     folder_view: IFolderView2,
     shell_browser: IShellBrowser,
@@ -100,13 +101,37 @@ pub(super) enum ShellRejection {
     MatchingItemIsNotAFile,
 }
 
-pub(super) fn select(point: PhysicalScreenPoint) -> Result<ActiveFolderView, ShellRejection> {
+pub(super) fn create_collection() -> windows::core::Result<IShellWindows> {
     // SAFETY: the caller owns a live MTA for the duration of this function. ShellWindows is a
-    // system COM class, no aggregation is requested, and every returned interface remains local
-    // to this resolver/apartment.
-    let shell_windows: IShellWindows = unsafe { CoCreateInstance(&ShellWindows, None, CLSCTX_ALL) }
-        .map_err(|error| ShellRejection::ShellWindowsUnavailable(error.code().0))?;
-    active_folder_view(&shell_windows, point)
+    // system COM class, no aggregation is requested, and the returned interface remains local to
+    // the resolver apartment until it is released there.
+    unsafe { CoCreateInstance(&ShellWindows, None, CLSCTX_ALL) }
+}
+
+pub(super) fn select(
+    shell_windows: &IShellWindows,
+    cached: &mut Option<ActiveFolderView>,
+    point: PhysicalScreenPoint,
+) -> Result<ActiveFolderView, ShellRejection> {
+    if let Some(existing) = cached.as_ref() {
+        match existing.try_reuse(shell_windows, point) {
+            Ok(Some(active_view)) => {
+                *cached = Some(active_view.clone());
+                return Ok(active_view);
+            }
+            Ok(None) => {
+                *cached = None;
+            }
+            Err(reason) => {
+                *cached = None;
+                return Err(reason);
+            }
+        }
+    }
+
+    let active_view = active_folder_view(shell_windows, point)?;
+    *cached = Some(active_view.clone());
+    Ok(active_view)
 }
 
 pub(super) fn selection_failure(reason: ShellRejection) -> ShellVerification {
@@ -180,15 +205,7 @@ fn active_folder_view(
     // SAFETY: every method is called on an apartment-local interface. Window handles are copied
     // values and are revalidated before use. No borrowed pointer outlives this function.
     unsafe {
-        let count = shell_windows
-            .Count()
-            .map_err(|error| ShellRejection::ShellWindowsUnavailable(error.code().0))?;
-        if count < 0 {
-            return Err(ShellRejection::InvalidShellWindowCount(count));
-        }
-        if count > MAX_SHELL_WINDOWS {
-            return Err(ShellRejection::ShellWindowLimitExceeded(count));
-        }
+        let count = shell_window_count(shell_windows)?;
 
         let screen_point = POINT {
             x: point.x,
@@ -292,7 +309,76 @@ unsafe fn relevant_folder_view(
     }
 }
 
+fn shell_window_count(shell_windows: &IShellWindows) -> Result<i32, ShellRejection> {
+    // SAFETY: the collection is live and apartment-local. Count returns one copied signed value.
+    let count = unsafe { shell_windows.Count() }
+        .map_err(|error| ShellRejection::ShellWindowsUnavailable(error.code().0))?;
+    if count < 0 {
+        return Err(ShellRejection::InvalidShellWindowCount(count));
+    }
+    if count > MAX_SHELL_WINDOWS {
+        return Err(ShellRejection::ShellWindowLimitExceeded(count));
+    }
+    Ok(count)
+}
+
 impl ActiveFolderView {
+    fn try_reuse(
+        &self,
+        shell_windows: &IShellWindows,
+        point: PhysicalScreenPoint,
+    ) -> Result<Option<Self>, ShellRejection> {
+        // SAFETY: the cached interfaces remain on their owning MTA. A cache hit is allowed only
+        // while the point still belongs to the same visible foreground browser, the registered
+        // Shell-window count is unchanged, and QueryActiveShellView returns the same controlling
+        // IUnknown identity. Any ordinary view/window change falls back to full enumeration.
+        unsafe {
+            let pointer_window = WindowFromPoint(POINT {
+                x: point.x,
+                y: point.y,
+            });
+            if pointer_window.0.is_null() {
+                return Err(ShellRejection::PointerWindowUnavailable);
+            }
+            let pointer_root = GetAncestor(pointer_window, GA_ROOT);
+            if pointer_root.0.is_null() || GetForegroundWindow() != pointer_root {
+                return Err(ShellRejection::PointerLeftForegroundExplorer);
+            }
+            if pointer_root != self.browser_window
+                || !IsWindowVisible(self.browser_window).as_bool()
+                || IsIconic(self.browser_window).as_bool()
+            {
+                return Ok(None);
+            }
+
+            let count = shell_window_count(shell_windows)?;
+            if count != self.shell_window_count {
+                return Ok(None);
+            }
+
+            let Ok(current_view) = self.shell_browser.QueryActiveShellView() else {
+                return Ok(None);
+            };
+            let Ok(current_identity) = current_view.cast::<IUnknown>() else {
+                return Ok(None);
+            };
+            if Interface::as_raw(&current_identity) != Interface::as_raw(&self.shell_view_identity)
+            {
+                return Ok(None);
+            }
+
+            Ok(Some(Self {
+                folder_view: self.folder_view.clone(),
+                shell_browser: self.shell_browser.clone(),
+                shell_view_identity: current_identity,
+                browser_window: self.browser_window,
+                pointer_window,
+                shell_window_index: self.shell_window_index,
+                shell_window_count: count,
+            }))
+        }
+    }
+
     fn revalidate(
         &self,
         point: PhysicalScreenPoint,
