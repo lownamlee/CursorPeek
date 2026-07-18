@@ -16,13 +16,16 @@ Options:
   -h, --help           Show this help text
   -V, --version        Show the program version
 
-The preview-worker and timeout-diagnostic modes are private.
+The DPI, preview-window, preview-worker, and timeout-diagnostic modes are private.
 ";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProcessMode {
     Main,
     InputDiagnostics,
+    DpiDiagnostics,
+    PreviewWindowDiagnostics,
+    PreviewWindowPracticeDiagnostics,
     WorkerDiagnostics,
     WorkerTimeoutDiagnostics,
     PreviewWorker,
@@ -52,6 +55,13 @@ impl Command {
             Some("-h" | "--help") => Self::Help,
             Some("-V" | "--version") => Self::Version,
             Some("--input-diagnostics") => Self::Run(ProcessMode::InputDiagnostics),
+            Some("--dpi-diagnostics") => Self::Run(ProcessMode::DpiDiagnostics),
+            Some("--preview-window-diagnostics") => {
+                Self::Run(ProcessMode::PreviewWindowDiagnostics)
+            }
+            Some("--preview-window-practice-diagnostics") => {
+                Self::Run(ProcessMode::PreviewWindowPracticeDiagnostics)
+            }
             Some("--worker-diagnostics") => Self::Run(ProcessMode::WorkerDiagnostics),
             Some("--worker-timeout-diagnostics") => {
                 Self::Run(ProcessMode::WorkerTimeoutDiagnostics)
@@ -134,6 +144,26 @@ mod tests {
         assert_eq!(
             Command::parse(["--input-diagnostics"]),
             Ok(Command::Run(ProcessMode::InputDiagnostics))
+        );
+    }
+
+    #[test]
+    fn private_switch_selects_dpi_diagnostic_mode() {
+        assert_eq!(
+            Command::parse(["--dpi-diagnostics"]),
+            Ok(Command::Run(ProcessMode::DpiDiagnostics))
+        );
+    }
+
+    #[test]
+    fn private_switch_selects_preview_window_diagnostic_mode() {
+        assert_eq!(
+            Command::parse(["--preview-window-diagnostics"]),
+            Ok(Command::Run(ProcessMode::PreviewWindowDiagnostics))
+        );
+        assert_eq!(
+            Command::parse(["--preview-window-practice-diagnostics"]),
+            Ok(Command::Run(ProcessMode::PreviewWindowPracticeDiagnostics))
         );
     }
 

@@ -66,9 +66,7 @@ impl CandidateTrace {
                 .iter()
                 .enumerate()
                 .all(|(depth, metadata)| metadata.invariant_holds(depth))
-            && item.control_kind.is_item()
-            && item.bounds.is_ordered()
-            && item.bounds.contains(point)
+            && item.is_item_at(point)
             && self.termination.invariant_holds(self.inspected.len())
     }
 
@@ -89,7 +87,18 @@ impl CandidateTrace {
             return Err(CandidateEvidenceError::MissingItemsContainerAncestor);
         }
 
-        let view_index = match item.item_index {
+        item.shell_evidence()
+    }
+}
+
+impl CachedElementMetadata {
+    pub(super) fn is_item_at(&self, point: PhysicalScreenPoint) -> bool {
+        self.control_kind.is_item() && self.bounds.is_ordered() && self.bounds.contains(point)
+    }
+
+    pub(super) fn shell_evidence(&self) -> Result<CandidateEvidence<'_>, CandidateEvidenceError> {
+        debug_assert!(self.control_kind.is_item());
+        let view_index = match self.item_index {
             Some(index) if index > 0 => Some(
                 u32::try_from(index - 1)
                     .expect("a positive UI Automation item index fits a zero-based u32 index"),
@@ -97,7 +106,7 @@ impl CandidateTrace {
             Some(0) | None => None,
             Some(index) => return Err(CandidateEvidenceError::InvalidItemIndex(index)),
         };
-        let path_units = match item.legacy_value.as_ref() {
+        let path_units = match self.legacy_value.as_ref() {
             Some(value) => match value.complete_units() {
                 Some(units) => Some(units),
                 None if view_index.is_some() => None,
@@ -111,9 +120,10 @@ impl CandidateTrace {
 
         Ok(CandidateEvidence {
             path_units,
+            display_name_units: self.name.complete_nonempty_units(),
             view_index,
-            item_native_window: item.native_window,
-            item_bounds: item.bounds,
+            item_native_window: self.native_window,
+            item_bounds: self.bounds,
         })
     }
 }
@@ -121,6 +131,7 @@ impl CandidateTrace {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct CandidateEvidence<'a> {
     pub(super) path_units: Option<&'a [u16]>,
+    pub(super) display_name_units: Option<&'a [u16]>,
     pub(super) view_index: Option<u32>,
     pub(super) item_native_window: usize,
     pub(super) item_bounds: CachedRect,
@@ -129,6 +140,7 @@ pub(super) struct CandidateEvidence<'a> {
 impl CandidateEvidence<'_> {
     pub(super) fn same_fingerprint(&self, other: &CandidateEvidence<'_>) -> bool {
         self.path_units == other.path_units
+            && self.display_name_units == other.display_name_units
             && self.view_index == other.view_index
             && self.item_native_window == other.item_native_window
             && self.item_bounds == other.item_bounds
@@ -226,10 +238,10 @@ pub(super) struct CachedMetadataError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CachedProperty {
     ControlType,
-    Name,
     BoundingRectangle,
     NativeWindowHandle,
     AutomationId,
+    Name,
     ItemIndex,
 }
 
@@ -238,10 +250,10 @@ pub(super) enum CachedProperty {
 pub(super) struct CachedElementMetadata {
     pub(super) depth: usize,
     pub(super) control_kind: ControlKind,
-    pub(super) name: BoundedText,
     pub(super) bounds: CachedRect,
     pub(super) native_window: usize,
     pub(super) automation_id: BoundedText,
+    pub(super) name: BoundedText,
     pub(super) has_legacy_pattern: bool,
     pub(super) legacy_value: Option<BoundedLegacyValue>,
     pub(super) item_index: Option<i32>,
@@ -250,8 +262,8 @@ pub(super) struct CachedElementMetadata {
 impl CachedElementMetadata {
     fn invariant_holds(&self, expected_depth: usize) -> bool {
         self.depth == expected_depth
-            && self.name.invariant_holds()
             && self.automation_id.invariant_holds()
+            && self.name.invariant_holds()
             && self
                 .legacy_value
                 .as_ref()
@@ -363,6 +375,10 @@ impl BoundedText {
 
     fn equals_str(&self, expected: &str) -> bool {
         !self.was_truncated() && self.units.iter().copied().eq(expected.encode_utf16())
+    }
+
+    fn complete_nonempty_units(&self) -> Option<&[u16]> {
+        (!self.was_truncated() && !self.units.is_empty()).then_some(&self.units)
     }
 }
 
@@ -497,7 +513,6 @@ mod tests {
         CachedElementMetadata {
             depth,
             control_kind,
-            name: BoundedText::from_units(&[]),
             bounds: CachedRect {
                 left: 0,
                 top: 0,
@@ -508,6 +523,7 @@ mod tests {
             automation_id: BoundedText::from_units(
                 &automation_id.encode_utf16().collect::<Vec<_>>(),
             ),
+            name: BoundedText::from_units(&"preview.txt".encode_utf16().collect::<Vec<_>>()),
             has_legacy_pattern: legacy_value.is_some(),
             legacy_value: legacy_value
                 .map(|value| BoundedLegacyValue::from_bstr(&windows::core::BSTR::from(value))),
@@ -538,6 +554,10 @@ mod tests {
             r"C:\preview.txt".encode_utf16().collect::<Vec<_>>()
         );
         assert_eq!(evidence.view_index, None);
+        assert_eq!(
+            evidence.display_name_units.unwrap(),
+            "preview.txt".encode_utf16().collect::<Vec<_>>()
+        );
         assert_eq!(evidence.item_native_window, 42);
 
         let mut list_container = candidate.clone();
@@ -635,5 +655,25 @@ mod tests {
         changed.inspected[0].native_window += 1;
         let changed_window = changed.shell_evidence().unwrap();
         assert!(!original.same_fingerprint(&changed_window));
+
+        changed.inspected[0].native_window = candidate.inspected[0].native_window;
+        changed.inspected[0].name =
+            BoundedText::from_units(&"different.txt".encode_utf16().collect::<Vec<_>>());
+        let changed_name = changed.shell_evidence().unwrap();
+        assert!(!original.same_fingerprint(&changed_name));
+    }
+
+    #[test]
+    fn refreshed_item_requires_an_item_shape_containing_the_point() {
+        let mut item = metadata(0, ControlKind::ListItem, "", Some(r"C:\preview.txt"));
+        assert!(item.is_item_at(PhysicalScreenPoint::new(5, 5)));
+        assert!(!item.is_item_at(PhysicalScreenPoint::new(10, 5)));
+
+        item.control_kind = ControlKind::Other(0);
+        assert!(!item.is_item_at(PhysicalScreenPoint::new(5, 5)));
+
+        item.control_kind = ControlKind::DataItem;
+        item.bounds.right = item.bounds.left;
+        assert!(!item.is_item_at(PhysicalScreenPoint::new(5, 5)));
     }
 }

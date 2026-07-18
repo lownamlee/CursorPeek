@@ -6,6 +6,7 @@ mod corpus;
 mod hover;
 mod mode;
 mod platform;
+mod preview;
 mod resolver;
 mod worker;
 

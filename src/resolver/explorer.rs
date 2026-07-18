@@ -20,11 +20,12 @@ use windows::{
             CUIAutomation8, CUIAutomationRegistrar, IUIAutomation2, IUIAutomationCacheRequest,
             IUIAutomationElement, IUIAutomationLegacyIAccessiblePattern, IUIAutomationRegistrar,
             IUIAutomationTreeWalker, TreeScope_Element, UIA_AutomationIdPropertyId,
-            UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId,
-            UIA_LegacyIAccessiblePatternId, UIA_NamePropertyId, UIA_NativeWindowHandlePropertyId,
-            UIA_PROPERTY_ID, UIAutomationPropertyInfo, UIAutomationType_Int,
+            UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId, UIA_DataItemControlTypeId,
+            UIA_LegacyIAccessiblePatternId, UIA_ListItemControlTypeId, UIA_NamePropertyId,
+            UIA_NativeWindowHandlePropertyId, UIA_PROPERTY_ID, UIAutomationPropertyInfo,
+            UIAutomationType_Int,
         },
-        UI::Shell::ItemIndex_Property_GUID,
+        UI::Shell::{IShellWindows, ItemIndex_Property_GUID},
     },
     core::{Error as WindowsError, w},
 };
@@ -43,6 +44,9 @@ pub(crate) struct ExplorerResolver {
     automation: IUIAutomation2,
     cache_request: IUIAutomationCacheRequest,
     control_walker: IUIAutomationTreeWalker,
+    item_walker: IUIAutomationTreeWalker,
+    shell_windows: IShellWindows,
+    active_folder_view: Option<shell::ActiveFolderView>,
     item_index_property: UIA_PROPERTY_ID,
     last_trace: Option<ExplorerTrace>,
     _apartment: ComApartment,
@@ -101,32 +105,79 @@ impl ExplorerResolver {
         // SAFETY: all three interfaces are created by the live apartment-local automation client.
         // The cache request retains copied property/pattern identifiers only. TreeScope_Element
         // limits each lookup to the returned element; parents are fetched individually below.
-        let (cache_request, control_walker) = unsafe {
+        let (cache_request, control_walker, item_walker) = unsafe {
             let cache_request = automation.CreateCacheRequest()?;
             cache_request.SetTreeScope(TreeScope_Element)?;
             for property in [
                 UIA_ControlTypePropertyId,
-                UIA_NamePropertyId,
                 UIA_BoundingRectanglePropertyId,
                 UIA_NativeWindowHandlePropertyId,
                 UIA_AutomationIdPropertyId,
+                UIA_NamePropertyId,
                 item_index_property,
             ] {
                 cache_request.AddProperty(property)?;
             }
             cache_request.AddPattern(UIA_LegacyIAccessiblePatternId)?;
 
-            (cache_request, automation.ControlViewWalker()?)
+            let list_item = automation.CreatePropertyCondition(
+                UIA_ControlTypePropertyId,
+                &VARIANT::from(UIA_ListItemControlTypeId.0),
+            )?;
+            let data_item = automation.CreatePropertyCondition(
+                UIA_ControlTypePropertyId,
+                &VARIANT::from(UIA_DataItemControlTypeId.0),
+            )?;
+            let item_condition = automation.CreateOrCondition(&list_item, &data_item)?;
+
+            (
+                cache_request,
+                automation.ControlViewWalker()?,
+                automation.CreateTreeWalker(&item_condition)?,
+            )
         };
+        let shell_windows = shell::create_collection()?;
 
         Ok(Self {
             automation,
             cache_request,
             control_walker,
+            item_walker,
+            shell_windows,
+            active_folder_view: None,
             item_index_property,
             last_trace: None,
             _apartment: apartment,
         })
+    }
+
+    fn select_active_view(
+        &mut self,
+        point: PhysicalScreenPoint,
+        evidence: candidate::CandidateEvidence<'_>,
+    ) -> Result<shell::ActiveFolderView, shell::ShellRejection> {
+        let first = shell::select(
+            &self.shell_windows,
+            &mut self.active_folder_view,
+            point,
+            evidence,
+        );
+        if !matches!(
+            first,
+            Err(shell::ShellRejection::ShellWindowsUnavailable(_))
+        ) {
+            return first;
+        }
+
+        self.shell_windows = shell::create_collection()
+            .map_err(|error| shell::ShellRejection::ShellWindowsUnavailable(error.code().0))?;
+        self.active_folder_view = None;
+        shell::select(
+            &self.shell_windows,
+            &mut self.active_folder_view,
+            point,
+            evidence,
+        )
     }
 
     fn inspect_point(&self, point: PhysicalScreenPoint) -> PointInspection {
@@ -248,14 +299,30 @@ impl ExplorerResolver {
         original_element: &IUIAutomationElement,
         original_evidence: &candidate::CandidateEvidence<'_>,
     ) -> Result<(), shell::ShellRejection> {
-        let second = self.inspect_point(point);
-        let ResolutionTrace::Candidate(candidate) = &second.trace else {
+        // SAFETY: all interfaces remain on their owning MTA. ElementFromPoint retrieves the live
+        // element at the same physical point; the conditioned walker then normalizes that hit to
+        // the nearest ListItem/DataItem ancestor and refreshes only the existing bounded cache.
+        // NormalizeElementBuildCache may return the root when no condition matches, so the cached
+        // control kind and geometry are still checked below before any identity comparison.
+        let hit = unsafe {
+            self.automation.ElementFromPoint(POINT {
+                x: point.x,
+                y: point.y,
+            })
+        }
+        .map_err(|error| shell::ShellRejection::CandidateRevalidationFailed(error.code().0))?;
+        let updated = unsafe {
+            self.item_walker
+                .NormalizeElementBuildCache(&hit, &self.cache_request)
+        }
+        .map_err(|error| shell::ShellRejection::CandidateRevalidationFailed(error.code().0))?;
+        let metadata = self
+            .read_cached_metadata(&updated, 0)
+            .map_err(|error| shell::ShellRejection::CandidateRevalidationFailed(error.code))?;
+        if !metadata.is_item_at(point) {
             return Err(shell::ShellRejection::CandidateChangedDuringVerification);
-        };
-        let Some(second_element) = second.item_element.as_ref() else {
-            return Err(shell::ShellRejection::CandidateChangedDuringVerification);
-        };
-        let second_evidence = candidate
+        }
+        let updated_evidence = metadata
             .shell_evidence()
             .map_err(|_| shell::ShellRejection::CandidateChangedDuringVerification)?;
 
@@ -263,13 +330,13 @@ impl ExplorerResolver {
         // comparison uses UIA runtime identity and returns a copied BOOL.
         let same_element = unsafe {
             self.automation
-                .CompareElements(original_element, second_element)
+                .CompareElements(original_element, &updated)
                 .map_err(|error| {
                     shell::ShellRejection::CandidateRevalidationFailed(error.code().0)
                 })?
                 .as_bool()
         };
-        if !same_element || !original_evidence.same_fingerprint(&second_evidence) {
+        if !same_element || !original_evidence.same_fingerprint(&updated_evidence) {
             return Err(shell::ShellRejection::CandidateChangedDuringVerification);
         }
         Ok(())
@@ -288,10 +355,6 @@ impl ExplorerResolver {
                 .CachedControlType()
                 .map_err(|error| cached_error(depth, CachedProperty::ControlType, error))?;
             let control_kind = ControlKind::from_raw(control_type.0);
-            let name = element
-                .CachedName()
-                .map(|value| BoundedText::from_bstr(&value))
-                .map_err(|error| cached_error(depth, CachedProperty::Name, error))?;
             let bounds = element
                 .CachedBoundingRectangle()
                 .map(CachedRect::from)
@@ -304,6 +367,10 @@ impl ExplorerResolver {
                 .CachedAutomationId()
                 .map(|value| BoundedText::from_bstr(&value))
                 .map_err(|error| cached_error(depth, CachedProperty::AutomationId, error))?;
+            let name = element
+                .CachedName()
+                .map(|value| BoundedText::from_bstr(&value))
+                .map_err(|error| cached_error(depth, CachedProperty::Name, error))?;
             let legacy_pattern = element
                 .GetCachedPatternAs::<IUIAutomationLegacyIAccessiblePattern>(
                     UIA_LegacyIAccessiblePatternId,
@@ -330,10 +397,10 @@ impl ExplorerResolver {
             Ok(CachedElementMetadata {
                 depth,
                 control_kind,
-                name,
                 bounds,
                 native_window,
                 automation_id,
+                name,
                 has_legacy_pattern: legacy_pattern.is_some(),
                 legacy_value,
                 item_index,
@@ -379,7 +446,6 @@ impl ExplorerResolver {
 
 impl PointResolver for ExplorerResolver {
     fn resolve(&mut self, point: PhysicalScreenPoint) -> ResolveOutcome {
-        let active_view = shell::select(point);
         let PointInspection {
             trace: uia,
             item_element,
@@ -391,6 +457,7 @@ impl PointResolver for ExplorerResolver {
             ),
             ResolutionTrace::Candidate(candidate) => match candidate.shell_evidence() {
                 Ok(evidence) => {
+                    let active_view = self.select_active_view(point, evidence);
                     let mut verification = match &active_view {
                         Ok(active_view) => shell::verify(active_view, point, evidence),
                         Err(reason) => shell::selection_failure(*reason),
@@ -585,10 +652,10 @@ fn walk_reason(termination: WalkTermination) -> CorpusReason {
 const fn cached_property_reason(property: CachedProperty) -> &'static str {
     match property {
         CachedProperty::ControlType => "uia.cached_control_type_failed",
-        CachedProperty::Name => "uia.cached_name_failed",
         CachedProperty::BoundingRectangle => "uia.cached_bounds_failed",
         CachedProperty::NativeWindowHandle => "uia.cached_native_window_failed",
         CachedProperty::AutomationId => "uia.cached_automation_id_failed",
+        CachedProperty::Name => "uia.cached_name_failed",
         CachedProperty::ItemIndex => "uia.cached_item_index_failed",
     }
 }
@@ -676,6 +743,9 @@ fn shell_rejection_reason(reason: shell::ShellRejection) -> CorpusReason {
         ShellRejection::CandidateIdentityMismatch { index } => {
             CorpusReason::with_context("shell.candidate_identity_mismatch", i64::from(index), 0)
         }
+        ShellRejection::NoCandidateViewAtPoint { inspected } => {
+            CorpusReason::with_context("shell.no_candidate_view_at_point", i64::from(inspected), 0)
+        }
         ShellRejection::CandidateRevalidationFailed(code) => {
             CorpusReason::with_context("shell.candidate_revalidation_failed", i64::from(code), 0)
         }
@@ -693,6 +763,16 @@ fn shell_rejection_reason(reason: shell::ShellRejection) -> CorpusReason {
         ShellRejection::ViewItemPathMalformed { index } => {
             CorpusReason::with_context("shell.view_item_path_malformed", i64::from(index), 0)
         }
+        ShellRejection::ViewItemDisplayNameFailed { index, code } => CorpusReason::with_context(
+            "shell.view_item_display_name_failed",
+            i64::from(index),
+            i64::from(code),
+        ),
+        ShellRejection::ViewItemDisplayNameMalformed { index } => CorpusReason::with_context(
+            "shell.view_item_display_name_malformed",
+            i64::from(index),
+            0,
+        ),
         ShellRejection::NoMatchingFilesystemItem { inspected } => {
             CorpusReason::with_context("shell.no_matching_filesystem_item", i64::from(inspected), 0)
         }
@@ -802,6 +882,7 @@ mod tests {
         resolver::{PointResolver, ResolveOutcome},
     };
     use std::thread;
+    use windows::core::Interface;
 
     #[test]
     fn automation_is_configured_resolves_a_point_and_releases_inside_its_mta() {
@@ -815,12 +896,18 @@ mod tests {
             );
 
             let point = PhysicalScreenPoint::new(0, 0);
+            let shell_collection = Interface::as_raw(&resolver.shell_windows);
             assert!(matches!(
                 resolver.resolve(point),
                 ResolveOutcome::Unavailable
                     | ResolveOutcome::Unsupported
                     | ResolveOutcome::Ambiguous
             ));
+            assert_eq!(
+                Interface::as_raw(&resolver.shell_windows),
+                shell_collection,
+                "ordinary observations should reuse the apartment-local Shell collection"
+            );
             let trace = resolver
                 .last_trace
                 .as_ref()

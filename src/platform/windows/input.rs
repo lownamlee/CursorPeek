@@ -45,6 +45,14 @@ pub(super) struct RawMouseActivity {
 }
 
 impl RawMouseActivity {
+    #[cfg(test)]
+    pub(super) const fn for_test(moved: bool, button_or_wheel: bool) -> Self {
+        Self {
+            moved,
+            button_or_wheel,
+        }
+    }
+
     pub(super) fn is_relevant(self) -> bool {
         self.moved || self.button_or_wheel
     }

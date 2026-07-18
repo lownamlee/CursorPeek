@@ -1,0 +1,2 @@
+case_id	os	build	dpi	layout	scenario	x	y	expectation	expected_path	actual_status	actual_path	elapsed_us	reason	context_a	context_b	verdict
+1	windows10	example	100	details	schema_example_not_evidence	0	0	fail_closed		unsupported		1	uia.unsupported_location	0	0	correct_fail_closed

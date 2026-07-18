@@ -1,0 +1,2 @@
+case_id	os	build	dpi	layout	scenario	interaction	focus_preserved	mouse_activation_eaten	click_delivered	dismissed	inside_work_area	pointer_gap_preserved	ui_thread_max_us	notes
+1	windows10	example	100	details	schema_example_not_evidence	timeout	yes	yes	n/a	yes	yes	yes	1	Parser-only fabricated row; not qualification evidence.
