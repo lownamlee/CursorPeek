@@ -43,6 +43,9 @@ param(
     [ValidateRange(0, 30)]
     [int]$ActivationDelaySeconds = 5,
 
+    [ValidateRange(100, 2000)]
+    [int]$SelectionSettleMilliseconds = 250,
+
     [string]$OutputDirectory,
     [string]$ScenarioMatrix,
 
@@ -619,7 +622,7 @@ foreach ($entry in $visible) {
             $point.Y,
             $explorerHwnd
         )
-        Start-Sleep -Milliseconds 100
+        Start-Sleep -Milliseconds $SelectionSettleMilliseconds
         if ([long]$window.HWND -ne $explorerHwnd -or
             [string]$window.LocationURL -cne $fixtureUrl) {
             throw "Explorer navigated or the exact frame identity changed during labeling."
@@ -769,6 +772,7 @@ $state = [ordered]@{
     layout = $Layout
     scenario = $Scenario
     point_profile = $PointProfile
+    selection_settle_ms = $SelectionSettleMilliseconds
     explorer_hwnd = $explorerHwnd
     explorer_bounds = $bounds
     shell_view_mode = $viewMode
