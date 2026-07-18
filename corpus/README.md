@@ -118,7 +118,11 @@ selection before it receives that file's label:
 
 Grid sessions take longer because they do not multiply one observed label into unverified points.
 They improve point-count and row-region coverage but do not replace other layouts, negative
-targets, DPI values, tabs, restart, or display-topology scenarios.
+targets, DPI values, tabs, restart, or display-topology scenarios. A provider may omit UIA's
+optional clickable-point hint; only `item_grid` may continue in that case because it supplies and
+independently verifies only its own interior points rather than mixing in the provider hint. The
+session state records
+`missing_clickable_items`; profiles that depend on the hint still stop.
 
 This tool captures positive visible-file pages only. It does not prove special scenarios such as
 inactive tabs, namespace targets, touch, mixed DPI, or negative-origin monitors. It also never

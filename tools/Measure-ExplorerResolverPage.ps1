@@ -585,6 +585,7 @@ function Add-UniquePoint {
 
 $cases = [System.Collections.Generic.List[object]]::new()
 $skippedFolders = 0
+$missingClickableItems = 0
 $caseId = $CaseIdStart
 $fixturePrefix =
     $fixture.TrimEnd([System.IO.Path]::DirectorySeparatorChar) +
@@ -606,8 +607,12 @@ foreach ($entry in $visible) {
         throw "A visible file-item candidate has invalid geometry."
     }
     $clickablePoint = [System.Windows.Point]::new(0, 0)
-    if (-not $element.TryGetClickablePoint([ref]$clickablePoint)) {
+    $hasClickablePoint = $element.TryGetClickablePoint([ref]$clickablePoint)
+    if (-not $hasClickablePoint -and $PointProfile -cne "item_grid") {
         throw "A visible file-item candidate has no physical clickable point."
+    }
+    if (-not $hasClickablePoint) {
+        $missingClickableItems++
     }
 
     $left = [Convert]::ToInt32([Math]::Floor($rectangle.Left))
@@ -623,10 +628,12 @@ foreach ($entry in $visible) {
     $pointKeys = [System.Collections.Generic.HashSet[string]]::new(
         [System.StringComparer]::Ordinal
     )
-    Add-UniquePoint $points $pointKeys `
-        ([Convert]::ToInt32([Math]::Round($clickablePoint.X))) `
-        ([Convert]::ToInt32([Math]::Round($clickablePoint.Y))) `
-        "clickable" $rectangle
+    if ($hasClickablePoint -and $PointProfile -cne "item_grid") {
+        Add-UniquePoint $points $pointKeys `
+            ([Convert]::ToInt32([Math]::Round($clickablePoint.X))) `
+            ([Convert]::ToInt32([Math]::Round($clickablePoint.Y))) `
+            "clickable" $rectangle
+    }
     if ($PointProfile -cin @("row_three", "icon_five")) {
         Add-UniquePoint $points $pointKeys ($left + $insetX) $centerY "left" $rectangle
         Add-UniquePoint $points $pointKeys $centerX $centerY "center" $rectangle
@@ -669,11 +676,16 @@ foreach ($entry in $visible) {
 
     $elementPath = $null
     foreach ($point in $points) {
-        [CursorPeekLiveCorpusNative]::ClickAndConfirm(
-            $point.X,
-            $point.Y,
-            $explorerHwnd
-        )
+        try {
+            [CursorPeekLiveCorpusNative]::ClickAndConfirm(
+                $point.X,
+                $point.Y,
+                $explorerHwnd
+            )
+        }
+        catch {
+            throw "Point $($point.Region) at ($($point.X),$($point.Y)) failed: $($_.Exception.Message)"
+        }
         Start-Sleep -Milliseconds $SelectionSettleMilliseconds
         if ([long]$window.HWND -ne $explorerHwnd -or
             [string]$window.LocationURL -cne $fixtureUrl) {
@@ -846,6 +858,7 @@ $state = [ordered]@{
     visible_uia_elements = $visible.Count
     clipped_uia_elements = $initialPage.ClippedCount
     skipped_folders = $skippedFolders
+    missing_clickable_items = $missingClickableItems
     labeled_rows = $cases.Count
     case_id_first = $cases[0].CaseId
     case_id_last = $cases[$cases.Count - 1].CaseId
