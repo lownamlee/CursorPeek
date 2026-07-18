@@ -6,5 +6,6 @@ mod windows;
 
 #[cfg(windows)]
 pub(crate) use self::windows::{
-    ApartmentKind, ComApartment, ContainedWorker, MessageWindow, ProcessError, WorkerPipes,
+    ApartmentKind, ComApartment, ContainedWorker, DPI_DIAGNOSTIC_SUCCESS, DpiAwarenessError,
+    MessageWindow, ProcessError, WorkerPipes, verify_per_monitor_v2,
 };
