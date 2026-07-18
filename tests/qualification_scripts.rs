@@ -462,6 +462,131 @@ fn live_page_collector_validates_without_promoting_evidence() {
         !invalid_settle_output.exists(),
         "an invalid selection-settling interval created output"
     );
+
+    let grid_output = repository_path("target/qualification-tests/live-page-grid-validation");
+    let valid_grid = run_live_page_collector(&[
+        "-FixturePath",
+        repository_path("corpus")
+            .to_str()
+            .expect("the corpus path should be Unicode"),
+        "-Os",
+        "windows11",
+        "-Build",
+        "22631",
+        "-Dpi",
+        "175",
+        "-Layout",
+        "details",
+        "-Scenario",
+        "file_row",
+        "-CaseIdStart",
+        "9900000",
+        "-SessionName",
+        "schema-only-live-page-grid",
+        "-PointProfile",
+        "item_grid",
+        "-GridSpacingPixels",
+        "16",
+        "-GridRows",
+        "2",
+        "-GridEdgeInsetPixels",
+        "32",
+        "-MaxGridPointsPerItem",
+        "128",
+        "-MaxCases",
+        "4096",
+        "-OutputDirectory",
+        grid_output
+            .to_str()
+            .expect("the grid validation output path should be Unicode"),
+        "-ValidateOnly",
+    ]);
+    assert!(
+        valid_grid.status.success(),
+        "bounded live-page grid validation failed: {}",
+        String::from_utf8_lossy(&valid_grid.stderr)
+    );
+    assert!(
+        !grid_output.exists(),
+        "grid validation-only mode unexpectedly created evidence artifacts"
+    );
+
+    let invalid_grid_output = repository_path("target/qualification-tests/live-page-invalid-grid");
+    let invalid_grid = run_live_page_collector(&[
+        "-FixturePath",
+        repository_path("corpus")
+            .to_str()
+            .expect("the corpus path should be Unicode"),
+        "-Os",
+        "windows11",
+        "-Build",
+        "22631",
+        "-Dpi",
+        "175",
+        "-Layout",
+        "details",
+        "-Scenario",
+        "file_row",
+        "-CaseIdStart",
+        "9900000",
+        "-SessionName",
+        "schema-only-live-page-invalid-grid",
+        "-PointProfile",
+        "item_grid",
+        "-GridSpacingPixels",
+        "7",
+        "-OutputDirectory",
+        invalid_grid_output
+            .to_str()
+            .expect("the invalid-grid output path should be Unicode"),
+        "-ValidateOnly",
+    ]);
+    assert!(
+        !invalid_grid.status.success(),
+        "live collection unexpectedly accepted an unsafe grid spacing"
+    );
+    assert!(
+        !invalid_grid_output.exists(),
+        "an invalid grid created output"
+    );
+
+    let misplaced_grid_output =
+        repository_path("target/qualification-tests/live-page-misplaced-grid");
+    let misplaced_grid = run_live_page_collector(&[
+        "-FixturePath",
+        repository_path("corpus")
+            .to_str()
+            .expect("the corpus path should be Unicode"),
+        "-Os",
+        "windows11",
+        "-Build",
+        "22631",
+        "-Dpi",
+        "175",
+        "-Layout",
+        "details",
+        "-Scenario",
+        "file_row",
+        "-CaseIdStart",
+        "9900000",
+        "-SessionName",
+        "schema-only-live-page-misplaced-grid",
+        "-GridRows",
+        "2",
+        "-OutputDirectory",
+        misplaced_grid_output
+            .to_str()
+            .expect("the misplaced-grid output path should be Unicode"),
+        "-ValidateOnly",
+    ]);
+    assert!(
+        !misplaced_grid.status.success(),
+        "non-grid collection unexpectedly accepted grid-only parameters"
+    );
+    assert!(
+        !misplaced_grid_output.exists(),
+        "misplaced grid parameters created output"
+    );
 }
 
 #[test]

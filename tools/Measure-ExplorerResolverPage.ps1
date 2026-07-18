@@ -31,11 +31,26 @@ param(
     [ValidatePattern("^[a-z0-9][a-z0-9._-]{0,63}$")]
     [string]$SessionName,
 
-    [ValidateSet("clickable", "row_three", "icon_five")]
+    [ValidateSet("clickable", "row_three", "icon_five", "item_grid")]
     [string]$PointProfile = "clickable",
 
     [ValidateRange(1, 256)]
     [int]$MaxVisibleItems = 128,
+
+    [ValidateRange(8, 128)]
+    [int]$GridSpacingPixels = 16,
+
+    [ValidateRange(1, 4)]
+    [int]$GridRows = 2,
+
+    [ValidateRange(16, 128)]
+    [int]$GridEdgeInsetPixels = 32,
+
+    [ValidateRange(1, 256)]
+    [int]$MaxGridPointsPerItem = 128,
+
+    [ValidateRange(1, 4096)]
+    [int]$MaxCases = 4096,
 
     [ValidateRange(100, 10000)]
     [int]$TimeoutMilliseconds = 1250,
@@ -145,6 +160,13 @@ $matrixMatches = @(
 )
 if ($matrixMatches.Count -ne 1) {
     throw "Scenario/layout must identify exactly one positive row in the scenario matrix."
+}
+if ($PointProfile -cne "item_grid" -and
+    ($PSBoundParameters.ContainsKey("GridSpacingPixels") -or
+     $PSBoundParameters.ContainsKey("GridRows") -or
+     $PSBoundParameters.ContainsKey("GridEdgeInsetPixels") -or
+     $PSBoundParameters.ContainsKey("MaxGridPointsPerItem"))) {
+    throw "Grid parameters require PointProfile item_grid."
 }
 
 if ([System.IO.Directory]::Exists($artifactDirectory)) {
@@ -614,6 +636,36 @@ foreach ($entry in $visible) {
         Add-UniquePoint $points $pointKeys $centerX ($top + $insetY) "top" $rectangle
         Add-UniquePoint $points $pointKeys $centerX ($bottom - $insetY - 1) "bottom" $rectangle
     }
+    if ($PointProfile -ceq "item_grid") {
+        $gridLeft = $left + $GridEdgeInsetPixels
+        $gridRight = $right - $GridEdgeInsetPixels - 1
+        if ($gridLeft -gt $gridRight) {
+            throw "A visible file-item candidate is too narrow for the configured grid edge inset."
+        }
+        for ($gridRow = 0; $gridRow -lt $GridRows; $gridRow++) {
+            $gridY = $top + [Convert]::ToInt32(
+                [Math]::Floor(
+                    (($gridRow + 1) * ($bottom - $top)) / ($GridRows + 1)
+                )
+            )
+            $gridColumn = 0
+            for ($gridX = $gridLeft; $gridX -le $gridRight; $gridX += $GridSpacingPixels) {
+                Add-UniquePoint $points $pointKeys $gridX $gridY `
+                    "grid_r$($gridRow + 1)_c$($gridColumn + 1)" $rectangle
+                $gridColumn++
+            }
+            if ((($gridRight - $gridLeft) % $GridSpacingPixels) -ne 0) {
+                Add-UniquePoint $points $pointKeys $gridRight $gridY `
+                    "grid_r$($gridRow + 1)_right" $rectangle
+            }
+        }
+        if ($points.Count -gt $MaxGridPointsPerItem) {
+            throw "A visible file-item candidate produced $($points.Count) points, exceeding MaxGridPointsPerItem $MaxGridPointsPerItem."
+        }
+    }
+    if (($cases.Count + $points.Count) -gt $MaxCases) {
+        throw "The live page would exceed the hard MaxCases limit of $MaxCases."
+    }
 
     $elementPath = $null
     foreach ($point in $points) {
@@ -773,6 +825,18 @@ $state = [ordered]@{
     scenario = $Scenario
     point_profile = $PointProfile
     selection_settle_ms = $SelectionSettleMilliseconds
+    max_cases = $MaxCases
+    grid = if ($PointProfile -ceq "item_grid") {
+        [ordered]@{
+            spacing_pixels = $GridSpacingPixels
+            rows = $GridRows
+            edge_inset_pixels = $GridEdgeInsetPixels
+            max_points_per_item = $MaxGridPointsPerItem
+        }
+    }
+    else {
+        $null
+    }
     explorer_hwnd = $explorerHwnd
     explorer_bounds = $bounds
     shell_view_mode = $viewMode

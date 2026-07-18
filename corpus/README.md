@@ -94,6 +94,32 @@ and a frame screenshot under
 `target\resolver-corpus\live`. A miss or wrong path remains in the raw result and fails the
 collector.
 
+For a high-count Details-page session, `-PointProfile item_grid` samples a bounded physical grid
+inside every fully visible item. The default 32-pixel edge inset avoids the Windows 10 item-checkbox
+region; spacing, row count, per-item points, and total cases all have strict caps and are recorded in
+`state.json`. Every grid coordinate is clicked separately and must produce the same one-item Shell
+selection before it receives that file's label:
+
+```powershell
+.\tools\Measure-ExplorerResolverPage.ps1 `
+    -FixturePath C:\Users\Public\CursorPeekCorpus\bulk-001 `
+    -Os windows10 `
+    -Build 19045 `
+    -Dpi 100 `
+    -Layout details `
+    -Scenario file_row `
+    -CaseIdStart 1306000 `
+    -SessionName win10-19045-100-details-grid-01 `
+    -PointProfile item_grid `
+    -GridSpacingPixels 16 `
+    -GridRows 1 `
+    -MaxCases 4096
+```
+
+Grid sessions take longer because they do not multiply one observed label into unverified points.
+They improve point-count and row-region coverage but do not replace other layouts, negative
+targets, DPI values, tabs, restart, or display-topology scenarios.
+
 This tool captures positive visible-file pages only. It does not prove special scenarios such as
 inactive tabs, namespace targets, touch, mixed DPI, or negative-origin monitors. It also never
 copies output into `corpus\results` or another accepted-evidence path. Review each page and its
