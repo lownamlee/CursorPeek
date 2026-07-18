@@ -424,6 +424,44 @@ fn live_page_collector_validates_without_promoting_evidence() {
         !forbidden.exists(),
         "a rejected evidence destination was modified"
     );
+
+    let invalid_settle_output =
+        repository_path("target/qualification-tests/live-page-invalid-settle");
+    let invalid_settle = run_live_page_collector(&[
+        "-FixturePath",
+        repository_path("corpus")
+            .to_str()
+            .expect("the corpus path should be Unicode"),
+        "-Os",
+        "windows11",
+        "-Build",
+        "22631",
+        "-Dpi",
+        "175",
+        "-Layout",
+        "details",
+        "-Scenario",
+        "file_row",
+        "-CaseIdStart",
+        "9900000",
+        "-SessionName",
+        "schema-only-live-page",
+        "-SelectionSettleMilliseconds",
+        "99",
+        "-OutputDirectory",
+        invalid_settle_output
+            .to_str()
+            .expect("the invalid-settle output path should be Unicode"),
+        "-ValidateOnly",
+    ]);
+    assert!(
+        !invalid_settle.status.success(),
+        "live collection unexpectedly accepted an unsafe selection-settling interval"
+    );
+    assert!(
+        !invalid_settle_output.exists(),
+        "an invalid selection-settling interval created output"
+    );
 }
 
 #[test]

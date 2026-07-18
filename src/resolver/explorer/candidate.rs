@@ -66,9 +66,7 @@ impl CandidateTrace {
                 .iter()
                 .enumerate()
                 .all(|(depth, metadata)| metadata.invariant_holds(depth))
-            && item.control_kind.is_item()
-            && item.bounds.is_ordered()
-            && item.bounds.contains(point)
+            && item.is_item_at(point)
             && self.termination.invariant_holds(self.inspected.len())
     }
 
@@ -89,7 +87,18 @@ impl CandidateTrace {
             return Err(CandidateEvidenceError::MissingItemsContainerAncestor);
         }
 
-        let view_index = match item.item_index {
+        item.shell_evidence()
+    }
+}
+
+impl CachedElementMetadata {
+    pub(super) fn is_item_at(&self, point: PhysicalScreenPoint) -> bool {
+        self.control_kind.is_item() && self.bounds.is_ordered() && self.bounds.contains(point)
+    }
+
+    pub(super) fn shell_evidence(&self) -> Result<CandidateEvidence<'_>, CandidateEvidenceError> {
+        debug_assert!(self.control_kind.is_item());
+        let view_index = match self.item_index {
             Some(index) if index > 0 => Some(
                 u32::try_from(index - 1)
                     .expect("a positive UI Automation item index fits a zero-based u32 index"),
@@ -97,7 +106,7 @@ impl CandidateTrace {
             Some(0) | None => None,
             Some(index) => return Err(CandidateEvidenceError::InvalidItemIndex(index)),
         };
-        let path_units = match item.legacy_value.as_ref() {
+        let path_units = match self.legacy_value.as_ref() {
             Some(value) => match value.complete_units() {
                 Some(units) => Some(units),
                 None if view_index.is_some() => None,
@@ -112,8 +121,8 @@ impl CandidateTrace {
         Ok(CandidateEvidence {
             path_units,
             view_index,
-            item_native_window: item.native_window,
-            item_bounds: item.bounds,
+            item_native_window: self.native_window,
+            item_bounds: self.bounds,
         })
     }
 }
@@ -631,5 +640,19 @@ mod tests {
         changed.inspected[0].native_window += 1;
         let changed_window = changed.shell_evidence().unwrap();
         assert!(!original.same_fingerprint(&changed_window));
+    }
+
+    #[test]
+    fn refreshed_item_requires_an_item_shape_containing_the_point() {
+        let mut item = metadata(0, ControlKind::ListItem, "", Some(r"C:\preview.txt"));
+        assert!(item.is_item_at(PhysicalScreenPoint::new(5, 5)));
+        assert!(!item.is_item_at(PhysicalScreenPoint::new(10, 5)));
+
+        item.control_kind = ControlKind::Other(0);
+        assert!(!item.is_item_at(PhysicalScreenPoint::new(5, 5)));
+
+        item.control_kind = ControlKind::DataItem;
+        item.bounds.right = item.bounds.left;
+        assert!(!item.is_item_at(PhysicalScreenPoint::new(5, 5)));
     }
 }

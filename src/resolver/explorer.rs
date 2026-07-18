@@ -20,9 +20,10 @@ use windows::{
             CUIAutomation8, CUIAutomationRegistrar, IUIAutomation2, IUIAutomationCacheRequest,
             IUIAutomationElement, IUIAutomationLegacyIAccessiblePattern, IUIAutomationRegistrar,
             IUIAutomationTreeWalker, TreeScope_Element, UIA_AutomationIdPropertyId,
-            UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId,
-            UIA_LegacyIAccessiblePatternId, UIA_NativeWindowHandlePropertyId, UIA_PROPERTY_ID,
-            UIAutomationPropertyInfo, UIAutomationType_Int,
+            UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId, UIA_DataItemControlTypeId,
+            UIA_LegacyIAccessiblePatternId, UIA_ListItemControlTypeId,
+            UIA_NativeWindowHandlePropertyId, UIA_PROPERTY_ID, UIAutomationPropertyInfo,
+            UIAutomationType_Int,
         },
         UI::Shell::{IShellWindows, ItemIndex_Property_GUID},
     },
@@ -43,6 +44,7 @@ pub(crate) struct ExplorerResolver {
     automation: IUIAutomation2,
     cache_request: IUIAutomationCacheRequest,
     control_walker: IUIAutomationTreeWalker,
+    item_walker: IUIAutomationTreeWalker,
     shell_windows: IShellWindows,
     active_folder_view: Option<shell::ActiveFolderView>,
     item_index_property: UIA_PROPERTY_ID,
@@ -103,7 +105,7 @@ impl ExplorerResolver {
         // SAFETY: all three interfaces are created by the live apartment-local automation client.
         // The cache request retains copied property/pattern identifiers only. TreeScope_Element
         // limits each lookup to the returned element; parents are fetched individually below.
-        let (cache_request, control_walker) = unsafe {
+        let (cache_request, control_walker, item_walker) = unsafe {
             let cache_request = automation.CreateCacheRequest()?;
             cache_request.SetTreeScope(TreeScope_Element)?;
             for property in [
@@ -117,7 +119,21 @@ impl ExplorerResolver {
             }
             cache_request.AddPattern(UIA_LegacyIAccessiblePatternId)?;
 
-            (cache_request, automation.ControlViewWalker()?)
+            let list_item = automation.CreatePropertyCondition(
+                UIA_ControlTypePropertyId,
+                &VARIANT::from(UIA_ListItemControlTypeId.0),
+            )?;
+            let data_item = automation.CreatePropertyCondition(
+                UIA_ControlTypePropertyId,
+                &VARIANT::from(UIA_DataItemControlTypeId.0),
+            )?;
+            let item_condition = automation.CreateOrCondition(&list_item, &data_item)?;
+
+            (
+                cache_request,
+                automation.ControlViewWalker()?,
+                automation.CreateTreeWalker(&item_condition)?,
+            )
         };
         let shell_windows = shell::create_collection()?;
 
@@ -125,6 +141,7 @@ impl ExplorerResolver {
             automation,
             cache_request,
             control_walker,
+            item_walker,
             shell_windows,
             active_folder_view: None,
             item_index_property,
@@ -270,14 +287,30 @@ impl ExplorerResolver {
         original_element: &IUIAutomationElement,
         original_evidence: &candidate::CandidateEvidence<'_>,
     ) -> Result<(), shell::ShellRejection> {
-        let second = self.inspect_point(point);
-        let ResolutionTrace::Candidate(candidate) = &second.trace else {
+        // SAFETY: all interfaces remain on their owning MTA. ElementFromPoint retrieves the live
+        // element at the same physical point; the conditioned walker then normalizes that hit to
+        // the nearest ListItem/DataItem ancestor and refreshes only the existing bounded cache.
+        // NormalizeElementBuildCache may return the root when no condition matches, so the cached
+        // control kind and geometry are still checked below before any identity comparison.
+        let hit = unsafe {
+            self.automation.ElementFromPoint(POINT {
+                x: point.x,
+                y: point.y,
+            })
+        }
+        .map_err(|error| shell::ShellRejection::CandidateRevalidationFailed(error.code().0))?;
+        let updated = unsafe {
+            self.item_walker
+                .NormalizeElementBuildCache(&hit, &self.cache_request)
+        }
+        .map_err(|error| shell::ShellRejection::CandidateRevalidationFailed(error.code().0))?;
+        let metadata = self
+            .read_cached_metadata(&updated, 0)
+            .map_err(|error| shell::ShellRejection::CandidateRevalidationFailed(error.code))?;
+        if !metadata.is_item_at(point) {
             return Err(shell::ShellRejection::CandidateChangedDuringVerification);
-        };
-        let Some(second_element) = second.item_element.as_ref() else {
-            return Err(shell::ShellRejection::CandidateChangedDuringVerification);
-        };
-        let second_evidence = candidate
+        }
+        let updated_evidence = metadata
             .shell_evidence()
             .map_err(|_| shell::ShellRejection::CandidateChangedDuringVerification)?;
 
@@ -285,13 +318,13 @@ impl ExplorerResolver {
         // comparison uses UIA runtime identity and returns a copied BOOL.
         let same_element = unsafe {
             self.automation
-                .CompareElements(original_element, second_element)
+                .CompareElements(original_element, &updated)
                 .map_err(|error| {
                     shell::ShellRejection::CandidateRevalidationFailed(error.code().0)
                 })?
                 .as_bool()
         };
-        if !same_element || !original_evidence.same_fingerprint(&second_evidence) {
+        if !same_element || !original_evidence.same_fingerprint(&updated_evidence) {
             return Err(shell::ShellRejection::CandidateChangedDuringVerification);
         }
         Ok(())

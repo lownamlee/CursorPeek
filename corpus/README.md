@@ -87,9 +87,10 @@ The collector searches only the exact Explorer frame's bounded UI Automation sub
 items clipped by their list viewport. For every fully visible `ListItem` or `DataItem`, it obtains a
 physical clickable point, sends one ordinary click, requires that exact frame to become foreground,
 and accepts an expected path only when Explorer's separate `SelectedItems()` model reports one
-existing drive-local non-folder file. It fingerprints the page before and after labeling so a
-selection-induced scroll, reorder, or geometry change aborts the session. It then writes a manifest,
-raw probe results, numeric OS/DPI/view state, hashes, and a frame screenshot under
+existing drive-local non-folder file after a bounded selection-settling interval. It fingerprints
+the page before and after labeling so a selection-induced scroll, reorder, or geometry change
+aborts the session. It then writes a manifest, raw probe results, numeric OS/DPI/view state, hashes,
+and a frame screenshot under
 `target\resolver-corpus\live`. A miss or wrong path remains in the raw result and fails the
 collector.
 
