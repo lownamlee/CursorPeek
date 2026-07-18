@@ -13,4 +13,6 @@ pub(crate) use dpi::{
 };
 pub(crate) use preview::PreviewWindow;
 pub(crate) use process::{ContainedWorker, ProcessError, WorkerPipes};
-pub(crate) use window::{MessageWindow, PREVIEW_WINDOW_DIAGNOSTIC_DURATION};
+pub(crate) use window::{
+    MessageWindow, PREVIEW_WINDOW_DIAGNOSTIC_DURATION, PREVIEW_WINDOW_PRACTICE_DURATION,
+};

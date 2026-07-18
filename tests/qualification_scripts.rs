@@ -23,6 +23,21 @@ fn run_gate(extra_arguments: &[&str]) -> Output {
         .expect("the qualification gate script should start")
 }
 
+fn run_preview_measurement(extra_arguments: &[&str]) -> Output {
+    Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(repository_path("tools/Measure-PreviewWindow.ps1"))
+        .args(extra_arguments)
+        .output()
+        .expect("the preview-window measurement script should start")
+}
+
 fn example_arguments() -> Vec<String> {
     vec![
         "-ResolverResults".into(),
@@ -66,6 +81,47 @@ fn qualification_schema_examples_validate_but_do_not_pass_the_gate() {
     assert!(report_text.contains("> Gate result: **FAIL**"));
     assert!(report_text.contains("fewer than 2,000"));
     assert!(report_text.contains("does not include windows11"));
+}
+
+#[test]
+fn preview_practice_refuses_an_evidence_filename_before_launch() {
+    let rejected_path = repository_path("target/qualification-tests/window.tsv");
+    let rejected = run_preview_measurement(&[
+        "-CaseId",
+        "9000001",
+        "-Os",
+        "windows11",
+        "-Build",
+        "synthetic_not_evidence",
+        "-Dpi",
+        "100",
+        "-Layout",
+        "details",
+        "-Scenario",
+        "example",
+        "-Interaction",
+        "wheel",
+        "-Notes",
+        "schema_guard",
+        "-Results",
+        rejected_path
+            .to_str()
+            .expect("the test path should be Unicode"),
+        "-ActivationDelaySeconds",
+        "0",
+        "-Practice",
+        "-SkipBuild",
+    ]);
+    assert!(
+        !rejected.status.success(),
+        "practice unexpectedly accepted an evidence-like filename"
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("Practice observations must be written to a clearly named attempts file"),
+        "unexpected practice-path rejection: {}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
 }
 
 #[test]

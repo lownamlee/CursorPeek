@@ -54,6 +54,10 @@ click or the intended context menu for a right click. The private executable dia
 final focus, dismissal, placement, pointer-gap, and UI-thread timing observations; it never
 manufactures click-delivery evidence.
 
+For operator rehearsal, add `-Practice`. Practice keeps the popup available for five seconds,
+automatically labels the notes, and writes only to a filename containing `attempt`. The release
+measurement remains 1.5 seconds; practice rows must never be supplied to the milestone gate.
+
 Each OS needs 100/125/150/175/200% DPI, timeout/move/wheel/left-click/right-click interactions, and
 these scenario labels:
 

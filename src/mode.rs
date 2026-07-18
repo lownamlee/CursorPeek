@@ -25,6 +25,7 @@ pub(crate) enum ProcessMode {
     InputDiagnostics,
     DpiDiagnostics,
     PreviewWindowDiagnostics,
+    PreviewWindowPracticeDiagnostics,
     WorkerDiagnostics,
     WorkerTimeoutDiagnostics,
     PreviewWorker,
@@ -57,6 +58,9 @@ impl Command {
             Some("--dpi-diagnostics") => Self::Run(ProcessMode::DpiDiagnostics),
             Some("--preview-window-diagnostics") => {
                 Self::Run(ProcessMode::PreviewWindowDiagnostics)
+            }
+            Some("--preview-window-practice-diagnostics") => {
+                Self::Run(ProcessMode::PreviewWindowPracticeDiagnostics)
             }
             Some("--worker-diagnostics") => Self::Run(ProcessMode::WorkerDiagnostics),
             Some("--worker-timeout-diagnostics") => {
@@ -156,6 +160,10 @@ mod tests {
         assert_eq!(
             Command::parse(["--preview-window-diagnostics"]),
             Ok(Command::Run(ProcessMode::PreviewWindowDiagnostics))
+        );
+        assert_eq!(
+            Command::parse(["--preview-window-practice-diagnostics"]),
+            Ok(Command::Run(ProcessMode::PreviewWindowPracticeDiagnostics))
         );
     }
 

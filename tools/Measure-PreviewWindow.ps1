@@ -39,6 +39,8 @@ param(
     [ValidateRange(0, 30)]
     [int]$ActivationDelaySeconds = 5,
 
+    [switch]$Practice,
+
     [switch]$SkipBuild
 )
 
@@ -46,7 +48,13 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 if ([string]::IsNullOrWhiteSpace($Results)) {
-    $Results = Join-Path $PSScriptRoot "..\target\qualification\evidence\window.tsv"
+    if ($Practice) {
+        $Results = Join-Path $PSScriptRoot `
+            "..\target\qualification\evidence\window-attempts.tsv"
+    }
+    else {
+        $Results = Join-Path $PSScriptRoot "..\target\qualification\evidence\window.tsv"
+    }
 }
 
 $tab = "`t"
@@ -90,6 +98,18 @@ foreach ($label in @(
 if ($Notes.IndexOfAny([char[]]@("`t", "`r", "`n")) -ge 0) {
     throw "Notes must fit on one TSV line and cannot contain tabs."
 }
+if ($Practice -and -not $Notes.StartsWith("practice_5s_", [System.StringComparison]::Ordinal)) {
+    $Notes = "practice_5s_$Notes"
+}
+
+$resultPath = [System.IO.Path]::GetFullPath($Results)
+if ($Practice -and
+    [System.IO.Path]::GetFileName($resultPath).IndexOf(
+        "attempt",
+        [System.StringComparison]::OrdinalIgnoreCase
+    ) -lt 0) {
+    throw "Practice observations must be written to a clearly named attempts file."
+}
 
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $targetDirectory = Join-Path $repoRoot "target\qualification\preview-window"
@@ -108,7 +128,6 @@ if (-not [System.IO.File]::Exists($executable)) {
     throw "Preview-window diagnostic executable not found: $executable"
 }
 
-$resultPath = [System.IO.Path]::GetFullPath($Results)
 $resultParent = [System.IO.Path]::GetDirectoryName($resultPath)
 if (-not [string]::IsNullOrEmpty($resultParent)) {
     [System.IO.Directory]::CreateDirectory($resultParent) | Out-Null
@@ -152,14 +171,20 @@ $instruction = switch ($Interaction) {
     }
 }
 Write-Host $instruction
-Write-Host "Place the pointer at the labeled point. The 1.5-second observation starts in $ActivationDelaySeconds seconds."
+$observationDuration = if ($Practice) { "5-second practice" } else { "1.5-second qualification" }
+Write-Host "Place the pointer at the labeled point. The $observationDuration observation starts in $ActivationDelaySeconds seconds."
 if ($ActivationDelaySeconds -gt 0) {
     Start-Sleep -Seconds $ActivationDelaySeconds
 }
 
 $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
 $startInfo.FileName = $executable
-$startInfo.Arguments = "--preview-window-diagnostics"
+$startInfo.Arguments = if ($Practice) {
+    "--preview-window-practice-diagnostics"
+}
+else {
+    "--preview-window-diagnostics"
+}
 $startInfo.UseShellExecute = $false
 $startInfo.CreateNoWindow = $true
 $startInfo.RedirectStandardOutput = $true
@@ -255,7 +280,8 @@ finally {
 }
 
 Write-Host $line
-Write-Host "Recorded preview-window evidence case $CaseId in $resultPath"
+$recordKind = if ($Practice) { "practice observation" } else { "preview-window evidence" }
+Write-Host "Recorded $recordKind case $CaseId in $resultPath"
 if ($focusPreserved -cne "yes" -or
     $mouseActivationEaten -cne "yes" -or
     $clickObservation -ceq "no" -or

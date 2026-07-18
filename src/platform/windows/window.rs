@@ -47,6 +47,7 @@ const INPUT_DIAGNOSTIC_DEADLINE_TIMER_ID: usize = 3;
 const PREVIEW_DIAGNOSTIC_DEADLINE_TIMER_ID: usize = 4;
 
 pub(crate) const PREVIEW_WINDOW_DIAGNOSTIC_DURATION: Duration = Duration::from_millis(1_500);
+pub(crate) const PREVIEW_WINDOW_PRACTICE_DURATION: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
 const TEST_PANIC_MESSAGE: u32 = WM_APP + 2;
@@ -695,9 +696,9 @@ fn dispatch_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        DWELL_TIMER_ID, IsWindow, LPARAM, MessageWindow, PostMessageW, TEST_PANIC_MESSAGE,
-        WM_TIMER, WPARAM, preview_input_requires_dismissal, registered_raw_mouse,
-        timer_interval_ms,
+        DWELL_TIMER_ID, IsWindow, LPARAM, MessageWindow, PREVIEW_WINDOW_DIAGNOSTIC_DURATION,
+        PREVIEW_WINDOW_PRACTICE_DURATION, PostMessageW, TEST_PANIC_MESSAGE, WM_TIMER, WPARAM,
+        preview_input_requires_dismissal, registered_raw_mouse, timer_interval_ms,
     };
     use crate::hover::PhysicalScreenPoint;
     use crate::platform::windows::explorer::is_explorer_window;
@@ -822,6 +823,15 @@ mod tests {
         assert_eq!(timer_interval_ms(Duration::from_micros(10_001)), 11);
         assert_eq!(timer_interval_ms(Duration::from_millis(400)), 400);
         assert_eq!(timer_interval_ms(Duration::MAX), 2_147_483_647);
+    }
+
+    #[test]
+    fn preview_practice_allows_more_operator_time_without_changing_evidence_timing() {
+        assert_eq!(
+            PREVIEW_WINDOW_DIAGNOSTIC_DURATION,
+            Duration::from_millis(1_500)
+        );
+        assert_eq!(PREVIEW_WINDOW_PRACTICE_DURATION, Duration::from_secs(5));
     }
 
     #[test]
