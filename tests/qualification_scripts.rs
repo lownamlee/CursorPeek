@@ -735,7 +735,7 @@ fn qualification_gate_pass_path_aggregates_all_required_metrics() {
             case_id += 1;
         }
     }
-    fs::write(&window_path, window_contents)
+    fs::write(&window_path, &window_contents)
         .expect("the synthetic window evidence should be written");
 
     let report_path = temporary_directory.join("report.md");
@@ -762,6 +762,63 @@ fn qualification_gate_pass_path_aggregates_all_required_metrics() {
     assert!(report.contains("| Wrong paths | 0 |"));
     assert!(report.contains("| Latency p95 | 10 us |"));
     assert!(report.contains("Failed focus/click/placement/task-bound rows: 0."));
+
+    let feasibility_window_path = temporary_directory.join("window-feasibility.tsv");
+    let feasibility_window_contents = window_contents
+        .lines()
+        .filter(|line| {
+            !line.contains("\tnegative_origin_monitor\t")
+                && !line.contains("\tmixed_dpi_transition\t")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(&feasibility_window_path, feasibility_window_contents)
+        .expect("the feasibility-only window evidence should be written");
+
+    let feasibility_report = temporary_directory.join("feasibility-report.md");
+    let feasibility_arguments = vec![
+        "-ResolverResultsDirectory".into(),
+        temporary_directory.to_string_lossy().into_owned(),
+        "-WindowEvidence".into(),
+        feasibility_window_path.to_string_lossy().into_owned(),
+        "-Profile".into(),
+        "feasibility".into(),
+        "-Report".into(),
+        feasibility_report.to_string_lossy().into_owned(),
+    ];
+    let feasibility = run_owned_arguments(&feasibility_arguments);
+    assert!(
+        feasibility.status.success(),
+        "representative feasibility profile failed: {}",
+        String::from_utf8_lossy(&feasibility.stderr)
+    );
+    let feasibility_text =
+        fs::read_to_string(&feasibility_report).expect("the feasibility report should be readable");
+    assert!(feasibility_text.contains("> Gate result: **PASS**"));
+    assert!(feasibility_text.contains("> Gate profile: **FEASIBILITY**"));
+    assert!(feasibility_text.contains("it is not release qualification"));
+
+    let incomplete_release_report = temporary_directory.join("incomplete-release-report.md");
+    let incomplete_release_arguments = vec![
+        "-ResolverResultsDirectory".into(),
+        temporary_directory.to_string_lossy().into_owned(),
+        "-WindowEvidence".into(),
+        feasibility_window_path.to_string_lossy().into_owned(),
+        "-Report".into(),
+        incomplete_release_report.to_string_lossy().into_owned(),
+    ];
+    let incomplete_release = run_owned_arguments(&incomplete_release_arguments);
+    assert!(
+        !incomplete_release.status.success(),
+        "the release profile unexpectedly accepted a feasibility-only window matrix"
+    );
+    let incomplete_release_text = fs::read_to_string(&incomplete_release_report)
+        .expect("the incomplete release report should be readable");
+    assert!(incomplete_release_text.contains("> Gate result: **FAIL**"));
+    assert!(incomplete_release_text.contains("> Gate profile: **RELEASE**"));
+    assert!(incomplete_release_text.contains("negative_origin_monitor"));
+    assert!(incomplete_release_text.contains("mixed_dpi_transition"));
 
     fs::remove_dir_all(&temporary_directory)
         .expect("the synthetic qualification directory should be removable");

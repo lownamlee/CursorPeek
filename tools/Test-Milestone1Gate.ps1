@@ -13,6 +13,9 @@ param(
 
     [string]$Report,
 
+    [ValidateSet("feasibility", "release")]
+    [string]$Profile = "release",
+
     [switch]$ValidateOnly
 )
 
@@ -87,6 +90,28 @@ $requiredWindowScenarios = @(
     "explorer_restart"
 )
 $requiredWindowInteractions = @("timeout", "move", "wheel", "left_click", "right_click")
+$feasibilityResolverKeys = @(
+    "file_icon|resolve|large_icons",
+    "file_row|resolve|details",
+    "blank_items_view|fail_closed|all",
+    "navigation_tree|fail_closed|all",
+    "address_bar|fail_closed|all",
+    "command_bar|fail_closed|all",
+    "column_header|fail_closed|details",
+    "folder_item|fail_closed|all",
+    "multiple_windows|resolve|multiple_windows",
+    "explorer_restart|resolve|details"
+)
+$windows11FeasibilityResolverKeys = @(
+    "rapid_tab_switch|resolve|active_tab",
+    "background_tab|fail_closed|background_tab"
+)
+$feasibilityWindowScenarios = @(
+    "center",
+    "work_area_top_left",
+    "work_area_bottom_right",
+    "explorer_restart"
+)
 
 function Resolve-OneFile {
     param(
@@ -543,12 +568,33 @@ foreach ($os in $requiredOperatingSystems) {
         $gateFailures.Add("resolver evidence does not include $os")
         continue
     }
-    foreach ($dpi in $requiredDpiValues) {
+    $requiredDpiForProfile = if ($Profile -ceq "release") {
+        $requiredDpiValues
+    }
+    else {
+        @()
+    }
+    foreach ($dpi in $requiredDpiForProfile) {
         if (@($osRows | Where-Object { $_.Dpi -ceq $dpi }).Count -eq 0) {
             $missingResolverCoverage.Add("$os dpi=$dpi")
         }
     }
-    foreach ($requirement in $scenarioRequirements) {
+    $requirementsForProfile = if ($Profile -ceq "release") {
+        $scenarioRequirements
+    }
+    else {
+        $requiredKeys = @($feasibilityResolverKeys)
+        if ($os -ceq "windows11") {
+            $requiredKeys += $windows11FeasibilityResolverKeys
+        }
+        @(
+            $scenarioRequirements | Where-Object {
+                $key = "$($_.Scenario)|$($_.Expectation)|$($_.Layout)"
+                $key -cin $requiredKeys
+            }
+        )
+    }
+    foreach ($requirement in $requirementsForProfile) {
         $matching = @(
             $osRows | Where-Object {
                 $_.Scenario -ceq $requirement.Scenario -and
@@ -564,7 +610,13 @@ foreach ($os in $requiredOperatingSystems) {
     }
 }
 if ($missingResolverCoverage.Count -ne 0) {
-    $gateFailures.Add("resolver scenario/DPI matrix is incomplete")
+    $failure = if ($Profile -ceq "release") {
+        "resolver scenario/DPI matrix is incomplete"
+    }
+    else {
+        "resolver feasibility scenario matrix is incomplete"
+    }
+    $gateFailures.Add($failure)
 }
 
 $windowFailureRows = @(
@@ -590,12 +642,18 @@ foreach ($os in $requiredOperatingSystems) {
         $gateFailures.Add("preview-window evidence does not include $os")
         continue
     }
-    foreach ($dpi in $requiredDpiValues) {
+    foreach ($dpi in $requiredDpiForProfile) {
         if (@($osRows | Where-Object { $_.Dpi -ceq $dpi }).Count -eq 0) {
             $missingWindowCoverage.Add("$os dpi=$dpi")
         }
     }
-    foreach ($scenario in $requiredWindowScenarios) {
+    $requiredWindowScenariosForProfile = if ($Profile -ceq "release") {
+        $requiredWindowScenarios
+    }
+    else {
+        $feasibilityWindowScenarios
+    }
+    foreach ($scenario in $requiredWindowScenariosForProfile) {
         if (@($osRows | Where-Object { $_.Scenario -ceq $scenario }).Count -eq 0) {
             $missingWindowCoverage.Add("$os scenario=$scenario")
         }
@@ -607,7 +665,13 @@ foreach ($os in $requiredOperatingSystems) {
     }
 }
 if ($missingWindowCoverage.Count -ne 0) {
-    $gateFailures.Add("preview-window OS/DPI/scenario/interaction matrix is incomplete")
+    $failure = if ($Profile -ceq "release") {
+        "preview-window OS/DPI/scenario/interaction matrix is incomplete"
+    }
+    else {
+        "preview-window feasibility scenario/interaction matrix is incomplete"
+    }
+    $gateFailures.Add($failure)
 }
 
 if ([string]::IsNullOrWhiteSpace($Report)) {
@@ -669,11 +733,23 @@ $formatCoverage = $coverage.ToString("F3", $invariant)
 $formatP50 = if ($null -eq $p50) { "n/a" } else { $p50 }
 $formatP95 = if ($null -eq $p95) { "n/a" } else { $p95 }
 $formatP99 = if ($null -eq $p99) { "n/a" } else { $p99 }
+$profileNotice = if ($Profile -ceq "feasibility") {
+    @(
+        "> Gate profile: **FEASIBILITY**",
+        "> A pass unlocks implementation only; it is not release qualification."
+    )
+}
+else {
+    @(
+        "> Gate profile: **RELEASE**"
+    )
+}
 
 $reportLines = @(
     "# Milestone 1 qualification report",
     "",
     "> Gate result: **$gateStatus**",
+    $profileNotice,
     "",
     "This report is recomputed from strict raw TSV evidence. It is not a substitute for the raw",
     "sessions, operator notes, VM snapshots, or an independent review of how points were labeled.",
@@ -739,4 +815,9 @@ Write-Host "Milestone 1 report: $reportPath"
 if ($gateFailures.Count -ne 0) {
     throw "Milestone 1 gate failed: $($gateFailures -join "; ")."
 }
-Write-Host "Milestone 1 resolver and preview-window feasibility gate passed."
+if ($Profile -ceq "feasibility") {
+    Write-Host "Milestone 1 resolver and preview-window feasibility gate passed."
+}
+else {
+    Write-Host "Milestone 1 release qualification gate passed."
+}

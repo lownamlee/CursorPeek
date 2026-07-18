@@ -11,6 +11,24 @@ observed preview-window TSV:
     -Report .\qualification\milestone-1-report.md
 ```
 
+The default `release` profile retains the exhaustive matrix below. Before the application feature
+work begins, checkpoint 9c uses `-Profile feasibility`. That profile keeps the 2,000-row, coverage,
+zero-wrong-path, runner-failure, latency, both-OS, focus/click/placement, task-bound, and all-input-
+interaction requirements. It requires representative file icon/row, non-item surface, folder,
+multiple-window, restart, and Windows 11 tab cases, but defers the exhaustive DPI/display-topology
+matrix to release qualification:
+
+```powershell
+.\tools\Test-Milestone1Gate.ps1 `
+    -ResolverResultsDirectory .\corpus\results `
+    -WindowEvidence .\qualification\evidence\window.tsv `
+    -Profile feasibility `
+    -Report .\qualification\milestone-1-feasibility.md
+```
+
+A feasibility pass only unlocks implementation. It must never be described as a release-qualified
+binary.
+
 Raw sessions belong in ignored `corpus/sessions`, `corpus/results`, and
 `qualification/evidence` directories. Keep them with VM snapshots, display topology, Explorer
 setup notes, and file hashes. The public aggregate report records only file names, hashes, counts,
