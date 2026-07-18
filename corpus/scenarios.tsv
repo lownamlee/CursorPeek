@@ -15,9 +15,12 @@ case_variant_name	resolve	details	Mixed-case local path and display name
 unicode_name	resolve	details	Non-ASCII BMP and supplementary-plane filename
 long_name	resolve	details	A long but valid local filename
 renamed_file	resolve	details	File renamed while the prepared session is refreshed
+touch_selected_file	resolve	details_touch	File selected through touch before a stable mouse hover
 rapid_tab_switch	resolve	active_tab	The same point sampled after alternating active Explorer tabs
 background_tab	fail_closed	background_tab	Point belonging only to an inactive Explorer tab
 multiple_windows	resolve	multiple_windows	Equivalent coordinates in distinct foreground Explorer windows
+mixed_dpi_file	resolve	details_mixed_dpi	Local file after moving Explorer between different-DPI monitors
+negative_origin_file	resolve	details_negative_origin	Local file in Explorer on a monitor with negative coordinates
 blank_items_view	fail_closed	all	Blank area inside the active items view
 navigation_tree	fail_closed	all	Folder entry in the navigation sidebar
 address_bar	fail_closed	all	Address-bar breadcrumb and editable text

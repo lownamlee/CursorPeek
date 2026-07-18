@@ -45,6 +45,12 @@ combined corpus intended to satisfy the release gate; it requires at least 2,000
 Windows 10 and Windows 11, at least 99.9% correct supported mappings, zero wrong paths, no probe
 failures, and resolver p95 no greater than 50 ms.
 
+The final Milestone 1 decision is stricter than one runner invocation. Pass every raw result file
+to `tools\Test-Milestone1Gate.ps1` with the separately collected preview-window evidence. That
+aggregator recomputes verdicts, rejects repeated labeled points, checks every scenario and DPI on
+both supported operating systems, and emits the hash-addressed Markdown report used for the
+branch decision. See `qualification\README.md`.
+
 The runner compares Windows paths with ordinal case-insensitive semantics. A positive miss reduces
 coverage. A mismatched positive path or any resolved `fail_closed` case is a wrong-path failure.
 
