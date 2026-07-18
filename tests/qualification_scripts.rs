@@ -38,6 +38,36 @@ fn run_preview_measurement(extra_arguments: &[&str]) -> Output {
         .expect("the preview-window measurement script should start")
 }
 
+fn run_fixture_generator(extra_arguments: &[&str]) -> Output {
+    Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(repository_path("tools/New-ResolverFixture.ps1"))
+        .args(extra_arguments)
+        .output()
+        .expect("the resolver fixture generator should start")
+}
+
+fn run_live_page_collector(extra_arguments: &[&str]) -> Output {
+    Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(repository_path("tools/Measure-ExplorerResolverPage.ps1"))
+        .args(extra_arguments)
+        .output()
+        .expect("the live resolver page collector should start")
+}
+
 fn example_arguments() -> Vec<String> {
     vec![
         "-ResolverResults".into(),
@@ -202,6 +232,197 @@ fn qualification_gate_rejects_unobserved_click_delivery() {
         String::from_utf8_lossy(&output.stderr).contains("must record click delivery as yes or no"),
         "unexpected click-delivery rejection: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn resolver_fixture_generator_is_deterministic_and_non_destructive() {
+    let temporary_root = repository_path("target/qualification-tests/live-fixture");
+    let inventory = repository_path("target/qualification-tests/live-fixture.inventory.tsv");
+    if temporary_root.exists() {
+        fs::remove_dir_all(&temporary_root)
+            .expect("the prior fixture test directory should be removable");
+    }
+    if inventory.exists() {
+        fs::remove_file(&inventory).expect("the prior fixture inventory should be removable");
+    }
+
+    let generated = run_fixture_generator(&[
+        "-Destination",
+        temporary_root
+            .to_str()
+            .expect("the fixture path should be Unicode"),
+        "-FileCount",
+        "8",
+        "-Inventory",
+        inventory
+            .to_str()
+            .expect("the inventory path should be Unicode"),
+    ]);
+    assert!(
+        generated.status.success(),
+        "fixture generation failed: {}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+
+    let files = fs::read_dir(&temporary_root)
+        .expect("the generated fixture directory should be readable")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("fixture entries should be readable");
+    assert_eq!(files.len(), 8);
+    assert_eq!(
+        fs::read_to_string(temporary_root.join("cursorpeek-item-0001.txt"))
+            .expect("the first fixture should be readable"),
+        "CursorPeek resolver fixture 0001\r\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&inventory)
+            .expect("the inventory should be readable")
+            .lines()
+            .count(),
+        9
+    );
+
+    let repeated = run_fixture_generator(&[
+        "-Destination",
+        temporary_root
+            .to_str()
+            .expect("the fixture path should be Unicode"),
+        "-FileCount",
+        "8",
+        "-Inventory",
+        repository_path("target/qualification-tests/repeated.inventory.tsv")
+            .to_str()
+            .expect("the repeated inventory path should be Unicode"),
+    ]);
+    assert!(
+        !repeated.status.success(),
+        "fixture generation unexpectedly overwrote a populated directory"
+    );
+    assert!(
+        String::from_utf8_lossy(&repeated.stderr).contains("destination must be absent or empty"),
+        "unexpected non-destructive guard: {}",
+        String::from_utf8_lossy(&repeated.stderr)
+    );
+
+    let nested_fixture = repository_path("target/qualification-tests/nested-live-fixture");
+    if nested_fixture.exists() {
+        fs::remove_dir_all(&nested_fixture)
+            .expect("the prior nested-inventory fixture should be removable");
+    }
+    let nested_inventory = nested_fixture.join("inventory.tsv");
+    let rejected_inventory = run_fixture_generator(&[
+        "-Destination",
+        nested_fixture
+            .to_str()
+            .expect("the nested fixture path should be Unicode"),
+        "-FileCount",
+        "8",
+        "-Inventory",
+        nested_inventory
+            .to_str()
+            .expect("the nested inventory path should be Unicode"),
+    ]);
+    assert!(
+        !rejected_inventory.status.success(),
+        "fixture generation unexpectedly placed its inventory among fixture files"
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected_inventory.stderr)
+            .contains("inventory must remain outside"),
+        "unexpected nested-inventory guard: {}",
+        String::from_utf8_lossy(&rejected_inventory.stderr)
+    );
+    assert!(
+        !nested_fixture.exists(),
+        "a rejected nested-inventory destination was modified"
+    );
+
+    fs::remove_dir_all(&temporary_root).expect("the fixture test directory should be removable");
+    fs::remove_file(&inventory).expect("the fixture inventory should be removable");
+}
+
+#[test]
+fn live_page_collector_validates_without_promoting_evidence() {
+    let output = repository_path("target/qualification-tests/live-page-validation");
+    if output.exists() {
+        fs::remove_dir_all(&output)
+            .expect("the prior live-page validation directory should be removable");
+    }
+    let valid = run_live_page_collector(&[
+        "-FixturePath",
+        repository_path("corpus")
+            .to_str()
+            .expect("the corpus path should be Unicode"),
+        "-Os",
+        "windows11",
+        "-Build",
+        "22631",
+        "-Dpi",
+        "175",
+        "-Layout",
+        "details",
+        "-Scenario",
+        "file_row",
+        "-CaseIdStart",
+        "9900000",
+        "-SessionName",
+        "schema-only-live-page",
+        "-OutputDirectory",
+        output
+            .to_str()
+            .expect("the validation output path should be Unicode"),
+        "-ValidateOnly",
+    ]);
+    assert!(
+        valid.status.success(),
+        "live-page validation failed: {}",
+        String::from_utf8_lossy(&valid.stderr)
+    );
+    assert!(
+        !output.exists(),
+        "validation-only mode unexpectedly created evidence artifacts"
+    );
+
+    let forbidden = repository_path("corpus/results/live-page-forbidden");
+    let rejected = run_live_page_collector(&[
+        "-FixturePath",
+        repository_path("corpus")
+            .to_str()
+            .expect("the corpus path should be Unicode"),
+        "-Os",
+        "windows11",
+        "-Build",
+        "22631",
+        "-Dpi",
+        "175",
+        "-Layout",
+        "details",
+        "-Scenario",
+        "file_row",
+        "-CaseIdStart",
+        "9900000",
+        "-SessionName",
+        "schema-only-live-page",
+        "-OutputDirectory",
+        forbidden
+            .to_str()
+            .expect("the forbidden output path should be Unicode"),
+        "-ValidateOnly",
+    ]);
+    assert!(
+        !rejected.status.success(),
+        "live collection unexpectedly accepted an evidence destination"
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("ignored review output, not accepted evidence paths"),
+        "unexpected evidence-path guard: {}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(
+        !forbidden.exists(),
+        "a rejected evidence destination was modified"
     );
 }
 
