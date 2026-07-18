@@ -1,6 +1,7 @@
 /target/
 /corpus/sessions/
 /corpus/results/
+/qualification/evidence/
 *.user
 *.suo
 .idea/

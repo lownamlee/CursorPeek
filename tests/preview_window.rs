@@ -18,4 +18,7 @@ fn noactivate_preview_diagnostic_preserves_focus_and_eats_clicks() {
     assert!(stdout.contains("focus_preserved=yes"));
     assert!(stdout.contains("mouse_activation=eaten"));
     assert!(stdout.contains("dismissal="));
+    assert!(stdout.contains("inside_work_area=yes"));
+    assert!(stdout.contains("pointer_gap_preserved=yes"));
+    assert!(stdout.contains("ui_thread_max_us="));
 }

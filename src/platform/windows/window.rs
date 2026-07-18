@@ -136,6 +136,7 @@ impl MessageWindow {
         mut self,
         duration: Duration,
     ) -> Result<PreviewWindowDiagnosticReport> {
+        let ui_task_started = Instant::now();
         let point = physical_cursor_position()?;
         let anchor = PhysicalScreenPoint::new(point.x, point.y);
         // SAFETY: This retrieves a borrowed window handle and transfers no ownership.
@@ -157,11 +158,14 @@ impl MessageWindow {
         deadline_timer.arm(duration)?;
         self.preview_window = Some(preview);
         self.preview_diagnostics = Some(ActivePreviewDiagnostics {
-            focus_preserved,
+            foreground_before,
+            focus_preserved_at_show: focus_preserved,
             mouse_activation_eaten,
             placement,
+            ui_thread_max: Duration::ZERO,
             _deadline_timer: deadline_timer,
         });
+        self.record_preview_ui_task(ui_task_started.elapsed());
 
         match self.run_loop()? {
             MessageLoopExit::PreviewDiagnostics(report) => Ok(report),
@@ -187,8 +191,12 @@ impl MessageWindow {
             if status.0 == 0 {
                 return Ok(MessageLoopExit::Shutdown);
             }
+            // GetMessageW is the intended blocking wait. Start timing only after it returns so the
+            // qualification counter measures one nonblocking UI-thread task, not idle time.
+            let ui_task_started = Instant::now();
 
             if message.hwnd == self.hwnd && message.message == SHUTDOWN_MESSAGE {
+                self.record_preview_ui_task(ui_task_started.elapsed());
                 return Ok(MessageLoopExit::Shutdown);
             }
 
@@ -207,6 +215,7 @@ impl MessageWindow {
                 && message.message == WM_TIMER
                 && message.wParam.0 == PREVIEW_DIAGNOSTIC_DEADLINE_TIMER_ID
             {
+                self.record_preview_ui_task(ui_task_started.elapsed());
                 return Ok(MessageLoopExit::PreviewDiagnostics(
                     self.finish_preview_diagnostics(PreviewWindowDismissal::Timeout),
                 ));
@@ -217,6 +226,7 @@ impl MessageWindow {
                 && message.wParam.0 == INPUT_SAMPLE_TIMER_ID
             {
                 self.handle_input_diagnostic_sample();
+                self.record_preview_ui_task(ui_task_started.elapsed());
                 continue;
             }
 
@@ -225,6 +235,7 @@ impl MessageWindow {
                 && message.wParam.0 == DWELL_TIMER_ID
             {
                 self.handle_dwell_timer(Instant::now());
+                self.record_preview_ui_task(ui_task_started.elapsed());
                 continue;
             }
 
@@ -245,12 +256,20 @@ impl MessageWindow {
                 if preview_input_requires_dismissal(&raw_mouse)
                     && self.preview_diagnostics.is_some()
                 {
+                    self.record_preview_ui_task(ui_task_started.elapsed());
                     return Ok(MessageLoopExit::PreviewDiagnostics(
                         self.finish_preview_diagnostics(PreviewWindowDismissal::Input),
                     ));
                 }
                 self.handle_raw_mouse(raw_mouse);
             }
+            self.record_preview_ui_task(ui_task_started.elapsed());
+        }
+    }
+
+    fn record_preview_ui_task(&mut self, duration: Duration) {
+        if let Some(diagnostics) = self.preview_diagnostics.as_mut() {
+            diagnostics.ui_thread_max = diagnostics.ui_thread_max.max(duration);
         }
     }
 
@@ -258,6 +277,10 @@ impl MessageWindow {
         &mut self,
         dismissal: PreviewWindowDismissal,
     ) -> PreviewWindowDiagnosticReport {
+        let finish_started = Instant::now();
+        // SAFETY: This retrieves a borrowed window handle and transfers no ownership.
+        let foreground_after_interaction = unsafe { GetForegroundWindow() };
+        let preview_handle = self.preview_window.as_ref().map(PreviewWindow::handle);
         if let Some(preview) = self.preview_window.as_ref() {
             let _ = preview.hide();
         }
@@ -266,11 +289,16 @@ impl MessageWindow {
             .preview_diagnostics
             .take()
             .expect("a preview diagnostic exits only while active");
+        let focus_preserved = diagnostics.focus_preserved_at_show
+            && foreground_after_interaction == diagnostics.foreground_before
+            && preview_handle.is_none_or(|handle| foreground_after_interaction != handle);
+        let ui_thread_max = diagnostics.ui_thread_max.max(finish_started.elapsed());
         PreviewWindowDiagnosticReport {
-            focus_preserved: diagnostics.focus_preserved,
+            focus_preserved,
             mouse_activation_eaten: diagnostics.mouse_activation_eaten,
             placement: diagnostics.placement,
             dismissal,
+            ui_thread_max,
         }
     }
 
@@ -453,9 +481,11 @@ enum MessageLoopExit {
 }
 
 struct ActivePreviewDiagnostics {
-    focus_preserved: bool,
+    foreground_before: HWND,
+    focus_preserved_at_show: bool,
     mouse_activation_eaten: bool,
     placement: PreviewPlacement,
+    ui_thread_max: Duration,
     _deadline_timer: WindowTimer,
 }
 
@@ -471,6 +501,7 @@ pub(crate) struct PreviewWindowDiagnosticReport {
     mouse_activation_eaten: bool,
     placement: PreviewPlacement,
     dismissal: PreviewWindowDismissal,
+    ui_thread_max: Duration,
 }
 
 impl fmt::Display for PreviewWindowDiagnosticReport {
@@ -486,13 +517,18 @@ impl fmt::Display for PreviewWindowDiagnosticReport {
             PreviewWindowDismissal::Timeout => "timeout",
             PreviewWindowDismissal::Shutdown => "shutdown",
         };
+        let ui_thread_max_us = u64::try_from(self.ui_thread_max.as_micros()).unwrap_or(u64::MAX);
 
         write!(
             formatter,
             "No-activate preview diagnostic completed: focus_preserved={focus}, \
              mouse_activation={mouse_activation}, dismissal={dismissal}, x={}, y={}, width={}, \
-             height={}",
-            self.placement.x, self.placement.y, self.placement.width, self.placement.height
+             height={}, inside_work_area=yes, pointer_gap_preserved=yes, ui_thread_max_us={}",
+            self.placement.x,
+            self.placement.y,
+            self.placement.width,
+            self.placement.height,
+            ui_thread_max_us
         )
     }
 }
