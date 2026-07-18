@@ -29,6 +29,11 @@ matrix to release qualification:
 A feasibility pass only unlocks implementation. It must never be described as a release-qualified
 binary.
 
+The current reviewed feasibility decision is recorded in
+[`milestone-1-feasibility.md`](milestone-1-feasibility.md). It passes the implementation-unlock
+profile; the default release profile and its full DPI, display-topology, input-device, and
+supported-OS matrix remain mandatory before version 0.1.0 can ship.
+
 Raw sessions belong in ignored `corpus/sessions`, `corpus/results`, and
 `qualification/evidence` directories. Keep them with VM snapshots, display topology, Explorer
 setup notes, and file hashes. The public aggregate report records only file names, hashes, counts,
