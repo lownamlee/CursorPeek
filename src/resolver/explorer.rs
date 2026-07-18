@@ -21,7 +21,7 @@ use windows::{
             IUIAutomationElement, IUIAutomationLegacyIAccessiblePattern, IUIAutomationRegistrar,
             IUIAutomationTreeWalker, TreeScope_Element, UIA_AutomationIdPropertyId,
             UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId, UIA_DataItemControlTypeId,
-            UIA_LegacyIAccessiblePatternId, UIA_ListItemControlTypeId,
+            UIA_LegacyIAccessiblePatternId, UIA_ListItemControlTypeId, UIA_NamePropertyId,
             UIA_NativeWindowHandlePropertyId, UIA_PROPERTY_ID, UIAutomationPropertyInfo,
             UIAutomationType_Int,
         },
@@ -113,6 +113,7 @@ impl ExplorerResolver {
                 UIA_BoundingRectanglePropertyId,
                 UIA_NativeWindowHandlePropertyId,
                 UIA_AutomationIdPropertyId,
+                UIA_NamePropertyId,
                 item_index_property,
             ] {
                 cache_request.AddProperty(property)?;
@@ -153,8 +154,14 @@ impl ExplorerResolver {
     fn select_active_view(
         &mut self,
         point: PhysicalScreenPoint,
+        evidence: candidate::CandidateEvidence<'_>,
     ) -> Result<shell::ActiveFolderView, shell::ShellRejection> {
-        let first = shell::select(&self.shell_windows, &mut self.active_folder_view, point);
+        let first = shell::select(
+            &self.shell_windows,
+            &mut self.active_folder_view,
+            point,
+            evidence,
+        );
         if !matches!(
             first,
             Err(shell::ShellRejection::ShellWindowsUnavailable(_))
@@ -165,7 +172,12 @@ impl ExplorerResolver {
         self.shell_windows = shell::create_collection()
             .map_err(|error| shell::ShellRejection::ShellWindowsUnavailable(error.code().0))?;
         self.active_folder_view = None;
-        shell::select(&self.shell_windows, &mut self.active_folder_view, point)
+        shell::select(
+            &self.shell_windows,
+            &mut self.active_folder_view,
+            point,
+            evidence,
+        )
     }
 
     fn inspect_point(&self, point: PhysicalScreenPoint) -> PointInspection {
@@ -355,6 +367,10 @@ impl ExplorerResolver {
                 .CachedAutomationId()
                 .map(|value| BoundedText::from_bstr(&value))
                 .map_err(|error| cached_error(depth, CachedProperty::AutomationId, error))?;
+            let name = element
+                .CachedName()
+                .map(|value| BoundedText::from_bstr(&value))
+                .map_err(|error| cached_error(depth, CachedProperty::Name, error))?;
             let legacy_pattern = element
                 .GetCachedPatternAs::<IUIAutomationLegacyIAccessiblePattern>(
                     UIA_LegacyIAccessiblePatternId,
@@ -384,6 +400,7 @@ impl ExplorerResolver {
                 bounds,
                 native_window,
                 automation_id,
+                name,
                 has_legacy_pattern: legacy_pattern.is_some(),
                 legacy_value,
                 item_index,
@@ -429,7 +446,6 @@ impl ExplorerResolver {
 
 impl PointResolver for ExplorerResolver {
     fn resolve(&mut self, point: PhysicalScreenPoint) -> ResolveOutcome {
-        let active_view = self.select_active_view(point);
         let PointInspection {
             trace: uia,
             item_element,
@@ -441,6 +457,7 @@ impl PointResolver for ExplorerResolver {
             ),
             ResolutionTrace::Candidate(candidate) => match candidate.shell_evidence() {
                 Ok(evidence) => {
+                    let active_view = self.select_active_view(point, evidence);
                     let mut verification = match &active_view {
                         Ok(active_view) => shell::verify(active_view, point, evidence),
                         Err(reason) => shell::selection_failure(*reason),
@@ -638,6 +655,7 @@ const fn cached_property_reason(property: CachedProperty) -> &'static str {
         CachedProperty::BoundingRectangle => "uia.cached_bounds_failed",
         CachedProperty::NativeWindowHandle => "uia.cached_native_window_failed",
         CachedProperty::AutomationId => "uia.cached_automation_id_failed",
+        CachedProperty::Name => "uia.cached_name_failed",
         CachedProperty::ItemIndex => "uia.cached_item_index_failed",
     }
 }
@@ -725,6 +743,9 @@ fn shell_rejection_reason(reason: shell::ShellRejection) -> CorpusReason {
         ShellRejection::CandidateIdentityMismatch { index } => {
             CorpusReason::with_context("shell.candidate_identity_mismatch", i64::from(index), 0)
         }
+        ShellRejection::NoCandidateViewAtPoint { inspected } => {
+            CorpusReason::with_context("shell.no_candidate_view_at_point", i64::from(inspected), 0)
+        }
         ShellRejection::CandidateRevalidationFailed(code) => {
             CorpusReason::with_context("shell.candidate_revalidation_failed", i64::from(code), 0)
         }
@@ -742,6 +763,16 @@ fn shell_rejection_reason(reason: shell::ShellRejection) -> CorpusReason {
         ShellRejection::ViewItemPathMalformed { index } => {
             CorpusReason::with_context("shell.view_item_path_malformed", i64::from(index), 0)
         }
+        ShellRejection::ViewItemDisplayNameFailed { index, code } => CorpusReason::with_context(
+            "shell.view_item_display_name_failed",
+            i64::from(index),
+            i64::from(code),
+        ),
+        ShellRejection::ViewItemDisplayNameMalformed { index } => CorpusReason::with_context(
+            "shell.view_item_display_name_malformed",
+            i64::from(index),
+            0,
+        ),
         ShellRejection::NoMatchingFilesystemItem { inspected } => {
             CorpusReason::with_context("shell.no_matching_filesystem_item", i64::from(inspected), 0)
         }

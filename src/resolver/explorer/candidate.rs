@@ -120,6 +120,7 @@ impl CachedElementMetadata {
 
         Ok(CandidateEvidence {
             path_units,
+            display_name_units: self.name.complete_nonempty_units(),
             view_index,
             item_native_window: self.native_window,
             item_bounds: self.bounds,
@@ -130,6 +131,7 @@ impl CachedElementMetadata {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct CandidateEvidence<'a> {
     pub(super) path_units: Option<&'a [u16]>,
+    pub(super) display_name_units: Option<&'a [u16]>,
     pub(super) view_index: Option<u32>,
     pub(super) item_native_window: usize,
     pub(super) item_bounds: CachedRect,
@@ -138,6 +140,7 @@ pub(super) struct CandidateEvidence<'a> {
 impl CandidateEvidence<'_> {
     pub(super) fn same_fingerprint(&self, other: &CandidateEvidence<'_>) -> bool {
         self.path_units == other.path_units
+            && self.display_name_units == other.display_name_units
             && self.view_index == other.view_index
             && self.item_native_window == other.item_native_window
             && self.item_bounds == other.item_bounds
@@ -238,6 +241,7 @@ pub(super) enum CachedProperty {
     BoundingRectangle,
     NativeWindowHandle,
     AutomationId,
+    Name,
     ItemIndex,
 }
 
@@ -249,6 +253,7 @@ pub(super) struct CachedElementMetadata {
     pub(super) bounds: CachedRect,
     pub(super) native_window: usize,
     pub(super) automation_id: BoundedText,
+    pub(super) name: BoundedText,
     pub(super) has_legacy_pattern: bool,
     pub(super) legacy_value: Option<BoundedLegacyValue>,
     pub(super) item_index: Option<i32>,
@@ -258,6 +263,7 @@ impl CachedElementMetadata {
     fn invariant_holds(&self, expected_depth: usize) -> bool {
         self.depth == expected_depth
             && self.automation_id.invariant_holds()
+            && self.name.invariant_holds()
             && self
                 .legacy_value
                 .as_ref()
@@ -369,6 +375,10 @@ impl BoundedText {
 
     fn equals_str(&self, expected: &str) -> bool {
         !self.was_truncated() && self.units.iter().copied().eq(expected.encode_utf16())
+    }
+
+    fn complete_nonempty_units(&self) -> Option<&[u16]> {
+        (!self.was_truncated() && !self.units.is_empty()).then_some(&self.units)
     }
 }
 
@@ -513,6 +523,7 @@ mod tests {
             automation_id: BoundedText::from_units(
                 &automation_id.encode_utf16().collect::<Vec<_>>(),
             ),
+            name: BoundedText::from_units(&"preview.txt".encode_utf16().collect::<Vec<_>>()),
             has_legacy_pattern: legacy_value.is_some(),
             legacy_value: legacy_value
                 .map(|value| BoundedLegacyValue::from_bstr(&windows::core::BSTR::from(value))),
@@ -543,6 +554,10 @@ mod tests {
             r"C:\preview.txt".encode_utf16().collect::<Vec<_>>()
         );
         assert_eq!(evidence.view_index, None);
+        assert_eq!(
+            evidence.display_name_units.unwrap(),
+            "preview.txt".encode_utf16().collect::<Vec<_>>()
+        );
         assert_eq!(evidence.item_native_window, 42);
 
         let mut list_container = candidate.clone();
@@ -640,6 +655,12 @@ mod tests {
         changed.inspected[0].native_window += 1;
         let changed_window = changed.shell_evidence().unwrap();
         assert!(!original.same_fingerprint(&changed_window));
+
+        changed.inspected[0].native_window = candidate.inspected[0].native_window;
+        changed.inspected[0].name =
+            BoundedText::from_units(&"different.txt".encode_utf16().collect::<Vec<_>>());
+        let changed_name = changed.shell_evidence().unwrap();
+        assert!(!original.same_fingerprint(&changed_name));
     }
 
     #[test]

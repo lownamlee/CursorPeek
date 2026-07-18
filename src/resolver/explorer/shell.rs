@@ -16,7 +16,7 @@ use windows::{
             Shell::{
                 IFolderView2, IShellBrowser, IShellItem, IShellItemArray, IShellView,
                 IShellWindows, IWebBrowser2, SID_STopLevelBrowser, SIGDN_FILESYSPATH,
-                SVGIO_ALLVIEW, ShellWindows,
+                SIGDN_NORMALDISPLAY, SVGIO_ALLVIEW, ShellWindows,
             },
             WindowsAndMessaging::{
                 GA_ROOT, GetAncestor, GetForegroundWindow, IsChild, IsIconic, IsWindowVisible,
@@ -90,11 +90,14 @@ pub(super) enum ShellRejection {
     ViewItemLimitExceeded(u32),
     CandidateItemIndexOutOfRange { index: u32, count: u32 },
     CandidateIdentityMismatch { index: u32 },
+    NoCandidateViewAtPoint { inspected: i32 },
     CandidateRevalidationFailed(i32),
     CandidateChangedDuringVerification,
     ViewItemFailed { index: u32, code: i32 },
     ViewItemPathFailed { index: u32, code: i32 },
     ViewItemPathMalformed { index: u32 },
+    ViewItemDisplayNameFailed { index: u32, code: i32 },
+    ViewItemDisplayNameMalformed { index: u32 },
     NoMatchingFilesystemItem { inspected: u32 },
     MultipleMatchingFilesystemItems,
     MatchingItemAttributesFailed(i32),
@@ -112,6 +115,7 @@ pub(super) fn select(
     shell_windows: &IShellWindows,
     cached: &mut Option<ActiveFolderView>,
     point: PhysicalScreenPoint,
+    evidence: CandidateEvidence<'_>,
 ) -> Result<ActiveFolderView, ShellRejection> {
     if let Some(existing) = cached.as_ref() {
         match existing.try_reuse(shell_windows, point) {
@@ -129,7 +133,7 @@ pub(super) fn select(
         }
     }
 
-    let active_view = active_folder_view(shell_windows, point)?;
+    let active_view = active_folder_view(shell_windows, point, evidence)?;
     *cached = Some(active_view.clone());
     Ok(active_view)
 }
@@ -164,6 +168,7 @@ pub(super) fn verify(
     let resolution = matching_item(
         &active_view.folder_view,
         evidence.path_units,
+        evidence.display_name_units,
         evidence.view_index,
     );
     if let Err(reason) = active_view.revalidate(point, evidence.item_native_window) {
@@ -201,6 +206,7 @@ fn rejected(outcome: ShellOutcome, reason: ShellRejection) -> ShellVerification 
 fn active_folder_view(
     shell_windows: &IShellWindows,
     point: PhysicalScreenPoint,
+    evidence: CandidateEvidence<'_>,
 ) -> Result<ActiveFolderView, ShellRejection> {
     // SAFETY: every method is called on an apartment-local interface. Window handles are copied
     // values and are revalidated before use. No borrowed pointer outlives this function.
@@ -221,7 +227,7 @@ fn active_folder_view(
             return Err(ShellRejection::PointerLeftForegroundExplorer);
         }
 
-        let mut selected: Option<ActiveFolderView> = None;
+        let mut candidates = Vec::new();
         for index in 0..count {
             let dispatch = shell_windows.Item(&VARIANT::from(index)).map_err(|error| {
                 ShellRejection::ShellWindowItemFailed {
@@ -251,27 +257,67 @@ fn active_folder_view(
                 }
             })?;
 
-            if let Some(selected_view) = &selected {
-                if Interface::as_raw(&selected_view.shell_view_identity)
-                    != Interface::as_raw(&shell_view_identity)
-                {
-                    return Err(ShellRejection::MultipleActiveViews);
-                }
-            } else {
-                selected = Some(ActiveFolderView {
-                    folder_view,
-                    shell_browser,
-                    shell_view_identity,
-                    browser_window,
-                    pointer_window,
-                    shell_window_index: index,
-                    shell_window_count: count,
-                });
+            if candidates.iter().any(|candidate: &ActiveFolderView| {
+                Interface::as_raw(&candidate.shell_view_identity)
+                    == Interface::as_raw(&shell_view_identity)
+            }) {
+                continue;
             }
+
+            candidates.push(ActiveFolderView {
+                folder_view,
+                shell_browser,
+                shell_view_identity,
+                browser_window,
+                pointer_window,
+                shell_window_index: index,
+                shell_window_count: count,
+            });
         }
 
-        selected.ok_or(ShellRejection::NoActiveViewAtPoint { inspected: count })
+        if candidates.is_empty() {
+            return Err(ShellRejection::NoActiveViewAtPoint { inspected: count });
+        }
+        if candidates.len() == 1 {
+            return Ok(candidates
+                .pop()
+                .expect("the single-view branch retains one candidate"));
+        }
+
+        let inspected = i32::try_from(candidates.len())
+            .expect("the Shell-window cap keeps the candidate count in i32");
+        let mut matches = Vec::with_capacity(candidates.len());
+        for candidate in &candidates {
+            matches.push(view_matches_candidate(&candidate.folder_view, evidence)?);
+        }
+
+        match classify_view_matches(&matches) {
+            ViewMatchSelection::None => Err(ShellRejection::NoCandidateViewAtPoint { inspected }),
+            ViewMatchSelection::Unique(index) => Ok(candidates.swap_remove(index)),
+            ViewMatchSelection::Multiple => Err(ShellRejection::MultipleActiveViews),
+        }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ViewMatchSelection {
+    None,
+    Unique(usize),
+    Multiple,
+}
+
+fn classify_view_matches(matches: &[bool]) -> ViewMatchSelection {
+    let mut selected = None;
+    for (index, matched) in matches.iter().copied().enumerate() {
+        if !matched {
+            continue;
+        }
+        if selected.is_some() {
+            return ViewMatchSelection::Multiple;
+        }
+        selected = Some(index);
+    }
+    selected.map_or(ViewMatchSelection::None, ViewMatchSelection::Unique)
 }
 
 unsafe fn relevant_folder_view(
@@ -329,9 +375,10 @@ impl ActiveFolderView {
         point: PhysicalScreenPoint,
     ) -> Result<Option<Self>, ShellRejection> {
         // SAFETY: the cached interfaces remain on their owning MTA. A cache hit is allowed only
-        // while the point still belongs to the same visible foreground browser, the registered
-        // Shell-window count is unchanged, and QueryActiveShellView returns the same controlling
-        // IUnknown identity. Any ordinary view/window change falls back to full enumeration.
+        // while the point still belongs to the same visible foreground browser, exactly one Shell
+        // window is registered, and QueryActiveShellView returns the same controlling-IUnknown
+        // identity. Multiple registrations may be same-frame tabs, so they always force full
+        // evidence correlation instead of taking the cache.
         unsafe {
             let pointer_window = WindowFromPoint(POINT {
                 x: point.x,
@@ -352,7 +399,7 @@ impl ActiveFolderView {
             }
 
             let count = shell_window_count(shell_windows)?;
-            if count != self.shell_window_count {
+            if count != self.shell_window_count || count != 1 {
                 return Ok(None);
             }
 
@@ -444,22 +491,14 @@ impl ActiveFolderView {
 fn matching_item(
     folder_view: &IFolderView2,
     candidate_path: Option<&[u16]>,
+    candidate_display_name: Option<&[u16]>,
     view_index: Option<u32>,
 ) -> Result<(ResolvedTarget, u32), ShellRejection> {
     // SAFETY: the view is apartment-local. The returned array/items are binding-owned COM
     // interfaces. GetDisplayName allocates with the COM task allocator; OwnedShellPath frees every
     // successful result, including error/early-return paths below.
     unsafe {
-        let raw_count = folder_view
-            .ItemCount(SVGIO_ALLVIEW)
-            .map_err(|error| ShellRejection::ViewItemsFailed(error.code().0))?;
-        if raw_count < 0 {
-            return Err(ShellRejection::InvalidViewItemCount(raw_count));
-        }
-        let count = u32::try_from(raw_count).expect("a nonnegative i32 fits u32");
-        if count > MAX_VIEW_ITEMS {
-            return Err(ShellRejection::ViewItemLimitExceeded(count));
-        }
+        let count = view_item_count(folder_view)?;
 
         let (item, path_units) = if let Some(index) = view_index {
             if index >= count {
@@ -473,6 +512,12 @@ fn matching_item(
                     index,
                     code: error.code().0,
                 })?;
+            if let Some(candidate) = candidate_display_name {
+                let display_name = item_display_name(&item, index)?;
+                if candidate != display_name {
+                    return Err(ShellRejection::CandidateIdentityMismatch { index });
+                }
+            }
             let path_units = item_path(&item, index)?;
             if candidate_path.is_some_and(|candidate| candidate != path_units) {
                 return Err(ShellRejection::CandidateIdentityMismatch { index });
@@ -504,6 +549,12 @@ fn matching_item(
                 if path_units != candidate_path {
                     continue;
                 }
+                if let Some(candidate_display_name) = candidate_display_name {
+                    let display_name = item_display_name(&item, index)?;
+                    if display_name != candidate_display_name {
+                        return Err(ShellRejection::CandidateIdentityMismatch { index });
+                    }
+                }
                 if matched.is_some() {
                     return Err(ShellRejection::MultipleMatchingFilesystemItems);
                 }
@@ -530,6 +581,101 @@ fn matching_item(
     }
 }
 
+fn view_matches_candidate(
+    folder_view: &IFolderView2,
+    evidence: CandidateEvidence<'_>,
+) -> Result<bool, ShellRejection> {
+    // SAFETY: the folder view and returned Shell items stay on the resolver MTA. Every collection
+    // traversal is bounded before an item is requested.
+    unsafe {
+        let count = view_item_count(folder_view)?;
+        if let Some(index) = evidence.view_index {
+            if index >= count {
+                return Ok(false);
+            }
+            let item = folder_view
+                .GetItem::<IShellItem>(
+                    i32::try_from(index).expect("the capped item index fits a signed view index"),
+                )
+                .map_err(|error| ShellRejection::ViewItemFailed {
+                    index,
+                    code: error.code().0,
+                })?;
+
+            if let Some(candidate_display_name) = evidence.display_name_units {
+                let display_name = item_display_name(&item, index)?;
+                if !display_name_matches(Some(candidate_display_name), &display_name) {
+                    return Ok(false);
+                }
+            }
+            if let Some(candidate_path) = evidence.path_units {
+                let path = item_path(&item, index)?;
+                if path != candidate_path {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
+
+        let candidate_path = evidence
+            .path_units
+            .expect("candidate evidence without an index always retains a complete path");
+        let items: IShellItemArray = folder_view
+            .Items(SVGIO_ALLVIEW)
+            .map_err(|error| ShellRejection::ViewItemsFailed(error.code().0))?;
+        let item_count = items
+            .GetCount()
+            .map_err(|error| ShellRejection::ViewItemsFailed(error.code().0))?;
+        if item_count > MAX_VIEW_ITEMS {
+            return Err(ShellRejection::ViewItemLimitExceeded(item_count));
+        }
+
+        let mut matched = false;
+        for index in 0..item_count {
+            let item = items
+                .GetItemAt(index)
+                .map_err(|error| ShellRejection::ViewItemFailed {
+                    index,
+                    code: error.code().0,
+                })?;
+            if item_path(&item, index)? != candidate_path {
+                continue;
+            }
+            if let Some(candidate_display_name) = evidence.display_name_units
+                && !display_name_matches(
+                    Some(candidate_display_name),
+                    &item_display_name(&item, index)?,
+                )
+            {
+                return Ok(false);
+            }
+            if matched {
+                return Err(ShellRejection::MultipleMatchingFilesystemItems);
+            }
+            matched = true;
+        }
+        Ok(matched)
+    }
+}
+
+fn display_name_matches(candidate: Option<&[u16]>, actual: &[u16]) -> bool {
+    candidate.is_none_or(|candidate| candidate == actual)
+}
+
+fn view_item_count(folder_view: &IFolderView2) -> Result<u32, ShellRejection> {
+    // SAFETY: the view is apartment-local and ItemCount returns one copied signed value.
+    let raw_count = unsafe { folder_view.ItemCount(SVGIO_ALLVIEW) }
+        .map_err(|error| ShellRejection::ViewItemsFailed(error.code().0))?;
+    if raw_count < 0 {
+        return Err(ShellRejection::InvalidViewItemCount(raw_count));
+    }
+    let count = u32::try_from(raw_count).expect("a nonnegative i32 fits u32");
+    if count > MAX_VIEW_ITEMS {
+        return Err(ShellRejection::ViewItemLimitExceeded(count));
+    }
+    Ok(count)
+}
+
 unsafe fn item_path(item: &IShellItem, index: u32) -> Result<Vec<u16>, ShellRejection> {
     // SAFETY: item is an apartment-local Shell interface. GetDisplayName transfers a
     // CoTaskMemAlloc-compatible string; OwnedShellPath frees it on every return path.
@@ -544,6 +690,24 @@ unsafe fn item_path(item: &IShellItem, index: u32) -> Result<Vec<u16>, ShellReje
         path.units()
             .map(<[u16]>::to_vec)
             .ok_or(ShellRejection::ViewItemPathMalformed { index })
+    }
+}
+
+unsafe fn item_display_name(item: &IShellItem, index: u32) -> Result<Vec<u16>, ShellRejection> {
+    // SAFETY: item is an apartment-local Shell interface. GetDisplayName transfers a
+    // CoTaskMemAlloc-compatible string; OwnedShellPath frees it on every return path.
+    unsafe {
+        let display_name =
+            OwnedShellPath::new(item.GetDisplayName(SIGDN_NORMALDISPLAY).map_err(|error| {
+                ShellRejection::ViewItemDisplayNameFailed {
+                    index,
+                    code: error.code().0,
+                }
+            })?);
+        display_name
+            .units()
+            .map(<[u16]>::to_vec)
+            .ok_or(ShellRejection::ViewItemDisplayNameMalformed { index })
     }
 }
 
@@ -596,7 +760,9 @@ impl Drop for OwnedShellPath {
 
 #[cfg(test)]
 mod tests {
-    use super::is_supported_local_path;
+    use super::{
+        ViewMatchSelection, classify_view_matches, display_name_matches, is_supported_local_path,
+    };
 
     #[test]
     fn local_path_policy_accepts_only_drive_absolute_values() {
@@ -613,5 +779,31 @@ mod tests {
             0x5c,
             0
         ]));
+    }
+
+    #[test]
+    fn same_frame_tabs_require_exactly_one_correlated_view() {
+        assert_eq!(
+            classify_view_matches(&[false, false]),
+            ViewMatchSelection::None
+        );
+        assert_eq!(
+            classify_view_matches(&[false, true, false]),
+            ViewMatchSelection::Unique(1)
+        );
+        assert_eq!(
+            classify_view_matches(&[true, false, true]),
+            ViewMatchSelection::Multiple
+        );
+    }
+
+    #[test]
+    fn display_name_correlation_is_exact_and_optional() {
+        let expected = "preview.txt".encode_utf16().collect::<Vec<_>>();
+        let different = "Preview.txt".encode_utf16().collect::<Vec<_>>();
+
+        assert!(display_name_matches(None, &different));
+        assert!(display_name_matches(Some(&expected), &expected));
+        assert!(!display_name_matches(Some(&expected), &different));
     }
 }
