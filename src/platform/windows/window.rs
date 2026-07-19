@@ -23,7 +23,7 @@ use crate::worker::{
     CompletionNotifier, PendingWorkerPoll, PendingWorkerResolution, WorkerManager,
 };
 
-use super::PreviewWindow;
+use super::{PreviewWindow, TrayCommand, TrayIcon};
 
 use windows::{
     Win32::{
@@ -45,6 +45,7 @@ use windows::Win32::UI::WindowsAndMessaging::IsWindow;
 const CLASS_NAME: PCWSTR = w!("CursorPeek.MessageWindow");
 const SHUTDOWN_MESSAGE: u32 = WM_APP + 1;
 const WORKER_RESULT_MESSAGE: u32 = WM_APP + 2;
+const TRAY_CALLBACK_MESSAGE: u32 = WM_APP + 3;
 const DWELL_TIMER_ID: usize = 1;
 const INPUT_SAMPLE_TIMER_ID: usize = 2;
 const INPUT_DIAGNOSTIC_DEADLINE_TIMER_ID: usize = 3;
@@ -54,7 +55,7 @@ pub(crate) const PREVIEW_WINDOW_DIAGNOSTIC_DURATION: Duration = Duration::from_m
 pub(crate) const PREVIEW_WINDOW_PRACTICE_DURATION: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
-const TEST_PANIC_MESSAGE: u32 = WM_APP + 3;
+const TEST_PANIC_MESSAGE: u32 = WM_APP + 4;
 
 pub(crate) struct MessageWindow {
     hwnd: HWND,
@@ -63,6 +64,8 @@ pub(crate) struct MessageWindow {
     input_diagnostics: Option<InputDiagnostics>,
     preview_diagnostics: Option<ActivePreviewDiagnostics>,
     preview_window: Option<PreviewWindow>,
+    tray_icon: Option<TrayIcon>,
+    paused: bool,
     worker_manager: Option<WorkerManager>,
     pending_worker_resolution: Option<PendingWorkerResolution>,
     latest_worker_completion: Option<Generation>,
@@ -102,6 +105,8 @@ impl MessageWindow {
             input_diagnostics: None,
             preview_diagnostics: None,
             preview_window: None,
+            tray_icon: None,
+            paused: false,
             worker_manager: None,
             pending_worker_resolution: None,
             latest_worker_completion: None,
@@ -129,7 +134,17 @@ impl MessageWindow {
 
     pub(crate) fn run_application(mut self, worker_manager: WorkerManager) -> Result<()> {
         self.worker_manager = Some(worker_manager);
+        self.tray_icon = Some(TrayIcon::create(self.hwnd, TRAY_CALLBACK_MESSAGE)?);
+        self.finish_application_loop()
+    }
 
+    #[cfg(test)]
+    fn run_application_without_tray(mut self, worker_manager: WorkerManager) -> Result<()> {
+        self.worker_manager = Some(worker_manager);
+        self.finish_application_loop()
+    }
+
+    fn finish_application_loop(mut self) -> Result<()> {
         match self.run_loop()? {
             MessageLoopExit::Shutdown => Ok(()),
             MessageLoopExit::InputDiagnostics(_) | MessageLoopExit::PreviewDiagnostics(_) => {
@@ -269,6 +284,14 @@ impl MessageWindow {
                 continue;
             }
 
+            if message.hwnd == self.hwnd && message.message == TRAY_CALLBACK_MESSAGE {
+                if self.handle_tray_callback(message.wParam, message.lParam)? {
+                    return Ok(MessageLoopExit::Shutdown);
+                }
+                self.record_preview_ui_task(ui_task_started.elapsed());
+                continue;
+            }
+
             let raw_mouse = if message.hwnd == self.hwnd && message.message == WM_INPUT {
                 Some(read_raw_mouse_activity(message.lParam))
             } else {
@@ -335,6 +358,9 @@ impl MessageWindow {
     fn handle_raw_mouse(&mut self, raw_mouse: Result<Option<RawMouseActivity>>) {
         if self.input_diagnostics.is_some() {
             self.handle_input_diagnostic_raw(raw_mouse);
+            return;
+        }
+        if self.paused {
             return;
         }
 
@@ -500,6 +526,41 @@ impl MessageWindow {
         }
     }
 
+    fn handle_tray_callback(&mut self, wparam: WPARAM, lparam: LPARAM) -> Result<bool> {
+        let Some(command) = self
+            .tray_icon
+            .as_ref()
+            .map(|tray| tray.command_for_callback(wparam, lparam, self.paused))
+            .transpose()?
+            .flatten()
+        else {
+            return Ok(false);
+        };
+
+        match command {
+            TrayCommand::TogglePaused => {
+                let paused = !self.paused;
+                self.tray_icon
+                    .as_mut()
+                    .expect("a tray command requires the live tray owner")
+                    .set_paused(paused)?;
+                self.paused = paused;
+                if paused {
+                    self.cancel_dwell();
+                }
+                Ok(false)
+            }
+            TrayCommand::About => {
+                self.tray_icon
+                    .as_ref()
+                    .expect("a tray command requires the live tray owner")
+                    .show_about();
+                Ok(false)
+            }
+            TrayCommand::Exit => Ok(true),
+        }
+    }
+
     #[cfg(test)]
     fn handle(&self) -> HWND {
         self.hwnd
@@ -540,6 +601,7 @@ fn preview_input_requires_dismissal(raw_mouse: &Result<Option<RawMouseActivity>>
 
 impl Drop for MessageWindow {
     fn drop(&mut self) {
+        drop(self.tray_icon.take());
         drop(self.preview_diagnostics.take());
         drop(self.preview_window.take());
         drop(self.input_diagnostics.take());
@@ -890,7 +952,7 @@ mod tests {
                 .request_shutdown()
                 .expect("the application shutdown message should be queued");
             application
-                .run_application(worker_manager)
+                .run_application_without_tray(worker_manager)
                 .expect("normal application shutdown should join the worker manager");
             // SAFETY: The normal application loop consumed and dropped its owned HWND.
             assert!(!unsafe { IsWindow(Some(application_handle)).as_bool() });
