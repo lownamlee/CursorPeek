@@ -12,6 +12,7 @@ use crate::{
         verify_per_monitor_v2,
     },
     resolver::{ExplorerResolver, ResolverError},
+    settings::{SettingsError, SettingsFile},
     worker::{self, WorkerManagerError, WorkerSessionError},
 };
 
@@ -46,7 +47,10 @@ pub(crate) fn run(process_mode: ProcessMode) -> Result<(), AppError> {
 
     match process_mode {
         ProcessMode::Main => {
-            let message_window = MessageWindow::create()?;
+            let settings_file = SettingsFile::discover()?;
+            let settings = settings_file.load_or_create()?;
+            let message_window =
+                MessageWindow::create_with_dwell_delay(settings.settings().dwell_delay())?;
             let worker_manager = worker::WorkerManager::start()?;
             message_window.run_application(worker_manager)?;
         }
@@ -106,6 +110,7 @@ pub(crate) enum AppError {
     WorkerManager(WorkerManagerError),
     Worker(WorkerSessionError),
     Resolver(ResolverError),
+    Settings(SettingsError),
     #[cfg(feature = "resolver-corpus")]
     Corpus(corpus::CorpusError),
 }
@@ -118,6 +123,7 @@ impl fmt::Display for AppError {
             Self::WorkerManager(error) => write!(formatter, "worker manager: {error}"),
             Self::Worker(error) => write!(formatter, "worker protocol: {error}"),
             Self::Resolver(error) => write!(formatter, "Explorer resolver: {error}"),
+            Self::Settings(error) => write!(formatter, "settings: {error}"),
             #[cfg(feature = "resolver-corpus")]
             Self::Corpus(error) => write!(formatter, "resolver corpus: {error}"),
         }
@@ -132,6 +138,7 @@ impl Error for AppError {
             Self::WorkerManager(error) => Some(error),
             Self::Worker(error) => Some(error),
             Self::Resolver(error) => Some(error),
+            Self::Settings(error) => Some(error),
             #[cfg(feature = "resolver-corpus")]
             Self::Corpus(error) => Some(error),
         }
@@ -174,6 +181,12 @@ impl From<ApplicationRunError> for AppError {
 impl From<ResolverError> for AppError {
     fn from(error: ResolverError) -> Self {
         Self::Resolver(error)
+    }
+}
+
+impl From<SettingsError> for AppError {
+    fn from(error: SettingsError) -> Self {
+        Self::Settings(error)
     }
 }
 

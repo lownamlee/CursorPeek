@@ -79,6 +79,10 @@ pub(crate) struct MessageWindow {
 
 impl MessageWindow {
     pub(crate) fn create() -> Result<Self> {
+        Self::create_with_dwell_delay(DEFAULT_DWELL_DELAY)
+    }
+
+    pub(crate) fn create_with_dwell_delay(dwell_delay: Duration) -> Result<Self> {
         let class = RegisteredWindowClass::register()?;
 
         // SAFETY: The class remains registered in `class`, all string pointers are static, the
@@ -104,7 +108,7 @@ impl MessageWindow {
         let mut window = Self {
             hwnd,
             dwell_timer: Some(WindowTimer::new(hwnd, DWELL_TIMER_ID)),
-            hover_state: HoverState::new(DEFAULT_DWELL_DELAY),
+            hover_state: HoverState::new(dwell_delay),
             input_diagnostics: None,
             preview_diagnostics: None,
             preview_window: None,
@@ -615,6 +619,11 @@ impl MessageWindow {
     fn dwell_timer_is_armed(&self) -> bool {
         self.dwell_timer.as_ref().is_some_and(WindowTimer::is_armed)
     }
+
+    #[cfg(test)]
+    fn dwell_delay(&self) -> Duration {
+        self.hover_state.delay()
+    }
 }
 
 #[derive(Debug)]
@@ -1024,8 +1033,9 @@ mod tests {
                 "raw mouse input should be unregistered before window teardown"
             );
 
-            let application =
-                MessageWindow::create().expect("the application message window should be created");
+            let application = MessageWindow::create_with_dwell_delay(Duration::from_millis(650))
+                .expect("the application message window should be created");
+            assert_eq!(application.dwell_delay(), Duration::from_millis(650));
             let application_handle = application.handle();
             let worker_manager =
                 WorkerManager::start().expect("the lazy worker manager should start");

@@ -8,6 +8,7 @@ mod mode;
 mod platform;
 mod preview;
 mod resolver;
+mod settings;
 mod worker;
 
 use std::{env, process::ExitCode};

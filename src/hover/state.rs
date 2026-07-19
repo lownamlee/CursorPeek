@@ -136,6 +136,11 @@ impl HoverState {
         self.pending = None;
     }
 
+    #[cfg(test)]
+    pub(crate) const fn delay(&self) -> Duration {
+        self.delay
+    }
+
     pub(crate) const fn generation(&self) -> Generation {
         self.generation
     }
