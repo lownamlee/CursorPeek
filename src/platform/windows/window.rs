@@ -1,4 +1,5 @@
 use std::{
+    error::Error as StdError,
     fmt,
     marker::PhantomData,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -21,6 +22,7 @@ use crate::hover::{
 use crate::preview::PreviewPlacement;
 use crate::worker::{
     CompletionNotifier, PendingWorkerPoll, PendingWorkerResolution, WorkerManager,
+    WorkerManagerError,
 };
 
 use super::{PreviewWindow, TrayCommand, TrayIcon};
@@ -42,10 +44,11 @@ use windows::{
 #[cfg(test)]
 use windows::Win32::UI::WindowsAndMessaging::IsWindow;
 
-const CLASS_NAME: PCWSTR = w!("CursorPeek.MessageWindow");
+pub(super) const CLASS_NAME: PCWSTR = w!("CursorPeek.MessageWindow");
 const SHUTDOWN_MESSAGE: u32 = WM_APP + 1;
 const WORKER_RESULT_MESSAGE: u32 = WM_APP + 2;
 const TRAY_CALLBACK_MESSAGE: u32 = WM_APP + 3;
+pub(super) const ACTIVATE_MESSAGE: u32 = WM_APP + 4;
 const DWELL_TIMER_ID: usize = 1;
 const INPUT_SAMPLE_TIMER_ID: usize = 2;
 const INPUT_DIAGNOSTIC_DEADLINE_TIMER_ID: usize = 3;
@@ -55,7 +58,7 @@ pub(crate) const PREVIEW_WINDOW_DIAGNOSTIC_DURATION: Duration = Duration::from_m
 pub(crate) const PREVIEW_WINDOW_PRACTICE_DURATION: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
-const TEST_PANIC_MESSAGE: u32 = WM_APP + 4;
+const TEST_PANIC_MESSAGE: u32 = WM_APP + 5;
 
 pub(crate) struct MessageWindow {
     hwnd: HWND,
@@ -132,25 +135,48 @@ impl MessageWindow {
         Ok(())
     }
 
-    pub(crate) fn run_application(mut self, worker_manager: WorkerManager) -> Result<()> {
+    pub(crate) fn run_application(
+        mut self,
+        worker_manager: WorkerManager,
+    ) -> std::result::Result<(), ApplicationRunError> {
         self.worker_manager = Some(worker_manager);
         self.tray_icon = Some(TrayIcon::create(self.hwnd, TRAY_CALLBACK_MESSAGE)?);
         self.finish_application_loop()
     }
 
     #[cfg(test)]
-    fn run_application_without_tray(mut self, worker_manager: WorkerManager) -> Result<()> {
+    fn run_application_without_tray(
+        mut self,
+        worker_manager: WorkerManager,
+    ) -> std::result::Result<(), ApplicationRunError> {
         self.worker_manager = Some(worker_manager);
         self.finish_application_loop()
     }
 
-    fn finish_application_loop(mut self) -> Result<()> {
-        match self.run_loop()? {
+    fn finish_application_loop(mut self) -> std::result::Result<(), ApplicationRunError> {
+        let loop_result = self.run_loop();
+        let shutdown_result = self.shutdown_application();
+        let exit = loop_result?;
+        shutdown_result?;
+
+        match exit {
             MessageLoopExit::Shutdown => Ok(()),
             MessageLoopExit::InputDiagnostics(_) | MessageLoopExit::PreviewDiagnostics(_) => {
                 unreachable!("normal application mode cannot complete a diagnostic")
             }
         }
+    }
+
+    fn shutdown_application(&mut self) -> std::result::Result<(), WorkerManagerError> {
+        self.paused = true;
+        self.cancel_dwell();
+        drop(self.preview_window.take());
+        drop(self.tray_icon.take());
+
+        if let Some(manager) = self.worker_manager.take() {
+            manager.shutdown()?;
+        }
+        Ok(())
     }
 
     pub(crate) fn run_input_diagnostics(
@@ -286,6 +312,14 @@ impl MessageWindow {
 
             if message.hwnd == self.hwnd && message.message == TRAY_CALLBACK_MESSAGE {
                 if self.handle_tray_callback(message.wParam, message.lParam)? {
+                    return Ok(MessageLoopExit::Shutdown);
+                }
+                self.record_preview_ui_task(ui_task_started.elapsed());
+                continue;
+            }
+
+            if message.hwnd == self.hwnd && message.message == ACTIVATE_MESSAGE {
+                if self.handle_instance_activation()? {
                     return Ok(MessageLoopExit::Shutdown);
                 }
                 self.record_preview_ui_task(ui_task_started.elapsed());
@@ -527,18 +561,29 @@ impl MessageWindow {
     }
 
     fn handle_tray_callback(&mut self, wparam: WPARAM, lparam: LPARAM) -> Result<bool> {
-        let Some(command) = self
+        let command = self
             .tray_icon
             .as_ref()
             .map(|tray| tray.command_for_callback(wparam, lparam, self.paused))
             .transpose()?
-            .flatten()
-        else {
-            return Ok(false);
-        };
+            .flatten();
+        self.apply_tray_command(command)
+    }
 
+    fn handle_instance_activation(&mut self) -> Result<bool> {
+        let command = self
+            .tray_icon
+            .as_ref()
+            .map(|tray| tray.command_at_cursor(self.paused))
+            .transpose()?
+            .flatten();
+        self.apply_tray_command(command)
+    }
+
+    fn apply_tray_command(&mut self, command: Option<TrayCommand>) -> Result<bool> {
         match command {
-            TrayCommand::TogglePaused => {
+            None => Ok(false),
+            Some(TrayCommand::TogglePaused) => {
                 let paused = !self.paused;
                 self.tray_icon
                     .as_mut()
@@ -550,14 +595,14 @@ impl MessageWindow {
                 }
                 Ok(false)
             }
-            TrayCommand::About => {
+            Some(TrayCommand::About) => {
                 self.tray_icon
                     .as_ref()
                     .expect("a tray command requires the live tray owner")
                     .show_about();
                 Ok(false)
             }
-            TrayCommand::Exit => Ok(true),
+            Some(TrayCommand::Exit) => Ok(true),
         }
     }
 
@@ -569,6 +614,42 @@ impl MessageWindow {
     #[cfg(test)]
     fn dwell_timer_is_armed(&self) -> bool {
         self.dwell_timer.as_ref().is_some_and(WindowTimer::is_armed)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ApplicationRunError {
+    Windows(Error),
+    WorkerManager(WorkerManagerError),
+}
+
+impl fmt::Display for ApplicationRunError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Windows(error) => write!(formatter, "{error}"),
+            Self::WorkerManager(error) => write!(formatter, "worker manager: {error}"),
+        }
+    }
+}
+
+impl StdError for ApplicationRunError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Windows(error) => Some(error),
+            Self::WorkerManager(error) => Some(error),
+        }
+    }
+}
+
+impl From<Error> for ApplicationRunError {
+    fn from(error: Error) -> Self {
+        Self::Windows(error)
+    }
+}
+
+impl From<WorkerManagerError> for ApplicationRunError {
+    fn from(error: WorkerManagerError) -> Self {
+        Self::WorkerManager(error)
     }
 }
 

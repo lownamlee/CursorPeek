@@ -10,11 +10,11 @@ use windows::{
                 NOTIFYICONDATAW_0, Shell_NotifyIconW,
             },
             WindowsAndMessaging::{
-                AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow, HMENU,
-                IDI_APPLICATION, LoadIconW, MB_ICONINFORMATION, MB_OK, MF_SEPARATOR, MF_STRING,
-                MessageBoxW, PostMessageW, SetForegroundWindow, TPM_NONOTIFY, TPM_RETURNCMD,
-                TPM_RIGHTBUTTON, TrackPopupMenu, WM_CONTEXTMENU, WM_NULL, WS_EX_TOOLWINDOW,
-                WS_POPUP,
+                AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
+                GetCursorPos, HMENU, IDI_APPLICATION, LoadIconW, MB_ICONINFORMATION, MB_OK,
+                MF_SEPARATOR, MF_STRING, MessageBoxW, PostMessageW, SetForegroundWindow,
+                TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_CONTEXTMENU,
+                WM_NULL, WS_EX_TOOLWINDOW, WS_POPUP,
             },
         },
     },
@@ -104,6 +104,14 @@ impl TrayIcon {
             return Ok(None);
         };
 
+        self.menu_owner.show_menu(anchor, paused)
+    }
+
+    pub(crate) fn command_at_cursor(&self, paused: bool) -> Result<Option<TrayCommand>> {
+        let mut anchor = POINT::default();
+        // SAFETY: The output points to a valid initialized POINT and the process is Per-Monitor V2
+        // aware, so the screen coordinate is suitable for the native popup-menu API.
+        unsafe { GetCursorPos(&mut anchor)? };
         self.menu_owner.show_menu(anchor, paused)
     }
 

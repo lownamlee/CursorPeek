@@ -2,6 +2,7 @@ mod com;
 mod dpi;
 mod explorer;
 mod input;
+mod instance;
 mod mitigation;
 mod preview;
 mod process;
@@ -12,9 +13,11 @@ pub(crate) use com::{ApartmentKind, ComApartment};
 pub(crate) use dpi::{
     DIAGNOSTIC_SUCCESS as DPI_DIAGNOSTIC_SUCCESS, DpiAwarenessError, verify_per_monitor_v2,
 };
+pub(crate) use instance::{SingleInstance, activate_existing_instance};
 pub(crate) use preview::PreviewWindow;
 pub(crate) use process::{ContainedWorker, ProcessError, WorkerPipes};
 pub(crate) use tray::{TrayCommand, TrayIcon};
 pub(crate) use window::{
-    MessageWindow, PREVIEW_WINDOW_DIAGNOSTIC_DURATION, PREVIEW_WINDOW_PRACTICE_DURATION,
+    ApplicationRunError, MessageWindow, PREVIEW_WINDOW_DIAGNOSTIC_DURATION,
+    PREVIEW_WINDOW_PRACTICE_DURATION,
 };

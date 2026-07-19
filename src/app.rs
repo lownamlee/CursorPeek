@@ -6,8 +6,9 @@ use crate::{
     hover::INPUT_DIAGNOSTIC_DURATION,
     mode::ProcessMode,
     platform::{
-        ApartmentKind, ComApartment, DPI_DIAGNOSTIC_SUCCESS, DpiAwarenessError, MessageWindow,
-        PREVIEW_WINDOW_DIAGNOSTIC_DURATION, PREVIEW_WINDOW_PRACTICE_DURATION,
+        ApartmentKind, ApplicationRunError, ComApartment, DPI_DIAGNOSTIC_SUCCESS,
+        DpiAwarenessError, MessageWindow, PREVIEW_WINDOW_DIAGNOSTIC_DURATION,
+        PREVIEW_WINDOW_PRACTICE_DURATION, SingleInstance, activate_existing_instance,
         verify_per_monitor_v2,
     },
     resolver::{ExplorerResolver, ResolverError},
@@ -16,6 +17,18 @@ use crate::{
 
 pub(crate) fn run(process_mode: ProcessMode) -> Result<(), AppError> {
     verify_per_monitor_v2()?;
+
+    let _single_instance_guard = if process_mode == ProcessMode::Main {
+        match SingleInstance::acquire()? {
+            Some(instance) => Some(instance),
+            None => {
+                activate_existing_instance()?;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
 
     let _apartment = match process_mode {
         ProcessMode::Main
@@ -146,6 +159,15 @@ impl From<WorkerSessionError> for AppError {
 impl From<WorkerManagerError> for AppError {
     fn from(error: WorkerManagerError) -> Self {
         Self::WorkerManager(error)
+    }
+}
+
+impl From<ApplicationRunError> for AppError {
+    fn from(error: ApplicationRunError) -> Self {
+        match error {
+            ApplicationRunError::Windows(error) => Self::Windows(error),
+            ApplicationRunError::WorkerManager(error) => Self::WorkerManager(error),
+        }
     }
 }
 

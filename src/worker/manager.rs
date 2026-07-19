@@ -225,7 +225,7 @@ impl WorkerManager {
         }
     }
 
-    fn shutdown(mut self) -> Result<(), WorkerManagerError> {
+    pub(crate) fn shutdown(mut self) -> Result<(), WorkerManagerError> {
         self.finish()
     }
 
