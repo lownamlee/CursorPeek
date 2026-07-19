@@ -5,7 +5,7 @@ use std::{
     io::{self, ErrorKind, Read},
     sync::{
         Arc, Condvar, Mutex,
-        mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
+        mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -33,7 +33,7 @@ const TIMEOUT_DIAGNOSTIC_DEADLINE: Duration = Duration::from_millis(100);
 
 pub(crate) fn run_launch_diagnostic() -> Result<WorkerDiagnosticReport, WorkerManagerError> {
     let started = Instant::now();
-    let manager = WorkerManager::start(WorkerManagerConfig {
+    let manager = WorkerManager::start_with_config(WorkerManagerConfig {
         idle_lifetime: DIAGNOSTIC_IDLE_LIFETIME,
     })?;
 
@@ -153,14 +153,18 @@ impl Default for WorkerManagerConfig {
     }
 }
 
-struct WorkerManager {
+pub(crate) struct WorkerManager {
     requests: Arc<LatestRequestMailbox>,
     idle_receiver: Receiver<u64>,
     thread: Option<JoinHandle<Result<(), WorkerManagerError>>>,
 }
 
 impl WorkerManager {
-    fn start(config: WorkerManagerConfig) -> Result<Self, WorkerManagerError> {
+    pub(crate) fn start() -> Result<Self, WorkerManagerError> {
+        Self::start_with_config(WorkerManagerConfig::default())
+    }
+
+    fn start_with_config(config: WorkerManagerConfig) -> Result<Self, WorkerManagerError> {
         let requests = Arc::new(LatestRequestMailbox::new());
         let manager_requests = Arc::clone(&requests);
         let (idle_sender, idle_receiver) = mpsc::channel();
@@ -188,13 +192,26 @@ impl WorkerManager {
         self.submit(generation, point)?.wait()
     }
 
-    fn submit(
+    pub(crate) fn submit(
         &self,
         generation: Generation,
         point: PhysicalScreenPoint,
     ) -> Result<PendingWorkerResolution, WorkerManagerError> {
         Ok(PendingWorkerResolution {
             receiver: self.requests.submit(generation, point)?,
+        })
+    }
+
+    pub(crate) fn submit_with_notifier(
+        &self,
+        generation: Generation,
+        point: PhysicalScreenPoint,
+        notifier: CompletionNotifier,
+    ) -> Result<PendingWorkerResolution, WorkerManagerError> {
+        Ok(PendingWorkerResolution {
+            receiver: self
+                .requests
+                .submit_with_notifier(generation, point, notifier)?,
         })
     }
 
@@ -231,16 +248,33 @@ impl Drop for WorkerManager {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct WorkerResolution {
+pub(crate) struct WorkerResolution {
+    generation: Generation,
     session_id: u64,
     status: ResolverStatus,
 }
 
-struct PendingWorkerResolution {
+impl WorkerResolution {
+    pub(crate) const fn generation(self) -> Generation {
+        self.generation
+    }
+}
+
+pub(crate) struct PendingWorkerResolution {
     receiver: Receiver<Result<WorkerResolution, WorkerManagerError>>,
 }
 
 impl PendingWorkerResolution {
+    pub(crate) fn poll(&mut self) -> PendingWorkerPoll {
+        match self.receiver.try_recv() {
+            Ok(result) => PendingWorkerPoll::Ready(result),
+            Err(TryRecvError::Empty) => PendingWorkerPoll::Pending,
+            Err(TryRecvError::Disconnected) => {
+                PendingWorkerPoll::Ready(Err(WorkerManagerError::ManagerChannelDisconnected))
+            }
+        }
+    }
+
     fn wait(self) -> Result<WorkerResolution, WorkerManagerError> {
         self.receiver
             .recv()
@@ -248,10 +282,32 @@ impl PendingWorkerResolution {
     }
 }
 
+pub(crate) enum PendingWorkerPoll {
+    Pending,
+    Ready(Result<WorkerResolution, WorkerManagerError>),
+}
+
 struct PendingRequest {
     generation: Generation,
     point: PhysicalScreenPoint,
     response_sender: SyncSender<Result<WorkerResolution, WorkerManagerError>>,
+    completion_notifier: Option<CompletionNotifier>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CompletionNotifier {
+    context: usize,
+    callback: fn(usize),
+}
+
+impl CompletionNotifier {
+    pub(crate) const fn new(context: usize, callback: fn(usize)) -> Self {
+        Self { context, callback }
+    }
+
+    fn notify(self) {
+        (self.callback)(self.context);
+    }
 }
 
 #[derive(Default)]
@@ -280,6 +336,24 @@ impl LatestRequestMailbox {
         generation: Generation,
         point: PhysicalScreenPoint,
     ) -> Result<Receiver<Result<WorkerResolution, WorkerManagerError>>, WorkerManagerError> {
+        self.submit_request(generation, point, None)
+    }
+
+    fn submit_with_notifier(
+        &self,
+        generation: Generation,
+        point: PhysicalScreenPoint,
+        notifier: CompletionNotifier,
+    ) -> Result<Receiver<Result<WorkerResolution, WorkerManagerError>>, WorkerManagerError> {
+        self.submit_request(generation, point, Some(notifier))
+    }
+
+    fn submit_request(
+        &self,
+        generation: Generation,
+        point: PhysicalScreenPoint,
+        completion_notifier: Option<CompletionNotifier>,
+    ) -> Result<Receiver<Result<WorkerResolution, WorkerManagerError>>, WorkerManagerError> {
         let (response_sender, response_receiver) = mpsc::sync_channel(1);
         let replaced = {
             let mut state = self
@@ -294,6 +368,7 @@ impl LatestRequestMailbox {
                 generation,
                 point,
                 response_sender,
+                completion_notifier,
             });
             #[cfg(test)]
             {
@@ -303,9 +378,7 @@ impl LatestRequestMailbox {
         };
 
         if let Some(replaced) = replaced {
-            let _ = replaced
-                .response_sender
-                .send(Err(WorkerManagerError::RequestSuperseded));
+            complete_request(replaced, Err(WorkerManagerError::RequestSuperseded));
         }
         self.changed.notify_one();
         Ok(response_receiver)
@@ -364,9 +437,7 @@ impl LatestRequestMailbox {
             }
         };
         if let Some(cancelled) = cancelled {
-            let _ = cancelled
-                .response_sender
-                .send(Err(WorkerManagerError::RequestCancelled));
+            complete_request(cancelled, Err(WorkerManagerError::RequestCancelled));
         }
         self.changed.notify_all();
     }
@@ -404,11 +475,16 @@ fn manager_loop(
                 generation,
                 point,
                 response_sender,
+                completion_notifier,
             }) => {
                 if session.is_none() {
                     let session_id = next_session_id;
                     let Some(following_session_id) = next_session_id.checked_add(1) else {
-                        let _ = response_sender.send(Err(WorkerManagerError::SessionIdExhausted));
+                        send_completion(
+                            response_sender,
+                            completion_notifier,
+                            Err(WorkerManagerError::SessionIdExhausted),
+                        );
                         continue;
                     };
                     match WorkerSession::spawn(session_id) {
@@ -417,7 +493,7 @@ fn manager_loop(
                             session = Some(started);
                         }
                         Err(error) => {
-                            let _ = response_sender.send(Err(error));
+                            send_completion(response_sender, completion_notifier, Err(error));
                             continue;
                         }
                     }
@@ -435,7 +511,15 @@ fn manager_loop(
                             .as_ref()
                             .expect("a successful request keeps its session")
                             .id;
-                        let _ = response_sender.send(Ok(WorkerResolution { session_id, status }));
+                        send_completion(
+                            response_sender,
+                            completion_notifier,
+                            Ok(WorkerResolution {
+                                generation,
+                                session_id,
+                                status,
+                            }),
+                        );
                     }
                     Err(operation) => {
                         let failed = session
@@ -448,7 +532,7 @@ fn manager_loop(
                                 cleanup: Box::new(cleanup),
                             }),
                         };
-                        let _ = response_sender.send(result);
+                        send_completion(response_sender, completion_notifier, result);
                     }
                 }
             }
@@ -462,6 +546,21 @@ fn manager_loop(
             }
             MailboxTake::Closed => return shutdown_session(session),
         }
+    }
+}
+
+fn complete_request(request: PendingRequest, result: Result<WorkerResolution, WorkerManagerError>) {
+    send_completion(request.response_sender, request.completion_notifier, result);
+}
+
+fn send_completion(
+    response_sender: SyncSender<Result<WorkerResolution, WorkerManagerError>>,
+    completion_notifier: Option<CompletionNotifier>,
+    result: Result<WorkerResolution, WorkerManagerError>,
+) {
+    let _ = response_sender.send(result);
+    if let Some(notifier) = completion_notifier {
+        notifier.notify();
     }
 }
 
@@ -935,17 +1034,26 @@ impl From<ProtocolStreamError> for WorkerManagerError {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_WORKER_IDLE_LIFETIME, LatestRequestMailbox, MailboxTake, WorkerManagerConfig,
-        WorkerManagerError, WorkerResolution, validate_ready, validate_result,
+        CompletionNotifier, DEFAULT_WORKER_IDLE_LIFETIME, LatestRequestMailbox, MailboxTake,
+        PendingWorkerPoll, PendingWorkerResolution, WorkerManagerConfig, WorkerManagerError,
+        WorkerResolution, validate_ready, validate_result,
     };
     use crate::{
         hover::{Generation, PhysicalScreenPoint},
         worker::protocol::{ResolverStatus, SessionNonce, WorkerMessage},
     };
-    use std::time::Duration;
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
 
     const NONCE: SessionNonce = SessionNonce::from_bytes([0x11; 16]);
     const OTHER_NONCE: SessionNonce = SessionNonce::from_bytes([0x22; 16]);
+    static NOTIFICATION_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    fn record_notification(increment: usize) {
+        NOTIFICATION_COUNT.fetch_add(increment, Ordering::SeqCst);
+    }
 
     #[test]
     fn default_worker_idle_lifetime_is_fifteen_seconds() {
@@ -1001,6 +1109,7 @@ mod tests {
         pending
             .response_sender
             .send(Ok(WorkerResolution {
+                generation: Generation::from_raw(2),
                 session_id: 7,
                 status: ResolverStatus::Unavailable,
             }))
@@ -1008,10 +1117,59 @@ mod tests {
         assert_eq!(
             newer.recv().unwrap().unwrap(),
             WorkerResolution {
+                generation: Generation::from_raw(2),
                 session_id: 7,
                 status: ResolverStatus::Unavailable,
             }
         );
+    }
+
+    #[test]
+    fn superseded_notified_request_wakes_its_consumer_once() {
+        NOTIFICATION_COUNT.store(0, Ordering::SeqCst);
+        let mailbox = LatestRequestMailbox::new();
+        let older = mailbox
+            .submit_with_notifier(
+                Generation::from_raw(1),
+                PhysicalScreenPoint::new(1, 1),
+                CompletionNotifier::new(1, record_notification),
+            )
+            .unwrap();
+
+        let _newer = mailbox
+            .submit(Generation::from_raw(2), PhysicalScreenPoint::new(2, 2))
+            .unwrap();
+
+        assert!(matches!(
+            older.recv().unwrap(),
+            Err(WorkerManagerError::RequestSuperseded)
+        ));
+        assert_eq!(NOTIFICATION_COUNT.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn pending_resolution_poll_never_blocks_the_ui_contract() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let mut pending = PendingWorkerResolution { receiver };
+
+        assert!(matches!(pending.poll(), PendingWorkerPoll::Pending));
+
+        sender
+            .send(Ok(WorkerResolution {
+                generation: Generation::from_raw(9),
+                session_id: 4,
+                status: ResolverStatus::Resolved,
+            }))
+            .unwrap();
+
+        match pending.poll() {
+            PendingWorkerPoll::Ready(Ok(resolution)) => {
+                assert_eq!(resolution.generation(), Generation::from_raw(9));
+            }
+            PendingWorkerPoll::Pending | PendingWorkerPoll::Ready(Err(_)) => {
+                panic!("the queued resolution should be ready")
+            }
+        }
     }
 
     #[test]
@@ -1069,6 +1227,7 @@ mod tests {
         active
             .response_sender
             .send(Ok(WorkerResolution {
+                generation: Generation::from_raw(1),
                 session_id: 1,
                 status: ResolverStatus::Unavailable,
             }))
@@ -1083,6 +1242,7 @@ mod tests {
         latest
             .response_sender
             .send(Ok(WorkerResolution {
+                generation: Generation::from_raw(10_000),
                 session_id: 1,
                 status: ResolverStatus::Unavailable,
             }))

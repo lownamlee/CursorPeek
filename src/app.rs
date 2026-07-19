@@ -34,9 +34,8 @@ pub(crate) fn run(process_mode: ProcessMode) -> Result<(), AppError> {
     match process_mode {
         ProcessMode::Main => {
             let message_window = MessageWindow::create()?;
-            message_window.request_shutdown()?;
-            message_window.run_message_loop()?;
-            println!("CursorPeek main/STA foundation processed its message loop.");
+            let worker_manager = worker::WorkerManager::start()?;
+            message_window.run_application(worker_manager)?;
         }
         ProcessMode::InputDiagnostics => {
             println!(

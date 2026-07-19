@@ -15,10 +15,13 @@ use super::input::{
 };
 
 use crate::hover::{
-    DEFAULT_DWELL_DELAY, DwellTimerEvent, HoverState, INPUT_SAMPLE_INTERVAL, InputCoverage,
-    InputCoverageReport, PhysicalScreenPoint,
+    DEFAULT_DWELL_DELAY, DwellTimerEvent, Generation, HoverState, INPUT_SAMPLE_INTERVAL,
+    InputCoverage, InputCoverageReport, PhysicalScreenPoint,
 };
 use crate::preview::PreviewPlacement;
+use crate::worker::{
+    CompletionNotifier, PendingWorkerPoll, PendingWorkerResolution, WorkerManager,
+};
 
 use super::PreviewWindow;
 
@@ -41,6 +44,7 @@ use windows::Win32::UI::WindowsAndMessaging::IsWindow;
 
 const CLASS_NAME: PCWSTR = w!("CursorPeek.MessageWindow");
 const SHUTDOWN_MESSAGE: u32 = WM_APP + 1;
+const WORKER_RESULT_MESSAGE: u32 = WM_APP + 2;
 const DWELL_TIMER_ID: usize = 1;
 const INPUT_SAMPLE_TIMER_ID: usize = 2;
 const INPUT_DIAGNOSTIC_DEADLINE_TIMER_ID: usize = 3;
@@ -50,7 +54,7 @@ pub(crate) const PREVIEW_WINDOW_DIAGNOSTIC_DURATION: Duration = Duration::from_m
 pub(crate) const PREVIEW_WINDOW_PRACTICE_DURATION: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
-const TEST_PANIC_MESSAGE: u32 = WM_APP + 2;
+const TEST_PANIC_MESSAGE: u32 = WM_APP + 3;
 
 pub(crate) struct MessageWindow {
     hwnd: HWND,
@@ -59,6 +63,9 @@ pub(crate) struct MessageWindow {
     input_diagnostics: Option<InputDiagnostics>,
     preview_diagnostics: Option<ActivePreviewDiagnostics>,
     preview_window: Option<PreviewWindow>,
+    worker_manager: Option<WorkerManager>,
+    pending_worker_resolution: Option<PendingWorkerResolution>,
+    latest_worker_completion: Option<Generation>,
     raw_mouse_input: Option<RawMouseInputRegistration>,
     _class: RegisteredWindowClass,
     _thread_affinity: PhantomData<Rc<()>>,
@@ -95,6 +102,9 @@ impl MessageWindow {
             input_diagnostics: None,
             preview_diagnostics: None,
             preview_window: None,
+            worker_manager: None,
+            pending_worker_resolution: None,
+            latest_worker_completion: None,
             raw_mouse_input: None,
             _class: class,
             _thread_affinity: PhantomData,
@@ -104,15 +114,28 @@ impl MessageWindow {
         Ok(window)
     }
 
+    #[cfg(test)]
     pub(crate) fn request_shutdown(&self) -> Result<()> {
         // SAFETY: `self.hwnd` is owned by this live MessageWindow. The private message carries no
         // pointers or borrowed data, so its parameters remain valid until the queue processes it.
         unsafe { PostMessageW(Some(self.hwnd), SHUTDOWN_MESSAGE, WPARAM(0), LPARAM(0)) }
     }
 
+    #[cfg(test)]
     pub(crate) fn run_message_loop(mut self) -> Result<()> {
         let _ = self.run_loop()?;
         Ok(())
+    }
+
+    pub(crate) fn run_application(mut self, worker_manager: WorkerManager) -> Result<()> {
+        self.worker_manager = Some(worker_manager);
+
+        match self.run_loop()? {
+            MessageLoopExit::Shutdown => Ok(()),
+            MessageLoopExit::InputDiagnostics(_) | MessageLoopExit::PreviewDiagnostics(_) => {
+                unreachable!("normal application mode cannot complete a diagnostic")
+            }
+        }
     }
 
     pub(crate) fn run_input_diagnostics(
@@ -236,6 +259,12 @@ impl MessageWindow {
                 && message.wParam.0 == DWELL_TIMER_ID
             {
                 self.handle_dwell_timer(Instant::now());
+                self.record_preview_ui_task(ui_task_started.elapsed());
+                continue;
+            }
+
+            if message.hwnd == self.hwnd && message.message == WORKER_RESULT_MESSAGE {
+                self.handle_worker_result();
                 self.record_preview_ui_task(ui_task_started.elapsed());
                 continue;
             }
@@ -434,8 +463,30 @@ impl MessageWindow {
                     return;
                 }
 
-                let PhysicalScreenPoint { x, y } = point;
-                let _ = (generation, x, y);
+                let Some(manager) = self.worker_manager.as_ref() else {
+                    return;
+                };
+                let notifier = worker_result_notifier(self.hwnd);
+                let Ok(pending) = manager.submit_with_notifier(generation, point, notifier) else {
+                    return;
+                };
+
+                self.pending_worker_resolution = Some(pending);
+            }
+        }
+    }
+
+    fn handle_worker_result(&mut self) {
+        let Some(pending) = self.pending_worker_resolution.as_mut() else {
+            return;
+        };
+
+        match pending.poll() {
+            PendingWorkerPoll::Pending => {}
+            PendingWorkerPoll::Ready(result) => {
+                self.pending_worker_resolution = None;
+                self.latest_worker_completion =
+                    result.ok().map(|resolution| resolution.generation());
             }
         }
     }
@@ -451,6 +502,19 @@ impl MessageWindow {
     }
 }
 
+fn worker_result_notifier(hwnd: HWND) -> CompletionNotifier {
+    CompletionNotifier::new(hwnd.0 as usize, post_worker_result)
+}
+
+fn post_worker_result(raw_hwnd: usize) {
+    let hwnd = HWND(raw_hwnd as *mut core::ffi::c_void);
+    // SAFETY: The callback carries only the numeric value of the application-owned HWND and posts
+    // a parameter-free private message. Normal shutdown joins the worker manager before destroying
+    // the HWND; a late post during teardown is allowed to fail without dereferencing the stale
+    // value.
+    let _ = unsafe { PostMessageW(Some(hwnd), WORKER_RESULT_MESSAGE, WPARAM(0), LPARAM(0)) };
+}
+
 fn preview_input_requires_dismissal(raw_mouse: &Result<Option<RawMouseActivity>>) -> bool {
     match raw_mouse {
         Ok(Some(activity)) => activity.is_relevant(),
@@ -464,6 +528,8 @@ impl Drop for MessageWindow {
         drop(self.preview_window.take());
         drop(self.input_diagnostics.take());
         drop(self.dwell_timer.take());
+        drop(self.pending_worker_resolution.take());
+        drop(self.worker_manager.take());
         drop(self.raw_mouse_input.take());
 
         // SAFETY: The owner is !Send and therefore drops on the creating thread. All timers have
@@ -698,11 +764,13 @@ mod tests {
     use super::{
         DWELL_TIMER_ID, IsWindow, LPARAM, MessageWindow, PREVIEW_WINDOW_DIAGNOSTIC_DURATION,
         PREVIEW_WINDOW_PRACTICE_DURATION, PostMessageW, TEST_PANIC_MESSAGE, WM_TIMER, WPARAM,
-        preview_input_requires_dismissal, registered_raw_mouse, timer_interval_ms,
+        post_worker_result, preview_input_requires_dismissal, registered_raw_mouse,
+        timer_interval_ms,
     };
     use crate::hover::PhysicalScreenPoint;
     use crate::platform::windows::explorer::is_explorer_window;
     use crate::platform::windows::input::RawMouseActivity;
+    use crate::worker::WorkerManager;
     use std::{
         thread,
         time::{Duration, Instant},
@@ -755,6 +823,7 @@ mod tests {
             // catch_unwind boundary.
             unsafe { PostMessageW(Some(first_handle), TEST_PANIC_MESSAGE, WPARAM(0), LPARAM(0)) }
                 .expect("the callback test message should be queued");
+            post_worker_result(first_handle.0 as usize);
             first
                 .request_shutdown()
                 .expect("the shutdown message should be queued");
@@ -770,6 +839,20 @@ mod tests {
                     .is_none(),
                 "raw mouse input should be unregistered before window teardown"
             );
+
+            let application =
+                MessageWindow::create().expect("the application message window should be created");
+            let application_handle = application.handle();
+            let worker_manager =
+                WorkerManager::start().expect("the lazy worker manager should start");
+            application
+                .request_shutdown()
+                .expect("the application shutdown message should be queued");
+            application
+                .run_application(worker_manager)
+                .expect("normal application shutdown should join the worker manager");
+            // SAFETY: The normal application loop consumed and dropped its owned HWND.
+            assert!(!unsafe { IsWindow(Some(application_handle)).as_bool() });
 
             let diagnostic =
                 MessageWindow::create().expect("the diagnostic message window should be created");

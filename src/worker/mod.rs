@@ -10,7 +10,10 @@ use std::{
 use crate::resolver::{PointResolver, ResolveOutcome};
 use protocol::{ProtocolStreamError, ResolverStatus, WorkerMessage};
 
-pub(crate) use manager::{WorkerManagerError, run_launch_diagnostic, run_timeout_diagnostic};
+pub(crate) use manager::{
+    CompletionNotifier, PendingWorkerPoll, PendingWorkerResolution, WorkerManager,
+    WorkerManagerError, run_launch_diagnostic, run_timeout_diagnostic,
+};
 
 pub(crate) fn run_session<R, W>(
     reader: &mut R,
