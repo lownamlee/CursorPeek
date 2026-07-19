@@ -1,4 +1,5 @@
 use std::{
+    error::Error as StdError,
     fmt,
     marker::PhantomData,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -15,12 +16,16 @@ use super::input::{
 };
 
 use crate::hover::{
-    DEFAULT_DWELL_DELAY, DwellTimerEvent, HoverState, INPUT_SAMPLE_INTERVAL, InputCoverage,
-    InputCoverageReport, PhysicalScreenPoint,
+    DEFAULT_DWELL_DELAY, DwellTimerEvent, Generation, HoverState, INPUT_SAMPLE_INTERVAL,
+    InputCoverage, InputCoverageReport, PhysicalScreenPoint,
 };
 use crate::preview::PreviewPlacement;
+use crate::worker::{
+    CompletionNotifier, PendingWorkerPoll, PendingWorkerResolution, WorkerManager,
+    WorkerManagerError,
+};
 
-use super::PreviewWindow;
+use super::{PreviewWindow, TrayCommand, TrayIcon};
 
 use windows::{
     Win32::{
@@ -39,8 +44,11 @@ use windows::{
 #[cfg(test)]
 use windows::Win32::UI::WindowsAndMessaging::IsWindow;
 
-const CLASS_NAME: PCWSTR = w!("CursorPeek.MessageWindow");
+pub(super) const CLASS_NAME: PCWSTR = w!("CursorPeek.MessageWindow");
 const SHUTDOWN_MESSAGE: u32 = WM_APP + 1;
+const WORKER_RESULT_MESSAGE: u32 = WM_APP + 2;
+const TRAY_CALLBACK_MESSAGE: u32 = WM_APP + 3;
+pub(super) const ACTIVATE_MESSAGE: u32 = WM_APP + 4;
 const DWELL_TIMER_ID: usize = 1;
 const INPUT_SAMPLE_TIMER_ID: usize = 2;
 const INPUT_DIAGNOSTIC_DEADLINE_TIMER_ID: usize = 3;
@@ -50,7 +58,7 @@ pub(crate) const PREVIEW_WINDOW_DIAGNOSTIC_DURATION: Duration = Duration::from_m
 pub(crate) const PREVIEW_WINDOW_PRACTICE_DURATION: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
-const TEST_PANIC_MESSAGE: u32 = WM_APP + 2;
+const TEST_PANIC_MESSAGE: u32 = WM_APP + 5;
 
 pub(crate) struct MessageWindow {
     hwnd: HWND,
@@ -59,6 +67,11 @@ pub(crate) struct MessageWindow {
     input_diagnostics: Option<InputDiagnostics>,
     preview_diagnostics: Option<ActivePreviewDiagnostics>,
     preview_window: Option<PreviewWindow>,
+    tray_icon: Option<TrayIcon>,
+    paused: bool,
+    worker_manager: Option<WorkerManager>,
+    pending_worker_resolution: Option<PendingWorkerResolution>,
+    latest_worker_completion: Option<Generation>,
     raw_mouse_input: Option<RawMouseInputRegistration>,
     _class: RegisteredWindowClass,
     _thread_affinity: PhantomData<Rc<()>>,
@@ -66,6 +79,10 @@ pub(crate) struct MessageWindow {
 
 impl MessageWindow {
     pub(crate) fn create() -> Result<Self> {
+        Self::create_with_dwell_delay(DEFAULT_DWELL_DELAY)
+    }
+
+    pub(crate) fn create_with_dwell_delay(dwell_delay: Duration) -> Result<Self> {
         let class = RegisteredWindowClass::register()?;
 
         // SAFETY: The class remains registered in `class`, all string pointers are static, the
@@ -91,10 +108,15 @@ impl MessageWindow {
         let mut window = Self {
             hwnd,
             dwell_timer: Some(WindowTimer::new(hwnd, DWELL_TIMER_ID)),
-            hover_state: HoverState::new(DEFAULT_DWELL_DELAY),
+            hover_state: HoverState::new(dwell_delay),
             input_diagnostics: None,
             preview_diagnostics: None,
             preview_window: None,
+            tray_icon: None,
+            paused: false,
+            worker_manager: None,
+            pending_worker_resolution: None,
+            latest_worker_completion: None,
             raw_mouse_input: None,
             _class: class,
             _thread_affinity: PhantomData,
@@ -104,14 +126,60 @@ impl MessageWindow {
         Ok(window)
     }
 
+    #[cfg(test)]
     pub(crate) fn request_shutdown(&self) -> Result<()> {
         // SAFETY: `self.hwnd` is owned by this live MessageWindow. The private message carries no
         // pointers or borrowed data, so its parameters remain valid until the queue processes it.
         unsafe { PostMessageW(Some(self.hwnd), SHUTDOWN_MESSAGE, WPARAM(0), LPARAM(0)) }
     }
 
+    #[cfg(test)]
     pub(crate) fn run_message_loop(mut self) -> Result<()> {
         let _ = self.run_loop()?;
+        Ok(())
+    }
+
+    pub(crate) fn run_application(
+        mut self,
+        worker_manager: WorkerManager,
+    ) -> std::result::Result<(), ApplicationRunError> {
+        self.worker_manager = Some(worker_manager);
+        self.tray_icon = Some(TrayIcon::create(self.hwnd, TRAY_CALLBACK_MESSAGE)?);
+        self.finish_application_loop()
+    }
+
+    #[cfg(test)]
+    fn run_application_without_tray(
+        mut self,
+        worker_manager: WorkerManager,
+    ) -> std::result::Result<(), ApplicationRunError> {
+        self.worker_manager = Some(worker_manager);
+        self.finish_application_loop()
+    }
+
+    fn finish_application_loop(mut self) -> std::result::Result<(), ApplicationRunError> {
+        let loop_result = self.run_loop();
+        let shutdown_result = self.shutdown_application();
+        let exit = loop_result?;
+        shutdown_result?;
+
+        match exit {
+            MessageLoopExit::Shutdown => Ok(()),
+            MessageLoopExit::InputDiagnostics(_) | MessageLoopExit::PreviewDiagnostics(_) => {
+                unreachable!("normal application mode cannot complete a diagnostic")
+            }
+        }
+    }
+
+    fn shutdown_application(&mut self) -> std::result::Result<(), WorkerManagerError> {
+        self.paused = true;
+        self.cancel_dwell();
+        drop(self.preview_window.take());
+        drop(self.tray_icon.take());
+
+        if let Some(manager) = self.worker_manager.take() {
+            manager.shutdown()?;
+        }
         Ok(())
     }
 
@@ -240,6 +308,28 @@ impl MessageWindow {
                 continue;
             }
 
+            if message.hwnd == self.hwnd && message.message == WORKER_RESULT_MESSAGE {
+                self.handle_worker_result();
+                self.record_preview_ui_task(ui_task_started.elapsed());
+                continue;
+            }
+
+            if message.hwnd == self.hwnd && message.message == TRAY_CALLBACK_MESSAGE {
+                if self.handle_tray_callback(message.wParam, message.lParam)? {
+                    return Ok(MessageLoopExit::Shutdown);
+                }
+                self.record_preview_ui_task(ui_task_started.elapsed());
+                continue;
+            }
+
+            if message.hwnd == self.hwnd && message.message == ACTIVATE_MESSAGE {
+                if self.handle_instance_activation()? {
+                    return Ok(MessageLoopExit::Shutdown);
+                }
+                self.record_preview_ui_task(ui_task_started.elapsed());
+                continue;
+            }
+
             let raw_mouse = if message.hwnd == self.hwnd && message.message == WM_INPUT {
                 Some(read_raw_mouse_activity(message.lParam))
             } else {
@@ -306,6 +396,9 @@ impl MessageWindow {
     fn handle_raw_mouse(&mut self, raw_mouse: Result<Option<RawMouseActivity>>) {
         if self.input_diagnostics.is_some() {
             self.handle_input_diagnostic_raw(raw_mouse);
+            return;
+        }
+        if self.paused {
             return;
         }
 
@@ -377,6 +470,7 @@ impl MessageWindow {
     }
 
     fn restart_dwell(&mut self, point: PhysicalScreenPoint, now: Instant) {
+        self.invalidate_worker_delivery();
         let interval = self.hover_state.restart(point, now);
         let armed = self
             .dwell_timer
@@ -389,10 +483,16 @@ impl MessageWindow {
     }
 
     fn cancel_dwell(&mut self) {
+        self.invalidate_worker_delivery();
         self.hover_state.cancel();
         if let Some(timer) = self.dwell_timer.as_mut() {
             let _ = timer.stop();
         }
+    }
+
+    fn invalidate_worker_delivery(&mut self) {
+        drop(self.pending_worker_resolution.take());
+        self.latest_worker_completion = None;
     }
 
     fn handle_dwell_timer(&mut self, now: Instant) {
@@ -426,17 +526,87 @@ impl MessageWindow {
                     return;
                 };
 
-                // The resolver handoff will consume this validated generation/current-point pair
-                // in the next Milestone 1 slice.
+                // Keep the validated generation attached through the manager, protocol, and UI
+                // delivery boundaries so later input can invalidate this exact request.
                 let (generation, point) = ready.into_parts();
                 if !is_explorer_window_at(point) {
                     self.cancel_dwell();
                     return;
                 }
 
-                let PhysicalScreenPoint { x, y } = point;
-                let _ = (generation, x, y);
+                let Some(manager) = self.worker_manager.as_ref() else {
+                    return;
+                };
+                let notifier = worker_result_notifier(self.hwnd);
+                let Ok(pending) = manager.submit_with_notifier(generation, point, notifier) else {
+                    return;
+                };
+
+                self.pending_worker_resolution = Some(pending);
             }
+        }
+    }
+
+    fn handle_worker_result(&mut self) {
+        let Some(pending) = self.pending_worker_resolution.as_mut() else {
+            return;
+        };
+
+        match pending.poll() {
+            PendingWorkerPoll::Pending => {}
+            PendingWorkerPoll::Ready(result) => {
+                self.pending_worker_resolution = None;
+                self.latest_worker_completion = accept_worker_completion(
+                    self.hover_state.generation(),
+                    result.ok().map(|resolution| resolution.generation()),
+                );
+            }
+        }
+    }
+
+    fn handle_tray_callback(&mut self, wparam: WPARAM, lparam: LPARAM) -> Result<bool> {
+        let command = self
+            .tray_icon
+            .as_ref()
+            .map(|tray| tray.command_for_callback(wparam, lparam, self.paused))
+            .transpose()?
+            .flatten();
+        self.apply_tray_command(command)
+    }
+
+    fn handle_instance_activation(&mut self) -> Result<bool> {
+        let command = self
+            .tray_icon
+            .as_ref()
+            .map(|tray| tray.command_at_cursor(self.paused))
+            .transpose()?
+            .flatten();
+        self.apply_tray_command(command)
+    }
+
+    fn apply_tray_command(&mut self, command: Option<TrayCommand>) -> Result<bool> {
+        match command {
+            None => Ok(false),
+            Some(TrayCommand::TogglePaused) => {
+                let paused = !self.paused;
+                self.tray_icon
+                    .as_mut()
+                    .expect("a tray command requires the live tray owner")
+                    .set_paused(paused)?;
+                self.paused = paused;
+                if paused {
+                    self.cancel_dwell();
+                }
+                Ok(false)
+            }
+            Some(TrayCommand::About) => {
+                self.tray_icon
+                    .as_ref()
+                    .expect("a tray command requires the live tray owner")
+                    .show_about();
+                Ok(false)
+            }
+            Some(TrayCommand::Exit) => Ok(true),
         }
     }
 
@@ -449,6 +619,67 @@ impl MessageWindow {
     fn dwell_timer_is_armed(&self) -> bool {
         self.dwell_timer.as_ref().is_some_and(WindowTimer::is_armed)
     }
+
+    #[cfg(test)]
+    fn dwell_delay(&self) -> Duration {
+        self.hover_state.delay()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ApplicationRunError {
+    Windows(Error),
+    WorkerManager(WorkerManagerError),
+}
+
+impl fmt::Display for ApplicationRunError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Windows(error) => write!(formatter, "{error}"),
+            Self::WorkerManager(error) => write!(formatter, "worker manager: {error}"),
+        }
+    }
+}
+
+impl StdError for ApplicationRunError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Windows(error) => Some(error),
+            Self::WorkerManager(error) => Some(error),
+        }
+    }
+}
+
+impl From<Error> for ApplicationRunError {
+    fn from(error: Error) -> Self {
+        Self::Windows(error)
+    }
+}
+
+impl From<WorkerManagerError> for ApplicationRunError {
+    fn from(error: WorkerManagerError) -> Self {
+        Self::WorkerManager(error)
+    }
+}
+
+fn worker_result_notifier(hwnd: HWND) -> CompletionNotifier {
+    CompletionNotifier::new(hwnd.0 as usize, post_worker_result)
+}
+
+fn post_worker_result(raw_hwnd: usize) {
+    let hwnd = HWND(raw_hwnd as *mut core::ffi::c_void);
+    // SAFETY: The callback carries only the numeric value of the application-owned HWND and posts
+    // a parameter-free private message. Normal shutdown joins the worker manager before destroying
+    // the HWND; a late post during teardown is allowed to fail without dereferencing the stale
+    // value.
+    let _ = unsafe { PostMessageW(Some(hwnd), WORKER_RESULT_MESSAGE, WPARAM(0), LPARAM(0)) };
+}
+
+fn accept_worker_completion(
+    current: Generation,
+    completed: Option<Generation>,
+) -> Option<Generation> {
+    completed.filter(|generation| *generation == current)
 }
 
 fn preview_input_requires_dismissal(raw_mouse: &Result<Option<RawMouseActivity>>) -> bool {
@@ -460,10 +691,13 @@ fn preview_input_requires_dismissal(raw_mouse: &Result<Option<RawMouseActivity>>
 
 impl Drop for MessageWindow {
     fn drop(&mut self) {
+        drop(self.tray_icon.take());
         drop(self.preview_diagnostics.take());
         drop(self.preview_window.take());
         drop(self.input_diagnostics.take());
         drop(self.dwell_timer.take());
+        drop(self.pending_worker_resolution.take());
+        drop(self.worker_manager.take());
         drop(self.raw_mouse_input.take());
 
         // SAFETY: The owner is !Send and therefore drops on the creating thread. All timers have
@@ -698,17 +932,44 @@ mod tests {
     use super::{
         DWELL_TIMER_ID, IsWindow, LPARAM, MessageWindow, PREVIEW_WINDOW_DIAGNOSTIC_DURATION,
         PREVIEW_WINDOW_PRACTICE_DURATION, PostMessageW, TEST_PANIC_MESSAGE, WM_TIMER, WPARAM,
-        preview_input_requires_dismissal, registered_raw_mouse, timer_interval_ms,
+        accept_worker_completion, post_worker_result, preview_input_requires_dismissal,
+        registered_raw_mouse, timer_interval_ms,
     };
-    use crate::hover::PhysicalScreenPoint;
+    use crate::hover::{Generation, PhysicalScreenPoint};
     use crate::platform::windows::explorer::is_explorer_window;
     use crate::platform::windows::input::RawMouseActivity;
+    use crate::worker::WorkerManager;
     use std::{
         thread,
         time::{Duration, Instant},
     };
     use windows::Win32::UI::Input::RIDEV_INPUTSINK;
     use windows::core::Error;
+
+    #[test]
+    fn worker_delivery_accepts_only_the_current_generation() {
+        let current = Generation::from_raw(8);
+
+        assert_eq!(
+            accept_worker_completion(current, Some(Generation::from_raw(7))),
+            None,
+            "a delayed response must not cross a newer input generation"
+        );
+        assert_eq!(
+            accept_worker_completion(current, Some(Generation::from_raw(9))),
+            None,
+            "an out-of-order future response must fail closed"
+        );
+        assert_eq!(
+            accept_worker_completion(current, None),
+            None,
+            "worker errors cannot become an accepted completion"
+        );
+        assert_eq!(
+            accept_worker_completion(current, Some(current)),
+            Some(current)
+        );
+    }
 
     #[test]
     fn message_window_lifecycle_and_callback_boundary_are_sound() {
@@ -755,6 +1016,7 @@ mod tests {
             // catch_unwind boundary.
             unsafe { PostMessageW(Some(first_handle), TEST_PANIC_MESSAGE, WPARAM(0), LPARAM(0)) }
                 .expect("the callback test message should be queued");
+            post_worker_result(first_handle.0 as usize);
             first
                 .request_shutdown()
                 .expect("the shutdown message should be queued");
@@ -770,6 +1032,21 @@ mod tests {
                     .is_none(),
                 "raw mouse input should be unregistered before window teardown"
             );
+
+            let application = MessageWindow::create_with_dwell_delay(Duration::from_millis(650))
+                .expect("the application message window should be created");
+            assert_eq!(application.dwell_delay(), Duration::from_millis(650));
+            let application_handle = application.handle();
+            let worker_manager =
+                WorkerManager::start().expect("the lazy worker manager should start");
+            application
+                .request_shutdown()
+                .expect("the application shutdown message should be queued");
+            application
+                .run_application_without_tray(worker_manager)
+                .expect("normal application shutdown should join the worker manager");
+            // SAFETY: The normal application loop consumed and dropped its owned HWND.
+            assert!(!unsafe { IsWindow(Some(application_handle)).as_bool() });
 
             let diagnostic =
                 MessageWindow::create().expect("the diagnostic message window should be created");
