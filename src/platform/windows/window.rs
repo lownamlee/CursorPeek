@@ -406,6 +406,7 @@ impl MessageWindow {
     }
 
     fn restart_dwell(&mut self, point: PhysicalScreenPoint, now: Instant) {
+        self.invalidate_worker_delivery();
         let interval = self.hover_state.restart(point, now);
         let armed = self
             .dwell_timer
@@ -418,10 +419,16 @@ impl MessageWindow {
     }
 
     fn cancel_dwell(&mut self) {
+        self.invalidate_worker_delivery();
         self.hover_state.cancel();
         if let Some(timer) = self.dwell_timer.as_mut() {
             let _ = timer.stop();
         }
+    }
+
+    fn invalidate_worker_delivery(&mut self) {
+        drop(self.pending_worker_resolution.take());
+        self.latest_worker_completion = None;
     }
 
     fn handle_dwell_timer(&mut self, now: Instant) {
@@ -455,8 +462,8 @@ impl MessageWindow {
                     return;
                 };
 
-                // The resolver handoff will consume this validated generation/current-point pair
-                // in the next Milestone 1 slice.
+                // Keep the validated generation attached through the manager, protocol, and UI
+                // delivery boundaries so later input can invalidate this exact request.
                 let (generation, point) = ready.into_parts();
                 if !is_explorer_window_at(point) {
                     self.cancel_dwell();
@@ -485,8 +492,10 @@ impl MessageWindow {
             PendingWorkerPoll::Pending => {}
             PendingWorkerPoll::Ready(result) => {
                 self.pending_worker_resolution = None;
-                self.latest_worker_completion =
-                    result.ok().map(|resolution| resolution.generation());
+                self.latest_worker_completion = accept_worker_completion(
+                    self.hover_state.generation(),
+                    result.ok().map(|resolution| resolution.generation()),
+                );
             }
         }
     }
@@ -513,6 +522,13 @@ fn post_worker_result(raw_hwnd: usize) {
     // the HWND; a late post during teardown is allowed to fail without dereferencing the stale
     // value.
     let _ = unsafe { PostMessageW(Some(hwnd), WORKER_RESULT_MESSAGE, WPARAM(0), LPARAM(0)) };
+}
+
+fn accept_worker_completion(
+    current: Generation,
+    completed: Option<Generation>,
+) -> Option<Generation> {
+    completed.filter(|generation| *generation == current)
 }
 
 fn preview_input_requires_dismissal(raw_mouse: &Result<Option<RawMouseActivity>>) -> bool {
@@ -764,10 +780,10 @@ mod tests {
     use super::{
         DWELL_TIMER_ID, IsWindow, LPARAM, MessageWindow, PREVIEW_WINDOW_DIAGNOSTIC_DURATION,
         PREVIEW_WINDOW_PRACTICE_DURATION, PostMessageW, TEST_PANIC_MESSAGE, WM_TIMER, WPARAM,
-        post_worker_result, preview_input_requires_dismissal, registered_raw_mouse,
-        timer_interval_ms,
+        accept_worker_completion, post_worker_result, preview_input_requires_dismissal,
+        registered_raw_mouse, timer_interval_ms,
     };
-    use crate::hover::PhysicalScreenPoint;
+    use crate::hover::{Generation, PhysicalScreenPoint};
     use crate::platform::windows::explorer::is_explorer_window;
     use crate::platform::windows::input::RawMouseActivity;
     use crate::worker::WorkerManager;
@@ -777,6 +793,31 @@ mod tests {
     };
     use windows::Win32::UI::Input::RIDEV_INPUTSINK;
     use windows::core::Error;
+
+    #[test]
+    fn worker_delivery_accepts_only_the_current_generation() {
+        let current = Generation::from_raw(8);
+
+        assert_eq!(
+            accept_worker_completion(current, Some(Generation::from_raw(7))),
+            None,
+            "a delayed response must not cross a newer input generation"
+        );
+        assert_eq!(
+            accept_worker_completion(current, Some(Generation::from_raw(9))),
+            None,
+            "an out-of-order future response must fail closed"
+        );
+        assert_eq!(
+            accept_worker_completion(current, None),
+            None,
+            "worker errors cannot become an accepted completion"
+        );
+        assert_eq!(
+            accept_worker_completion(current, Some(current)),
+            Some(current)
+        );
+    }
 
     #[test]
     fn message_window_lifecycle_and_callback_boundary_are_sound() {

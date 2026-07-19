@@ -136,6 +136,10 @@ impl HoverState {
         self.pending = None;
     }
 
+    pub(crate) const fn generation(&self) -> Generation {
+        self.generation
+    }
+
     pub(crate) fn on_timer(&mut self, now: Instant) -> DwellTimerEvent {
         let Some(pending) = self.pending else {
             return DwellTimerEvent::Inactive;
@@ -242,8 +246,10 @@ mod tests {
         let mut state = HoverState::new(DEFAULT_DWELL_DELAY);
 
         state.restart(FIRST_POINT, start);
+        let cancelled_generation = state.generation();
         state.cancel();
 
+        assert_ne!(state.generation(), cancelled_generation);
         assert_eq!(
             state.on_timer(start + DEFAULT_DWELL_DELAY),
             DwellTimerEvent::Inactive
