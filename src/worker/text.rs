@@ -8,11 +8,15 @@ use crate::settings::LegacyEncoding;
 
 use super::{
     file::{PreviewFile, PreviewFileError},
-    payload::{MAX_TEXT_UTF8_LEN, TextPreview},
+    payload::{
+        MAX_TEXT_LINES, MAX_TEXT_SCALARS, MAX_TEXT_UTF8_LEN, TextPreview,
+        is_noncanonical_text_line_break, is_unsafe_text_control,
+    },
 };
 
 const TEXT_SNIFF_LIMIT: usize = 64 * 1024;
 const NULL_PATTERN_SAMPLE_LIMIT: usize = 4 * 1024;
+const NEUTRALIZED_CONTROL: char = '\u{fffd}';
 
 const TEXT_EXTENSIONS: &[&str] = &[
     "txt",
@@ -119,7 +123,7 @@ pub(super) fn decode(
     let Some(decoded) = decoded else {
         return Ok(TextDecodeResult::Unsupported);
     };
-    let (text, output_truncated) = truncate_utf8(decoded.text, MAX_TEXT_UTF8_LEN);
+    let (text, output_truncated) = sanitize_and_truncate(&decoded.text);
     Ok(TextDecodeResult::Preview(TextPreview {
         file_size: file.file_size(),
         linked_content: file.is_linked_content(),
@@ -432,17 +436,59 @@ fn decode_utf32(
     Some((text, remainder != 0))
 }
 
-fn truncate_utf8(mut text: String, max_bytes: usize) -> (String, bool) {
-    if text.len() <= max_bytes {
-        return (text, false);
+fn sanitize_and_truncate(text: &str) -> (String, bool) {
+    sanitize_and_truncate_with_limits(text, MAX_TEXT_UTF8_LEN, MAX_TEXT_SCALARS, MAX_TEXT_LINES)
+}
+
+fn sanitize_and_truncate_with_limits(
+    text: &str,
+    max_bytes: usize,
+    max_scalars: usize,
+    max_lines: usize,
+) -> (String, bool) {
+    if text.is_empty() {
+        return (String::new(), false);
+    }
+    if max_bytes == 0 || max_scalars == 0 || max_lines == 0 {
+        return (String::new(), true);
     }
 
-    let mut boundary = max_bytes;
-    while !text.is_char_boundary(boundary) {
-        boundary -= 1;
+    let mut output = String::with_capacity(text.len().min(max_bytes));
+    let mut input = text.chars().peekable();
+    let mut scalar_count = 0;
+    let mut line_count = 1;
+
+    while let Some(scalar) = input.next() {
+        let sanitized = if scalar == '\r' {
+            if input.peek() == Some(&'\n') {
+                input.next();
+            }
+            '\n'
+        } else if is_noncanonical_text_line_break(scalar) {
+            '\n'
+        } else if is_unsafe_text_control(scalar) {
+            NEUTRALIZED_CONTROL
+        } else {
+            scalar
+        };
+
+        let scalar_len = sanitized.len_utf8();
+        if scalar_count == max_scalars
+            || output
+                .len()
+                .checked_add(scalar_len)
+                .is_none_or(|length| length > max_bytes)
+            || (sanitized == '\n' && line_count == max_lines)
+        {
+            return (output, true);
+        }
+
+        output.push(sanitized);
+        scalar_count += 1;
+        line_count += usize::from(sanitized == '\n');
     }
-    text.truncate(boundary);
-    (text, true)
+
+    (output, false)
 }
 
 fn has_known_binary_signature(bytes: &[u8]) -> bool {
@@ -534,10 +580,14 @@ mod tests {
     use super::{
         TEXT_EXTENSIONS, TEXT_NAMES, TextByteKind, TextDecodeResult, classify_bytes,
         classify_prefix, decode, decode_legacy_bytes, decode_legacy_with_encoding,
-        decode_unicode_bytes, is_eligible_path, legacy_encoding_for_code_page, truncate_utf8,
+        decode_unicode_bytes, is_eligible_path, legacy_encoding_for_code_page,
+        sanitize_and_truncate, sanitize_and_truncate_with_limits,
     };
     use crate::settings::LegacyEncoding;
-    use crate::worker::file::PreviewFile;
+    use crate::worker::{
+        file::PreviewFile,
+        payload::{MAX_TEXT_LINES, MAX_TEXT_SCALARS},
+    };
     use encoding_rs::{SHIFT_JIS, WINDOWS_1252};
     use std::{
         env, fs, io,
@@ -652,7 +702,7 @@ mod tests {
         else {
             panic!("the bounded UTF-8 file should produce a preview");
         };
-        assert_eq!(preview.text, "a".repeat(64 * 1024));
+        assert_eq!(preview.text, "a".repeat(MAX_TEXT_SCALARS));
         assert_eq!(preview.encoding, "UTF-8");
         assert_eq!(preview.file_size, 80 * 1024);
         assert!(preview.truncated);
@@ -673,6 +723,34 @@ mod tests {
             decode(&image, &LegacyEncoding::Auto).unwrap(),
             TextDecodeResult::Unsupported
         );
+    }
+
+    #[test]
+    fn decoder_returns_only_canonical_bounded_text() {
+        let root = TestDirectory::new("sanitize");
+        let controls_path = root.path().join("controls.txt");
+        fs::write(
+            &controls_path,
+            "one\r\ntwo\u{001b}[31m\u{202e}three".as_bytes(),
+        )
+        .unwrap();
+        let controls = PreviewFile::open(&controls_path).unwrap();
+        let TextDecodeResult::Preview(preview) = decode(&controls, &LegacyEncoding::Auto).unwrap()
+        else {
+            panic!("the sanitized UTF-8 file should produce a preview");
+        };
+        assert_eq!(preview.text, "one\ntwo\u{fffd}[31m\u{fffd}three");
+        assert!(!preview.truncated);
+
+        let long_path = root.path().join("long.txt");
+        fs::write(&long_path, "x".repeat(MAX_TEXT_SCALARS + 1)).unwrap();
+        let long = PreviewFile::open(&long_path).unwrap();
+        let TextDecodeResult::Preview(preview) = decode(&long, &LegacyEncoding::Auto).unwrap()
+        else {
+            panic!("the bounded UTF-8 file should produce a preview");
+        };
+        assert_eq!(preview.text.len(), MAX_TEXT_SCALARS);
+        assert!(preview.truncated);
     }
 
     #[test]
@@ -776,11 +854,53 @@ mod tests {
     }
 
     #[test]
-    fn utf8_output_truncation_preserves_scalar_boundaries() {
-        let (text, truncated) = truncate_utf8("ab世cd".to_owned(), 4);
+    fn sanitizer_normalizes_every_hard_line_break() {
+        let (text, truncated) =
+            sanitize_and_truncate("one\r\ntwo\rthree\nfour\u{0085}five\u{2028}six\u{2029}seven");
+        assert_eq!(text, "one\ntwo\nthree\nfour\nfive\nsix\nseven");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn sanitizer_neutralizes_controls_and_bidi_formatting_but_preserves_tabs() {
+        let input =
+            "ok\t\n\0\u{001b}\u{007f}\u{009f}\u{061c}\u{200e}\u{202e}\u{2066}\u{206f}\u{feff}done";
+        let (text, truncated) = sanitize_and_truncate(input);
+        assert_eq!(text, format!("ok\t\n{}done", "\u{fffd}".repeat(10)));
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn sanitizer_enforces_exact_scalar_and_line_boundaries() {
+        let exact_scalars = "世".repeat(MAX_TEXT_SCALARS);
+        assert_eq!(
+            sanitize_and_truncate(&exact_scalars),
+            (exact_scalars.clone(), false)
+        );
+        let (text, truncated) = sanitize_and_truncate(&(exact_scalars.clone() + "界"));
+        assert_eq!(text, exact_scalars);
+        assert!(truncated);
+
+        let exact_lines = (1..=MAX_TEXT_LINES)
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            sanitize_and_truncate(&exact_lines),
+            (exact_lines.clone(), false)
+        );
+        let (text, truncated) = sanitize_and_truncate(&(exact_lines.clone() + "\nover"));
+        assert_eq!(text, exact_lines);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn sanitizer_enforces_utf8_bytes_without_splitting_a_scalar() {
+        let (text, truncated) = sanitize_and_truncate_with_limits("ab世cd", 4, usize::MAX, 1);
         assert_eq!(text, "ab");
         assert!(truncated);
-        let (text, truncated) = truncate_utf8("世界".to_owned(), 6);
+
+        let (text, truncated) = sanitize_and_truncate_with_limits("世界", 6, usize::MAX, 1);
         assert_eq!(text, "世界");
         assert!(!truncated);
     }
