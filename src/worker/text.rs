@@ -1,5 +1,11 @@
 use std::path::Path;
 
+use chardetng::{EncodingDetector, Iso2022JpDetection, Utf8Detection};
+use encoding_rs::{DecoderResult, Encoding, UTF_8, UTF_16BE, UTF_16LE, X_USER_DEFINED};
+use windows::Win32::Globalization::GetACP;
+
+use crate::settings::LegacyEncoding;
+
 use super::{
     file::{PreviewFile, PreviewFileError},
     payload::{MAX_TEXT_UTF8_LEN, TextPreview},
@@ -86,35 +92,38 @@ const TEXT_NAMES: &[&str] = &[
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum UnicodeTextResult {
+pub(super) enum TextDecodeResult {
     Preview(TextPreview),
-    LegacyCandidate,
     Unsupported,
 }
 
-pub(super) fn decode_unicode(file: &PreviewFile) -> Result<UnicodeTextResult, PreviewFileError> {
+pub(super) fn decode(
+    file: &PreviewFile,
+    legacy_encoding: &LegacyEncoding,
+) -> Result<TextDecodeResult, PreviewFileError> {
     if !is_eligible_path(file.final_path()) {
-        return Ok(UnicodeTextResult::Unsupported);
+        return Ok(TextDecodeResult::Unsupported);
     }
 
     let bytes = file.read_prefix(TEXT_SNIFF_LIMIT)?;
     let prefix_truncated = file.file_size()
         > u64::try_from(bytes.len()).expect("the bounded text prefix length fits u64");
     let Some(kind) = classify_prefix(&bytes, prefix_truncated) else {
-        return Ok(UnicodeTextResult::Unsupported);
+        return Ok(TextDecodeResult::Unsupported);
     };
-    if kind == TextByteKind::LegacyCandidate {
-        return Ok(UnicodeTextResult::LegacyCandidate);
-    }
-
-    let Some(decoded) = decode_unicode_bytes(&bytes, kind, prefix_truncated) else {
-        return Ok(UnicodeTextResult::Unsupported);
+    let decoded = if kind == TextByteKind::LegacyCandidate {
+        decode_legacy_bytes(&bytes, prefix_truncated, legacy_encoding)
+    } else {
+        decode_unicode_bytes(&bytes, kind, prefix_truncated)
+    };
+    let Some(decoded) = decoded else {
+        return Ok(TextDecodeResult::Unsupported);
     };
     let (text, output_truncated) = truncate_utf8(decoded.text, MAX_TEXT_UTF8_LEN);
-    Ok(UnicodeTextResult::Preview(TextPreview {
+    Ok(TextDecodeResult::Preview(TextPreview {
         file_size: file.file_size(),
         linked_content: file.is_linked_content(),
-        encoding_was_guessed: false,
+        encoding_was_guessed: decoded.encoding_was_guessed,
         truncated: prefix_truncated || decoded.incomplete_tail || output_truncated,
         encoding: decoded.encoding.to_owned(),
         text,
@@ -159,6 +168,7 @@ enum TextByteKind {
 struct DecodedUnicode {
     text: String,
     encoding: &'static str,
+    encoding_was_guessed: bool,
     incomplete_tail: bool,
 }
 
@@ -252,8 +262,96 @@ fn decode_unicode_bytes(
     Some(DecodedUnicode {
         text,
         encoding,
+        encoding_was_guessed: false,
         incomplete_tail,
     })
+}
+
+fn decode_legacy_bytes(
+    bytes: &[u8],
+    prefix_truncated: bool,
+    policy: &LegacyEncoding,
+) -> Option<DecodedUnicode> {
+    let (encoding, encoding_was_guessed) = match policy {
+        LegacyEncoding::Off => return None,
+        LegacyEncoding::Auto => {
+            // Strict Unicode decoding already ran. Keep UTF-8 out of the fallback guess and do
+            // not auto-select the stateful ISO-2022-JP encoding for ordinary local files.
+            let mut detector = EncodingDetector::new(Iso2022JpDetection::Deny);
+            detector.feed(bytes, !prefix_truncated);
+            (detector.guess(None, Utf8Detection::Deny), true)
+        }
+        LegacyEncoding::System => (system_legacy_encoding()?, false),
+        LegacyEncoding::Label(label) => (supported_legacy_encoding(label)?, false),
+    };
+    let (text, output_truncated) = decode_legacy_with_encoding(bytes, encoding, prefix_truncated)?;
+    Some(DecodedUnicode {
+        text,
+        encoding: encoding.name(),
+        encoding_was_guessed,
+        incomplete_tail: output_truncated,
+    })
+}
+
+fn supported_legacy_encoding(label: &str) -> Option<&'static Encoding> {
+    let encoding = Encoding::for_label_no_replacement(label.as_bytes())?;
+    if encoding == UTF_8
+        || encoding == UTF_16LE
+        || encoding == UTF_16BE
+        || encoding == X_USER_DEFINED
+    {
+        None
+    } else {
+        Some(encoding)
+    }
+}
+
+fn system_legacy_encoding() -> Option<&'static Encoding> {
+    // GetACP is used only for the user's explicit `system` compatibility override; all normal
+    // application text and rendering remain Unicode.
+    // SAFETY: GetACP takes no arguments and returns the process-wide Windows ANSI code page.
+    legacy_encoding_for_code_page(unsafe { GetACP() })
+}
+
+fn legacy_encoding_for_code_page(code_page: u32) -> Option<&'static Encoding> {
+    let code_page = u16::try_from(code_page).ok()?;
+    let encoding = codepage::to_encoding_no_replacement(code_page)?;
+    if encoding == UTF_8 || encoding == UTF_16LE || encoding == UTF_16BE {
+        None
+    } else {
+        Some(encoding)
+    }
+}
+
+fn decode_legacy_with_encoding(
+    bytes: &[u8],
+    encoding: &'static Encoding,
+    prefix_truncated: bool,
+) -> Option<(String, bool)> {
+    let mut decoder = encoding.new_decoder_without_bom_handling();
+    let capacity = decoder
+        .max_utf8_buffer_length_without_replacement(bytes.len())?
+        .min(MAX_TEXT_UTF8_LEN);
+    let mut text = String::with_capacity(capacity);
+    let (result, read) =
+        decoder.decode_to_string_without_replacement(bytes, &mut text, !prefix_truncated);
+    match result {
+        DecoderResult::InputEmpty if prefix_truncated && read == bytes.len() => {
+            let additional = decoder.max_utf8_buffer_length_without_replacement(0)?;
+            text.reserve(additional);
+            let (finish, finish_read) =
+                decoder.decode_to_string_without_replacement(&[], &mut text, true);
+            debug_assert_eq!(finish_read, 0);
+            match finish {
+                DecoderResult::InputEmpty => Some((text, false)),
+                DecoderResult::Malformed(_, _) => Some((text, true)),
+                DecoderResult::OutputFull => None,
+            }
+        }
+        DecoderResult::InputEmpty => Some((text, read != bytes.len())),
+        DecoderResult::OutputFull => Some((text, true)),
+        DecoderResult::Malformed(_, _) => None,
+    }
 }
 
 fn decode_utf8(bytes: &[u8], prefix_truncated: bool) -> Option<(String, bool)> {
@@ -434,10 +532,13 @@ const fn at_least(count: usize, total: usize, numerator: usize, denominator: usi
 #[cfg(test)]
 mod tests {
     use super::{
-        TEXT_EXTENSIONS, TEXT_NAMES, TextByteKind, UnicodeTextResult, classify_bytes,
-        classify_prefix, decode_unicode, decode_unicode_bytes, is_eligible_path, truncate_utf8,
+        TEXT_EXTENSIONS, TEXT_NAMES, TextByteKind, TextDecodeResult, classify_bytes,
+        classify_prefix, decode, decode_legacy_bytes, decode_legacy_with_encoding,
+        decode_unicode_bytes, is_eligible_path, legacy_encoding_for_code_page, truncate_utf8,
     };
+    use crate::settings::LegacyEncoding;
     use crate::worker::file::PreviewFile;
+    use encoding_rs::{SHIFT_JIS, WINDOWS_1252};
     use std::{
         env, fs, io,
         path::{Path, PathBuf},
@@ -547,7 +648,8 @@ mod tests {
         let text_path = root.path().join("large.txt");
         fs::write(&text_path, vec![b'a'; 80 * 1024]).unwrap();
         let text = PreviewFile::open(&text_path).unwrap();
-        let UnicodeTextResult::Preview(preview) = decode_unicode(&text).unwrap() else {
+        let TextDecodeResult::Preview(preview) = decode(&text, &LegacyEncoding::Auto).unwrap()
+        else {
             panic!("the bounded UTF-8 file should produce a preview");
         };
         assert_eq!(preview.text, "a".repeat(64 * 1024));
@@ -560,17 +662,62 @@ mod tests {
         fs::write(&binary_path, b"\x89PNG\r\n\x1a\npayload").unwrap();
         let binary = PreviewFile::open(&binary_path).unwrap();
         assert_eq!(
-            decode_unicode(&binary).unwrap(),
-            UnicodeTextResult::Unsupported
+            decode(&binary, &LegacyEncoding::Auto).unwrap(),
+            TextDecodeResult::Unsupported
         );
 
         let image_path = root.path().join("image.png");
         fs::write(&image_path, b"not read by the text classifier").unwrap();
         let image = PreviewFile::open(&image_path).unwrap();
         assert_eq!(
-            decode_unicode(&image).unwrap(),
-            UnicodeTextResult::Unsupported
+            decode(&image, &LegacyEncoding::Auto).unwrap(),
+            TextDecodeResult::Unsupported
         );
+    }
+
+    #[test]
+    fn legacy_policy_supports_auto_override_and_off_modes() {
+        let auto = decode_legacy_bytes(b"I\x92", false, &LegacyEncoding::Auto).unwrap();
+        assert_eq!(auto.text, "I’");
+        assert_eq!(auto.encoding, "windows-1252");
+        assert!(auto.encoding_was_guessed);
+
+        let source = "Þetta er kóðunarpróf. Straße, café, naïve, résumé, voilà.";
+        let (bytes, _, had_errors) = WINDOWS_1252.encode(source);
+        assert!(!had_errors);
+
+        let explicit = decode_legacy_bytes(
+            bytes.as_ref(),
+            false,
+            &LegacyEncoding::Label("windows-1252".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(explicit.text, source);
+        assert_eq!(explicit.encoding, "windows-1252");
+        assert!(!explicit.encoding_was_guessed);
+
+        assert!(decode_legacy_bytes(bytes.as_ref(), false, &LegacyEncoding::Off).is_none());
+    }
+
+    #[test]
+    fn strict_legacy_decode_accepts_only_an_incomplete_bounded_tail() {
+        let (text, truncated) =
+            decode_legacy_with_encoding(b"\x82\xa0\x82", SHIFT_JIS, true).unwrap();
+        assert_eq!(text, "あ");
+        assert!(truncated);
+        assert!(decode_legacy_with_encoding(b"\x82\xa0\x82", SHIFT_JIS, false).is_none());
+        assert!(
+            decode_legacy_with_encoding(b"\x82\x20", SHIFT_JIS, false).is_none(),
+            "malformed bytes inside a complete file must fail closed"
+        );
+    }
+
+    #[test]
+    fn system_code_page_mapping_excludes_unicode_and_unknown_values() {
+        assert_eq!(legacy_encoding_for_code_page(1252), Some(WINDOWS_1252));
+        assert_eq!(legacy_encoding_for_code_page(65001), None);
+        assert_eq!(legacy_encoding_for_code_page(1200), None);
+        assert_eq!(legacy_encoding_for_code_page(u32::MAX), None);
     }
 
     #[test]

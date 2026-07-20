@@ -15,8 +15,12 @@ default = []
 resolver-corpus = []
 
 [dependencies]
+chardetng = { version = "=1.0.0", default-features = false }
+codepage = { version = "=0.1.2", default-features = false }
+encoding_rs = { version = "=0.8.35", default-features = false, features = ["alloc"] }
 windows = { version = "=0.62.2", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_Security_Cryptography",

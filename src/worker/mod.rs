@@ -11,10 +11,11 @@ use std::{
 };
 
 use crate::resolver::{PointResolver, ResolveOutcome};
+use crate::settings::LegacyEncoding;
 use file::PreviewFile;
 use payload::{PreviewResult, ResolverStatus};
 use protocol::{ProtocolStreamError, WorkerMessage};
-use text::UnicodeTextResult;
+use text::TextDecodeResult;
 
 pub(crate) use manager::{
     CompletionNotifier, PendingWorkerPoll, PendingWorkerResolution, WorkerManager,
@@ -30,8 +31,11 @@ where
     R: Read,
     W: Write,
 {
-    let nonce = match protocol::read_message(reader)? {
-        Some(WorkerMessage::Hello { nonce }) => nonce,
+    let (nonce, legacy_encoding) = match protocol::read_message(reader)? {
+        Some(WorkerMessage::Hello {
+            nonce,
+            legacy_encoding,
+        }) => (nonce, legacy_encoding),
         Some(_) => return Err(WorkerSessionError::ExpectedHello),
         None => return Err(WorkerSessionError::MissingHello),
     };
@@ -43,20 +47,17 @@ where
             Some(_) => return Err(WorkerSessionError::ExpectedResolvePoint),
             None => return Ok(()),
         };
-        let result = resolver_result(resolver.resolve(point));
+        let result = resolver_result(resolver.resolve(point), &legacy_encoding);
         protocol::write_message(writer, WorkerMessage::PreviewResult { generation, result })?;
     }
 }
 
-fn resolver_result(outcome: ResolveOutcome) -> PreviewResult {
+fn resolver_result(outcome: ResolveOutcome, legacy_encoding: &LegacyEncoding) -> PreviewResult {
     match outcome {
         ResolveOutcome::Resolved(target) => match PreviewFile::open(target.path()) {
-            Ok(file) => match text::decode_unicode(&file) {
-                Ok(UnicodeTextResult::Preview(preview)) => PreviewResult::Text(preview),
-                Ok(UnicodeTextResult::LegacyCandidate) => {
-                    PreviewResult::Status(ResolverStatus::Resolved)
-                }
-                Ok(UnicodeTextResult::Unsupported) => {
+            Ok(file) => match text::decode(&file, legacy_encoding) {
+                Ok(TextDecodeResult::Preview(preview)) => PreviewResult::Text(preview),
+                Ok(TextDecodeResult::Unsupported) => {
                     PreviewResult::Status(ResolverStatus::Unsupported)
                 }
                 Err(_) => PreviewResult::Status(ResolverStatus::Unavailable),
@@ -113,6 +114,7 @@ mod tests {
     use super::{WorkerSessionError, protocol, resolver_result, run_session};
     use crate::hover::{Generation, PhysicalScreenPoint};
     use crate::resolver::{PointResolver, ResolveOutcome, ResolvedTarget};
+    use crate::settings::LegacyEncoding;
     use crate::worker::payload::{PreviewResult, ResolverStatus};
     use protocol::{SessionNonce, WorkerMessage};
     use std::{
@@ -143,9 +145,10 @@ mod tests {
             NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed)
         ));
         fs::write(&path, b"preview").expect("the resolved fixture should be written");
-        let PreviewResult::Text(preview) =
-            resolver_result(ResolveOutcome::Resolved(ResolvedTarget::new(path.clone())))
-        else {
+        let PreviewResult::Text(preview) = resolver_result(
+            ResolveOutcome::Resolved(ResolvedTarget::new(path.clone())),
+            &LegacyEncoding::Auto,
+        ) else {
             panic!("the resolved UTF-8 fixture should produce a text preview");
         };
         assert_eq!(preview.text, "preview");
@@ -156,7 +159,10 @@ mod tests {
         assert!(!preview.truncated);
         fs::remove_file(&path).expect("the resolved fixture should be removed");
         assert_eq!(
-            resolver_result(ResolveOutcome::Resolved(ResolvedTarget::new(path))),
+            resolver_result(
+                ResolveOutcome::Resolved(ResolvedTarget::new(path)),
+                &LegacyEncoding::Auto,
+            ),
             PreviewResult::Status(ResolverStatus::Unavailable)
         );
         let binary_path = env::temp_dir().join(format!(
@@ -167,22 +173,48 @@ mod tests {
         fs::write(&binary_path, b"\x89PNG\r\n\x1a\npayload")
             .expect("the disguised binary fixture should be written");
         assert_eq!(
-            resolver_result(ResolveOutcome::Resolved(ResolvedTarget::new(
-                binary_path.clone()
-            ))),
+            resolver_result(
+                ResolveOutcome::Resolved(ResolvedTarget::new(binary_path.clone())),
+                &LegacyEncoding::Auto,
+            ),
             PreviewResult::Status(ResolverStatus::Unsupported)
         );
         fs::remove_file(binary_path).expect("the disguised binary fixture should be removed");
+
+        let legacy_path = env::temp_dir().join(format!(
+            "cursorpeek-resolved-target-{}-{}.txt",
+            std::process::id(),
+            NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&legacy_path, b"I\x92").expect("the legacy text fixture should be written");
+        let PreviewResult::Text(preview) = resolver_result(
+            ResolveOutcome::Resolved(ResolvedTarget::new(legacy_path.clone())),
+            &LegacyEncoding::Auto,
+        ) else {
+            panic!("the detected legacy fixture should produce a text preview");
+        };
+        assert_eq!(preview.text, "I’");
+        assert_eq!(preview.encoding, "windows-1252");
+        assert!(preview.encoding_was_guessed);
         assert_eq!(
-            resolver_result(ResolveOutcome::Unsupported),
+            resolver_result(
+                ResolveOutcome::Resolved(ResolvedTarget::new(legacy_path.clone())),
+                &LegacyEncoding::Off,
+            ),
+            PreviewResult::Status(ResolverStatus::Unsupported)
+        );
+        fs::remove_file(legacy_path).expect("the legacy text fixture should be removed");
+
+        assert_eq!(
+            resolver_result(ResolveOutcome::Unsupported, &LegacyEncoding::Auto),
             PreviewResult::Status(ResolverStatus::Unsupported)
         );
         assert_eq!(
-            resolver_result(ResolveOutcome::Ambiguous),
+            resolver_result(ResolveOutcome::Ambiguous, &LegacyEncoding::Auto),
             PreviewResult::Status(ResolverStatus::Ambiguous)
         );
         assert_eq!(
-            resolver_result(ResolveOutcome::Unavailable),
+            resolver_result(ResolveOutcome::Unavailable, &LegacyEncoding::Auto),
             PreviewResult::Status(ResolverStatus::Unavailable)
         );
     }
@@ -191,7 +223,14 @@ mod tests {
     fn session_echoes_nonce_and_handles_requests_until_clean_eof() {
         let generations = [Generation::from_raw(1), Generation::from_raw(u64::MAX)];
         let mut input = Vec::new();
-        protocol::write_message(&mut input, WorkerMessage::Hello { nonce: NONCE }).unwrap();
+        protocol::write_message(
+            &mut input,
+            WorkerMessage::Hello {
+                nonce: NONCE,
+                legacy_encoding: LegacyEncoding::Auto,
+            },
+        )
+        .unwrap();
         for (index, generation) in generations.into_iter().enumerate() {
             protocol::write_message(
                 &mut input,
@@ -255,7 +294,14 @@ mod tests {
         ));
 
         let mut wrong_second = Vec::new();
-        protocol::write_message(&mut wrong_second, WorkerMessage::Hello { nonce: NONCE }).unwrap();
+        protocol::write_message(
+            &mut wrong_second,
+            WorkerMessage::Hello {
+                nonce: NONCE,
+                legacy_encoding: LegacyEncoding::Auto,
+            },
+        )
+        .unwrap();
         protocol::write_message(&mut wrong_second, WorkerMessage::Ready { nonce: NONCE }).unwrap();
         assert!(matches!(
             run_session(
@@ -267,8 +313,14 @@ mod tests {
         ));
 
         let mut handshake_only = Vec::new();
-        protocol::write_message(&mut handshake_only, WorkerMessage::Hello { nonce: NONCE })
-            .unwrap();
+        protocol::write_message(
+            &mut handshake_only,
+            WorkerMessage::Hello {
+                nonce: NONCE,
+                legacy_encoding: LegacyEncoding::Auto,
+            },
+        )
+        .unwrap();
         run_session(
             &mut handshake_only.as_slice(),
             &mut output,

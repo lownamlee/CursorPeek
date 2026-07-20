@@ -51,7 +51,8 @@ pub(crate) fn run(process_mode: ProcessMode) -> Result<(), AppError> {
             let settings = settings_file.load_or_create()?;
             let message_window =
                 MessageWindow::create_with_dwell_delay(settings.settings().dwell_delay())?;
-            let worker_manager = worker::WorkerManager::start()?;
+            let worker_manager =
+                worker::WorkerManager::start(settings.settings().legacy_encoding().clone())?;
             message_window.run_application(worker_manager)?;
         }
         ProcessMode::InputDiagnostics => {
