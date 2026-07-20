@@ -13,7 +13,7 @@ use std::{
 use crate::resolver::{PointResolver, ResolveOutcome};
 use crate::settings::LegacyEncoding;
 use file::PreviewFile;
-use payload::{PreviewResult, ResolverStatus};
+use payload::ResolverStatus;
 use protocol::{ProtocolStreamError, WorkerMessage};
 use text::TextDecodeResult;
 
@@ -21,6 +21,7 @@ pub(crate) use manager::{
     CompletionNotifier, PendingWorkerPoll, PendingWorkerResolution, WorkerManager,
     WorkerManagerError, run_launch_diagnostic, run_timeout_diagnostic,
 };
+pub(crate) use payload::{PreviewResult, TextPreview};
 
 pub(crate) fn run_session<R, W>(
     reader: &mut R,

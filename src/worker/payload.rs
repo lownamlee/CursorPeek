@@ -26,7 +26,7 @@ const FLAG_IMAGE_FIRST_FRAME_ONLY: u32 = 1 << 1;
 const IMAGE_FLAGS: u32 = FLAG_LINKED_CONTENT | FLAG_IMAGE_FIRST_FRAME_ONLY;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ResolverStatus {
+pub(crate) enum ResolverStatus {
     Resolved = 0,
     Unsupported = 1,
     Ambiguous = 2,
@@ -48,7 +48,7 @@ impl ResolverStatus {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ImageFormat {
+pub(crate) enum ImageFormat {
     Jpeg = 0,
     Png = 1,
     Gif = 2,
@@ -74,30 +74,30 @@ impl ImageFormat {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct TextPreview {
-    pub(super) file_size: u64,
-    pub(super) linked_content: bool,
-    pub(super) encoding_was_guessed: bool,
-    pub(super) truncated: bool,
-    pub(super) encoding: String,
-    pub(super) text: String,
+pub(crate) struct TextPreview {
+    pub(crate) file_size: u64,
+    pub(crate) linked_content: bool,
+    pub(crate) encoding_was_guessed: bool,
+    pub(crate) truncated: bool,
+    pub(crate) encoding: String,
+    pub(crate) text: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct ImagePreview {
-    pub(super) file_size: u64,
-    pub(super) linked_content: bool,
-    pub(super) first_frame_only: bool,
-    pub(super) format: ImageFormat,
-    pub(super) source_width: u32,
-    pub(super) source_height: u32,
-    pub(super) width: u32,
-    pub(super) height: u32,
-    pub(super) premultiplied_bgra: Vec<u8>,
+pub(crate) struct ImagePreview {
+    pub(crate) file_size: u64,
+    pub(crate) linked_content: bool,
+    pub(crate) first_frame_only: bool,
+    pub(crate) format: ImageFormat,
+    pub(crate) source_width: u32,
+    pub(crate) source_height: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) premultiplied_bgra: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum PreviewResult {
+pub(crate) enum PreviewResult {
     Status(ResolverStatus),
     Text(TextPreview),
     Image(ImagePreview),

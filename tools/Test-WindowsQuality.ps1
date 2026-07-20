@@ -70,6 +70,8 @@ $approvedSystemImports = @(
     'API-MS-WIN-CORE-SYNCH-L1-2-0.DLL'
     'BCRYPT.DLL'
     'COMBASE.DLL'
+    'D2D1.DLL'
+    'DWRITE.DLL'
     'KERNEL32.DLL'
     'NTDLL.DLL'
     'OLE32.DLL'

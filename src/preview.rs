@@ -1,9 +1,23 @@
 use crate::hover::PhysicalScreenPoint;
 
 const BASE_DPI: i64 = 96;
-const DIAGNOSTIC_WIDTH: i64 = 320;
-const DIAGNOSTIC_HEIGHT: i64 = 240;
 const POINTER_GAP: i64 = 8;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PreviewSize {
+    width: u32,
+    height: u32,
+}
+
+impl PreviewSize {
+    pub(crate) const fn new(width: u32, height: u32) -> Self {
+        Self { width, height }
+    }
+
+    pub(crate) const fn diagnostic() -> Self {
+        Self::new(320, 240)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ScreenRect {
@@ -21,10 +35,11 @@ pub(crate) struct PreviewPlacement {
     pub(crate) height: i32,
 }
 
-pub(crate) fn place_diagnostic_preview(
+pub(crate) fn place_preview(
     anchor: PhysicalScreenPoint,
     work_area: ScreenRect,
     dpi: u32,
+    size: PreviewSize,
 ) -> Option<PreviewPlacement> {
     let work_left = i64::from(work_area.left);
     let work_top = i64::from(work_area.top);
@@ -32,12 +47,12 @@ pub(crate) fn place_diagnostic_preview(
     let work_bottom = i64::from(work_area.bottom);
     let work_width = work_right.checked_sub(work_left)?;
     let work_height = work_bottom.checked_sub(work_top)?;
-    if work_width <= 0 || work_height <= 0 || dpi == 0 {
+    if work_width <= 0 || work_height <= 0 || dpi == 0 || size.width == 0 || size.height == 0 {
         return None;
     }
 
-    let width = scale_from_96_dpi(DIAGNOSTIC_WIDTH, dpi)?.min(work_width);
-    let height = scale_from_96_dpi(DIAGNOSTIC_HEIGHT, dpi)?.min(work_height);
+    let width = scale_from_96_dpi(i64::from(size.width), dpi)?.min(work_width);
+    let height = scale_from_96_dpi(i64::from(size.height), dpi)?.min(work_height);
     let gap = scale_from_96_dpi(POINTER_GAP, dpi)?;
     let anchor_x = i64::from(anchor.x);
     let anchor_y = i64::from(anchor.y);
@@ -138,7 +153,7 @@ fn visible_area(
 
 #[cfg(test)]
 mod tests {
-    use super::{PreviewPlacement, ScreenRect, place_diagnostic_preview};
+    use super::{PreviewPlacement, PreviewSize, ScreenRect, place_preview};
     use crate::hover::PhysicalScreenPoint;
 
     const PRIMARY_WORK_AREA: ScreenRect = ScreenRect {
@@ -151,7 +166,12 @@ mod tests {
     #[test]
     fn prefers_right_below_when_the_preview_fits() {
         assert_eq!(
-            place_diagnostic_preview(PhysicalScreenPoint::new(200, 100), PRIMARY_WORK_AREA, 96),
+            place_preview(
+                PhysicalScreenPoint::new(200, 100),
+                PRIMARY_WORK_AREA,
+                96,
+                PreviewSize::diagnostic(),
+            ),
             Some(PreviewPlacement {
                 x: 208,
                 y: 108,
@@ -164,7 +184,12 @@ mod tests {
     #[test]
     fn chooses_the_largest_visible_quadrant_near_an_edge() {
         assert_eq!(
-            place_diagnostic_preview(PhysicalScreenPoint::new(1900, 1020), PRIMARY_WORK_AREA, 96),
+            place_preview(
+                PhysicalScreenPoint::new(1900, 1020),
+                PRIMARY_WORK_AREA,
+                96,
+                PreviewSize::diagnostic(),
+            ),
             Some(PreviewPlacement {
                 x: 1572,
                 y: 772,
@@ -176,7 +201,7 @@ mod tests {
 
     #[test]
     fn scales_up_and_handles_negative_monitor_coordinates() {
-        let placement = place_diagnostic_preview(
+        let placement = place_preview(
             PhysicalScreenPoint::new(-1800, 100),
             ScreenRect {
                 left: -1920,
@@ -185,6 +210,7 @@ mod tests {
                 bottom: 1080,
             },
             144,
+            PreviewSize::diagnostic(),
         )
         .expect("the negative-coordinate work area is valid");
 
@@ -199,7 +225,7 @@ mod tests {
     #[test]
     fn caps_the_preview_to_a_small_work_area_and_rejects_invalid_input() {
         assert_eq!(
-            place_diagnostic_preview(
+            place_preview(
                 PhysicalScreenPoint::new(1_000, 1_000),
                 ScreenRect {
                     left: -100,
@@ -208,6 +234,7 @@ mod tests {
                     bottom: 50,
                 },
                 192,
+                PreviewSize::diagnostic(),
             ),
             Some(PreviewPlacement {
                 x: -100,
@@ -217,7 +244,7 @@ mod tests {
             })
         );
         assert_eq!(
-            place_diagnostic_preview(
+            place_preview(
                 PhysicalScreenPoint::new(0, 0),
                 ScreenRect {
                     left: -100,
@@ -226,12 +253,13 @@ mod tests {
                     bottom: 50,
                 },
                 192,
+                PreviewSize::diagnostic(),
             ),
             None,
             "a work-area-sized popup must not cover its anchor"
         );
         assert_eq!(
-            place_diagnostic_preview(
+            place_preview(
                 PhysicalScreenPoint::new(0, 0),
                 ScreenRect {
                     left: 1,
@@ -240,12 +268,45 @@ mod tests {
                     bottom: 10,
                 },
                 96,
+                PreviewSize::diagnostic(),
             ),
             None
         );
         assert_eq!(
-            place_diagnostic_preview(PhysicalScreenPoint::new(0, 0), PRIMARY_WORK_AREA, 0),
+            place_preview(
+                PhysicalScreenPoint::new(0, 0),
+                PRIMARY_WORK_AREA,
+                0,
+                PreviewSize::diagnostic(),
+            ),
             None
+        );
+        assert_eq!(
+            place_preview(
+                PhysicalScreenPoint::new(0, 0),
+                PRIMARY_WORK_AREA,
+                96,
+                PreviewSize::new(0, 240),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn uses_the_requested_logical_content_size() {
+        assert_eq!(
+            place_preview(
+                PhysicalScreenPoint::new(200, 100),
+                PRIMARY_WORK_AREA,
+                120,
+                PreviewSize::new(640, 480),
+            ),
+            Some(PreviewPlacement {
+                x: 210,
+                y: 110,
+                width: 800,
+                height: 600,
+            })
         );
     }
 }

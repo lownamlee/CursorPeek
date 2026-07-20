@@ -20,6 +20,10 @@ codepage = { version = "=0.1.2", default-features = false }
 encoding_rs = { version = "=0.8.35", default-features = false, features = ["alloc"] }
 windows = { version = "=0.62.2", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dxgi_Common",
     "Win32_Globalization",
     "Win32_Graphics_Gdi",
     "Win32_Security",
@@ -39,6 +43,7 @@ windows = { version = "=0.62.2", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+windows-numerics = { version = "=0.3.1", default-features = false }
 
 [profile.release]
 opt-level = "z"

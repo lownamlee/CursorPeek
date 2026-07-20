@@ -135,6 +135,14 @@ impl AppSettings {
         &self.legacy_encoding
     }
 
+    pub(crate) const fn preview_width(&self) -> u16 {
+        self.preview_width
+    }
+
+    pub(crate) const fn preview_height(&self) -> u16 {
+        self.preview_height
+    }
+
     fn validate(&self) -> Result<(), SettingsParseError> {
         if !(MIN_DWELL_DELAY_MS..=MAX_DWELL_DELAY_MS).contains(&self.dwell_delay_ms) {
             return Err(SettingsParseError::new(0, INVALID_DWELL_DELAY));

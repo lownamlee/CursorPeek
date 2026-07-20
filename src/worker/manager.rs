@@ -268,6 +268,10 @@ impl WorkerResolution {
     pub(crate) const fn generation(&self) -> Generation {
         self.generation
     }
+
+    pub(crate) fn into_result(self) -> PreviewResult {
+        self.result
+    }
 }
 
 pub(crate) struct PendingWorkerResolution {
