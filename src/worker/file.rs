@@ -3,9 +3,11 @@ use std::{
     ffi::OsString,
     fmt,
     fs::File,
+    io,
     mem::size_of,
     os::windows::{
         ffi::{OsStrExt, OsStringExt},
+        fs::FileExt,
         io::{AsRawHandle, FromRawHandle, OwnedHandle},
     },
     path::{Path, PathBuf},
@@ -33,6 +35,7 @@ use windows::{
 
 const MAX_PATH_UNITS: usize = 32_768;
 const INITIAL_FINAL_PATH_UNITS: usize = 260;
+const MAX_CONTENT_PREFIX_LEN: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FileIdentity {
@@ -106,14 +109,55 @@ impl PreviewFile {
             && query_handle_path(&self.file, HandlePathKind::Normalized)? == self.final_path)
     }
 
-    #[cfg(test)]
-    const fn snapshot(&self) -> FileSnapshot {
-        self.snapshot
+    pub(super) fn final_path(&self) -> &Path {
+        &self.final_path
+    }
+
+    pub(super) const fn file_size(&self) -> u64 {
+        self.snapshot.file_size
+    }
+
+    pub(super) fn read_prefix(&self, max_bytes: usize) -> Result<Vec<u8>, PreviewFileError> {
+        if !(1..=MAX_CONTENT_PREFIX_LEN).contains(&max_bytes) {
+            return Err(PreviewFileError::ReadLimitOutOfRange(max_bytes));
+        }
+
+        let requested = usize::try_from(
+            self.snapshot
+                .file_size
+                .min(u64::try_from(max_bytes).expect("the content cap fits u64")),
+        )
+        .expect("the bounded content prefix fits usize");
+        let mut bytes = vec![0_u8; requested];
+        let mut filled = 0;
+        while filled < requested {
+            let read = self
+                .file
+                .seek_read(
+                    &mut bytes[filled..],
+                    u64::try_from(filled).expect("the content cap fits u64"),
+                )
+                .map_err(|source| PreviewFileError::Io {
+                    operation: "read the bounded content prefix",
+                    source,
+                })?;
+            if read == 0 {
+                break;
+            }
+            filled = filled
+                .checked_add(read)
+                .expect("a read cannot exceed its bounded destination");
+        }
+
+        if filled != requested || !self.is_unchanged()? {
+            return Err(PreviewFileError::ChangedDuringRead);
+        }
+        Ok(bytes)
     }
 
     #[cfg(test)]
-    fn final_path(&self) -> &Path {
-        &self.final_path
+    const fn snapshot(&self) -> FileSnapshot {
+        self.snapshot
     }
 
     #[cfg(test)]
@@ -388,8 +432,13 @@ pub(super) enum PreviewFileError {
         operation: &'static str,
         source: WindowsError,
     },
+    Io {
+        operation: &'static str,
+        source: io::Error,
+    },
     InvalidPath,
     PathTooLong(usize),
+    ReadLimitOutOfRange(usize),
     UnsupportedInputPath,
     NotDisk(u32),
     RemoteProtocol,
@@ -398,6 +447,7 @@ pub(super) enum PreviewFileError {
     Offline,
     RecallOnOpen,
     RecallOnDataAccess,
+    ChangedDuringRead,
     InvalidFileSize(i64),
     UnsupportedFinalPath,
 }
@@ -425,9 +475,16 @@ impl fmt::Display for PreviewFileError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Windows { operation, source } => write!(formatter, "{operation}: {source}"),
+            Self::Io { operation, source } => write!(formatter, "{operation}: {source}"),
             Self::InvalidPath => write!(formatter, "preview path contains a null character"),
             Self::PathTooLong(length) => {
                 write!(formatter, "preview path requires {length} UTF-16 units")
+            }
+            Self::ReadLimitOutOfRange(length) => {
+                write!(
+                    formatter,
+                    "preview prefix limit is out of range ({length} bytes)"
+                )
             }
             Self::UnsupportedInputPath => {
                 write!(formatter, "preview path is not a local DOS drive path")
@@ -441,6 +498,7 @@ impl fmt::Display for PreviewFileError {
             Self::RecallOnDataAccess => {
                 write!(formatter, "reading the preview file requires recall")
             }
+            Self::ChangedDuringRead => write!(formatter, "preview file changed during its read"),
             Self::InvalidFileSize(size) => {
                 write!(formatter, "preview file size is invalid ({size})")
             }
@@ -458,6 +516,7 @@ impl Error for PreviewFileError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Windows { source, .. } => Some(source),
+            Self::Io { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -466,8 +525,8 @@ impl Error for PreviewFileError {
 #[cfg(test)]
 mod tests {
     use super::{
-        PreviewFile, PreviewFileError, is_extended_drive_path, is_local_drive_path,
-        null_terminated_path, require_content_available,
+        MAX_CONTENT_PREFIX_LEN, PreviewFile, PreviewFileError, is_extended_drive_path,
+        is_local_drive_path, null_terminated_path, require_content_available,
     };
     use std::{
         env, fs, io,
@@ -514,6 +573,26 @@ mod tests {
         assert_ne!(first_identity, replacement.snapshot().identity);
         assert!(!first.is_unchanged().unwrap());
         assert!(replacement.is_unchanged().unwrap());
+    }
+
+    #[test]
+    fn prefix_reads_are_bounded_and_keep_the_handle_identity() {
+        let root = TestDirectory::new("prefix");
+        let path = root.path().join("large.txt");
+        fs::write(&path, vec![b'x'; MAX_CONTENT_PREFIX_LEN + 1]).unwrap();
+
+        let file = PreviewFile::open(&path).unwrap();
+        assert_eq!(file.read_prefix(64 * 1024).unwrap(), vec![b'x'; 64 * 1024]);
+        assert!(file.is_unchanged().unwrap());
+        assert!(matches!(
+            file.read_prefix(0),
+            Err(PreviewFileError::ReadLimitOutOfRange(0))
+        ));
+        assert!(matches!(
+            file.read_prefix(MAX_CONTENT_PREFIX_LEN + 1),
+            Err(PreviewFileError::ReadLimitOutOfRange(length))
+                if length == MAX_CONTENT_PREFIX_LEN + 1
+        ));
     }
 
     #[test]

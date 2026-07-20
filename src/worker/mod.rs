@@ -2,6 +2,7 @@ mod file;
 mod manager;
 mod payload;
 mod protocol;
+mod text;
 
 use std::{
     error::Error,
@@ -13,6 +14,7 @@ use crate::resolver::{PointResolver, ResolveOutcome};
 use file::PreviewFile;
 use payload::{PreviewResult, ResolverStatus};
 use protocol::{ProtocolStreamError, WorkerMessage};
+use text::TextClassification;
 
 pub(crate) use manager::{
     CompletionNotifier, PendingWorkerPoll, PendingWorkerResolution, WorkerManager,
@@ -49,9 +51,10 @@ where
 fn resolver_result(outcome: ResolveOutcome) -> PreviewResult {
     PreviewResult::Status(match outcome {
         ResolveOutcome::Resolved(target) => match PreviewFile::open(target.path()) {
-            Ok(file) => match file.is_unchanged() {
-                Ok(true) => ResolverStatus::Resolved,
-                Ok(false) | Err(_) => ResolverStatus::Unavailable,
+            Ok(file) => match text::classify(&file) {
+                Ok(TextClassification::Text) => ResolverStatus::Resolved,
+                Ok(TextClassification::Unsupported) => ResolverStatus::Unsupported,
+                Err(_) => ResolverStatus::Unavailable,
             },
             Err(error) if error.is_unsupported() => ResolverStatus::Unsupported,
             Err(_) => ResolverStatus::Unavailable,
@@ -128,7 +131,7 @@ mod tests {
     #[test]
     fn resolver_outcomes_map_to_typed_preview_statuses() {
         let path = env::temp_dir().join(format!(
-            "cursorpeek-resolved-target-{}-{}",
+            "cursorpeek-resolved-target-{}-{}.txt",
             std::process::id(),
             NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed)
         ));
@@ -142,6 +145,20 @@ mod tests {
             resolver_result(ResolveOutcome::Resolved(ResolvedTarget::new(path))),
             PreviewResult::Status(ResolverStatus::Unavailable)
         );
+        let binary_path = env::temp_dir().join(format!(
+            "cursorpeek-resolved-target-{}-{}.txt",
+            std::process::id(),
+            NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&binary_path, b"\x89PNG\r\n\x1a\npayload")
+            .expect("the disguised binary fixture should be written");
+        assert_eq!(
+            resolver_result(ResolveOutcome::Resolved(ResolvedTarget::new(
+                binary_path.clone()
+            ))),
+            PreviewResult::Status(ResolverStatus::Unsupported)
+        );
+        fs::remove_file(binary_path).expect("the disguised binary fixture should be removed");
         assert_eq!(
             resolver_result(ResolveOutcome::Unsupported),
             PreviewResult::Status(ResolverStatus::Unsupported)
