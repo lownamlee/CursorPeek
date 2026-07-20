@@ -13,16 +13,22 @@ use std::{
 
 use windows::{
     Win32::{
-        Foundation::{GENERIC_READ, HANDLE},
+        Foundation::{
+            ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, GENERIC_READ,
+            HANDLE,
+        },
         Storage::FileSystem::{
-            CreateFileW, FILE_BASIC_INFO, FILE_FLAG_OPEN_NO_RECALL, FILE_FLAG_SEQUENTIAL_SCAN,
-            FILE_ID_INFO, FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ,
-            FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_TYPE_DISK, FileBasicInfo, FileIdInfo,
+            CreateFileW, FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
+            FILE_ATTRIBUTE_RECALL_ON_OPEN, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO,
+            FILE_FLAG_OPEN_NO_RECALL, FILE_FLAG_SEQUENTIAL_SCAN, FILE_ID_INFO,
+            FILE_NAME_NORMALIZED, FILE_NAME_OPENED, FILE_REMOTE_PROTOCOL_INFO, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_TYPE_DISK,
+            FileAttributeTagInfo, FileBasicInfo, FileIdInfo, FileRemoteProtocolInfo,
             FileStandardInfo, GetFileInformationByHandleEx, GetFileType, GetFinalPathNameByHandleW,
             OPEN_EXISTING,
         },
     },
-    core::{Error as WindowsError, PCWSTR},
+    core::{Error as WindowsError, HRESULT, PCWSTR},
 };
 
 const MAX_PATH_UNITS: usize = 32_768;
@@ -39,11 +45,14 @@ struct FileSnapshot {
     identity: FileIdentity,
     file_size: u64,
     last_write_time: i64,
-    attributes: u32,
+    basic_attributes: u32,
+    tag_attributes: u32,
+    reparse_tag: u32,
 }
 
 pub(super) struct PreviewFile {
     file: File,
+    opened_path: PathBuf,
     final_path: PathBuf,
     snapshot: FileSnapshot,
 }
@@ -51,6 +60,9 @@ pub(super) struct PreviewFile {
 impl PreviewFile {
     pub(super) fn open(path: &Path) -> Result<Self, PreviewFileError> {
         let path_units = null_terminated_path(path)?;
+        if !is_local_drive_path(&path_units[..path_units.len() - 1]) {
+            return Err(PreviewFileError::UnsupportedInputPath);
+        }
         // SAFETY: `path_units` is a live null-terminated UTF-16 path. The call opens only an
         // existing object, receives no inheritable security attributes or template handle, and
         // explicitly permits ordinary rename/replace activity while this read handle is live.
@@ -75,11 +87,14 @@ impl PreviewFile {
         let handle = unsafe { OwnedHandle::from_raw_handle(raw_handle.0) };
         let file = File::from(handle);
         require_disk_file(&file)?;
+        require_local_protocol(&file)?;
         let snapshot = query_snapshot(&file)?;
-        let final_path = query_final_path(&file)?;
+        let opened_path = query_handle_path(&file, HandlePathKind::Opened)?;
+        let final_path = query_handle_path(&file, HandlePathKind::Normalized)?;
 
         Ok(Self {
             file,
+            opened_path,
             final_path,
             snapshot,
         })
@@ -87,7 +102,8 @@ impl PreviewFile {
 
     pub(super) fn is_unchanged(&self) -> Result<bool, PreviewFileError> {
         Ok(query_snapshot(&self.file)? == self.snapshot
-            && query_final_path(&self.file)? == self.final_path)
+            && query_handle_path(&self.file, HandlePathKind::Opened)? == self.opened_path
+            && query_handle_path(&self.file, HandlePathKind::Normalized)? == self.final_path)
     }
 
     #[cfg(test)]
@@ -99,6 +115,11 @@ impl PreviewFile {
     fn final_path(&self) -> &Path {
         &self.final_path
     }
+
+    #[cfg(test)]
+    fn is_linked_content(&self) -> bool {
+        self.opened_path != self.final_path
+    }
 }
 
 fn require_disk_file(file: &File) -> Result<(), PreviewFileError> {
@@ -108,6 +129,43 @@ fn require_disk_file(file: &File) -> Result<(), PreviewFileError> {
     } else {
         Err(PreviewFileError::NotDisk(file_type.0))
     }
+}
+
+fn require_local_protocol(file: &File) -> Result<(), PreviewFileError> {
+    const WORDS: usize = size_of::<FILE_REMOTE_PROTOCOL_INFO>() / size_of::<u32>();
+    const _: () = assert!(size_of::<FILE_REMOTE_PROTOCOL_INFO>().is_multiple_of(size_of::<u32>()));
+    // Keep this infrequently used provider query off the worker stack. A word buffer preserves the
+    // native structure's alignment while remaining fully writable to the filesystem provider.
+    let mut info = vec![0_u32; WORDS];
+    // SAFETY: `info` is the exact output structure paired with FileRemoteProtocolInfo. The file
+    // handle remains live and the writable buffer has the reported structure size.
+    let result = unsafe {
+        GetFileInformationByHandleEx(
+            file_handle(file),
+            FileRemoteProtocolInfo,
+            info.as_mut_ptr().cast(),
+            structure_size::<FILE_REMOTE_PROTOCOL_INFO>(),
+        )
+    };
+
+    match result {
+        Ok(()) => Err(PreviewFileError::RemoteProtocol),
+        Err(error) if means_no_remote_protocol(&error) => Ok(()),
+        Err(source) => Err(PreviewFileError::Windows {
+            operation: "determine whether the file uses a remote protocol",
+            source,
+        }),
+    }
+}
+
+fn means_no_remote_protocol(error: &WindowsError) -> bool {
+    [
+        ERROR_INVALID_FUNCTION,
+        ERROR_NOT_SUPPORTED,
+        ERROR_INVALID_PARAMETER,
+    ]
+    .into_iter()
+    .any(|code| error.code() == HRESULT::from_win32(code.0))
 }
 
 fn query_snapshot(file: &File) -> Result<FileSnapshot, PreviewFileError> {
@@ -121,6 +179,8 @@ fn query_snapshot(file: &File) -> Result<FileSnapshot, PreviewFileError> {
     let file_size = u64::try_from(standard.EndOfFile)
         .map_err(|_| PreviewFileError::InvalidFileSize(standard.EndOfFile))?;
     let basic = query_basic_info(file)?;
+    let attribute_tag = query_attribute_tag_info(file)?;
+    require_content_available(basic.FileAttributes | attribute_tag.FileAttributes)?;
     let id = query_id_info(file)?;
 
     Ok(FileSnapshot {
@@ -130,7 +190,9 @@ fn query_snapshot(file: &File) -> Result<FileSnapshot, PreviewFileError> {
         },
         file_size,
         last_write_time: basic.LastWriteTime,
-        attributes: basic.FileAttributes,
+        basic_attributes: basic.FileAttributes,
+        tag_attributes: attribute_tag.FileAttributes,
+        reparse_tag: attribute_tag.ReparseTag,
     })
 }
 
@@ -172,6 +234,37 @@ fn query_basic_info(file: &File) -> Result<FILE_BASIC_INFO, PreviewFileError> {
     Ok(info)
 }
 
+fn query_attribute_tag_info(file: &File) -> Result<FILE_ATTRIBUTE_TAG_INFO, PreviewFileError> {
+    let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
+    // SAFETY: the live disk handle permits metadata queries. `info` is the exact structure paired
+    // with FileAttributeTagInfo and remains writable for its reported size.
+    unsafe {
+        GetFileInformationByHandleEx(
+            file_handle(file),
+            FileAttributeTagInfo,
+            (&raw mut info).cast(),
+            structure_size::<FILE_ATTRIBUTE_TAG_INFO>(),
+        )
+    }
+    .map_err(|source| PreviewFileError::Windows {
+        operation: "query file attributes and reparse tag",
+        source,
+    })?;
+    Ok(info)
+}
+
+fn require_content_available(attributes: u32) -> Result<(), PreviewFileError> {
+    if attributes & FILE_ATTRIBUTE_OFFLINE.0 != 0 {
+        Err(PreviewFileError::Offline)
+    } else if attributes & FILE_ATTRIBUTE_RECALL_ON_OPEN.0 != 0 {
+        Err(PreviewFileError::RecallOnOpen)
+    } else if attributes & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS.0 != 0 {
+        Err(PreviewFileError::RecallOnDataAccess)
+    } else {
+        Ok(())
+    }
+}
+
 fn query_id_info(file: &File) -> Result<FILE_ID_INFO, PreviewFileError> {
     let mut info = FILE_ID_INFO::default();
     // SAFETY: the live disk handle permits metadata queries. `info` is the exact structure paired
@@ -191,18 +284,39 @@ fn query_id_info(file: &File) -> Result<FILE_ID_INFO, PreviewFileError> {
     Ok(info)
 }
 
-fn query_final_path(file: &File) -> Result<PathBuf, PreviewFileError> {
+#[derive(Clone, Copy)]
+enum HandlePathKind {
+    Opened,
+    Normalized,
+}
+
+impl HandlePathKind {
+    const fn flags(self) -> windows::Win32::Storage::FileSystem::GETFINALPATHNAMEBYHANDLE_FLAGS {
+        match self {
+            Self::Opened => FILE_NAME_OPENED,
+            Self::Normalized => FILE_NAME_NORMALIZED,
+        }
+    }
+
+    const fn operation(self) -> &'static str {
+        match self {
+            Self::Opened => "query the opened file path",
+            Self::Normalized => "query the normalized file path",
+        }
+    }
+}
+
+fn query_handle_path(file: &File, kind: HandlePathKind) -> Result<PathBuf, PreviewFileError> {
     let mut capacity = INITIAL_FINAL_PATH_UNITS;
     loop {
         let mut units = vec![0_u16; capacity];
         // SAFETY: `units` is a live writable UTF-16 buffer. The handle stays open for the entire
-        // query and the flags request the normalized DOS-volume form.
-        let returned = unsafe {
-            GetFinalPathNameByHandleW(file_handle(file), &mut units, FILE_NAME_NORMALIZED)
-        };
+        // query and the selected flag requests one documented DOS-volume path form.
+        let returned =
+            unsafe { GetFinalPathNameByHandleW(file_handle(file), &mut units, kind.flags()) };
         if returned == 0 {
             return Err(PreviewFileError::Windows {
-                operation: "query the final file path",
+                operation: kind.operation(),
                 source: WindowsError::from_thread(),
             });
         }
@@ -237,6 +351,17 @@ fn null_terminated_path(path: &Path) -> Result<Vec<u16>, PreviewFileError> {
     Ok(units)
 }
 
+fn is_local_drive_path(units: &[u16]) -> bool {
+    is_drive_path(units) || is_extended_drive_path(units)
+}
+
+fn is_drive_path(units: &[u16]) -> bool {
+    units.len() >= 3
+        && is_ascii_letter(units[0])
+        && units[1] == b':' as u16
+        && matches!(units[2], 0x2f | 0x5c)
+}
+
 fn is_extended_drive_path(units: &[u16]) -> bool {
     units.len() >= 7
         && units[..4] == [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]
@@ -265,9 +390,14 @@ pub(super) enum PreviewFileError {
     },
     InvalidPath,
     PathTooLong(usize),
+    UnsupportedInputPath,
     NotDisk(u32),
+    RemoteProtocol,
     Directory,
     DeletePending,
+    Offline,
+    RecallOnOpen,
+    RecallOnDataAccess,
     InvalidFileSize(i64),
     UnsupportedFinalPath,
 }
@@ -278,8 +408,13 @@ impl PreviewFileError {
             self,
             Self::InvalidPath
                 | Self::PathTooLong(_)
+                | Self::UnsupportedInputPath
                 | Self::NotDisk(_)
+                | Self::RemoteProtocol
                 | Self::Directory
+                | Self::Offline
+                | Self::RecallOnOpen
+                | Self::RecallOnDataAccess
                 | Self::InvalidFileSize(_)
                 | Self::UnsupportedFinalPath
         )
@@ -294,9 +429,18 @@ impl fmt::Display for PreviewFileError {
             Self::PathTooLong(length) => {
                 write!(formatter, "preview path requires {length} UTF-16 units")
             }
+            Self::UnsupportedInputPath => {
+                write!(formatter, "preview path is not a local DOS drive path")
+            }
             Self::NotDisk(file_type) => write!(formatter, "preview handle type is {file_type}"),
+            Self::RemoteProtocol => write!(formatter, "preview file uses a remote protocol"),
             Self::Directory => write!(formatter, "preview target is a directory"),
             Self::DeletePending => write!(formatter, "preview target is pending deletion"),
+            Self::Offline => write!(formatter, "preview file data is offline"),
+            Self::RecallOnOpen => write!(formatter, "opening the preview file requires recall"),
+            Self::RecallOnDataAccess => {
+                write!(formatter, "reading the preview file requires recall")
+            }
             Self::InvalidFileSize(size) => {
                 write!(formatter, "preview file size is invalid ({size})")
             }
@@ -321,13 +465,21 @@ impl Error for PreviewFileError {
 
 #[cfg(test)]
 mod tests {
-    use super::{PreviewFile, PreviewFileError, is_extended_drive_path};
+    use super::{
+        PreviewFile, PreviewFileError, is_extended_drive_path, is_local_drive_path,
+        null_terminated_path, require_content_available,
+    };
     use std::{
         env, fs, io,
         os::windows::ffi::OsStringExt,
         path::{Path, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
     };
+    use windows::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
+        FILE_ATTRIBUTE_RECALL_ON_OPEN, FILE_ATTRIBUTE_REPARSE_POINT, SetFileAttributesW,
+    };
+    use windows::core::PCWSTR;
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 
@@ -342,6 +494,7 @@ mod tests {
         assert_ne!(file.snapshot().identity.file_id, [0; 16]);
         assert!(file.final_path().is_absolute());
         assert!(file.final_path().ends_with("配置.txt"));
+        assert!(!file.is_linked_content());
         assert!(file.is_unchanged().unwrap());
     }
 
@@ -392,6 +545,76 @@ mod tests {
             r"\Device\HarddiskVolume1\file"
         )));
         assert!(!is_extended_drive_path(&wide(r"C:\file.txt")));
+    }
+
+    #[test]
+    fn input_path_shape_rejects_unc_device_and_relative_names_before_open() {
+        assert!(is_local_drive_path(&wide(r"C:\file.txt")));
+        assert!(is_local_drive_path(&wide(r"d:/file.txt")));
+        assert!(is_local_drive_path(&wide(r"\\?\C:\file.txt")));
+        assert!(!is_local_drive_path(&wide(r"\\server\share\file.txt")));
+        assert!(!is_local_drive_path(&wide(r"\\?\UNC\server\file.txt")));
+        assert!(!is_local_drive_path(&wide(r"\\.\C:\file.txt")));
+        assert!(!is_local_drive_path(&wide(
+            r"\Device\HarddiskVolume1\file.txt"
+        )));
+        assert!(!is_local_drive_path(&wide(r"relative\file.txt")));
+
+        for path in [
+            r"\\server\share\file.txt",
+            r"\\?\UNC\server\share\file.txt",
+            r"\\.\C:\file.txt",
+            r"relative\file.txt",
+        ] {
+            assert!(matches!(
+                PreviewFile::open(Path::new(path)),
+                Err(PreviewFileError::UnsupportedInputPath)
+            ));
+        }
+    }
+
+    #[test]
+    fn offline_and_recall_attributes_fail_before_content_reads() {
+        assert!(matches!(
+            require_content_available(FILE_ATTRIBUTE_OFFLINE.0),
+            Err(PreviewFileError::Offline)
+        ));
+        assert!(matches!(
+            require_content_available(FILE_ATTRIBUTE_RECALL_ON_OPEN.0),
+            Err(PreviewFileError::RecallOnOpen)
+        ));
+        assert!(matches!(
+            require_content_available(FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS.0),
+            Err(PreviewFileError::RecallOnDataAccess)
+        ));
+        assert!(require_content_available(FILE_ATTRIBUTE_REPARSE_POINT.0).is_ok());
+    }
+
+    #[test]
+    fn an_offline_file_attribute_is_rejected_from_handle_metadata() {
+        let root = TestDirectory::new("offline");
+        let path = root.path().join("offline.txt");
+        fs::write(&path, b"must not be read").unwrap();
+        let units = null_terminated_path(&path).unwrap();
+        unsafe { SetFileAttributesW(PCWSTR(units.as_ptr()), FILE_ATTRIBUTE_OFFLINE) }
+            .expect("the disposable fixture should accept the offline attribute");
+
+        assert!(matches!(
+            PreviewFile::open(&path),
+            Err(PreviewFileError::Offline)
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires CURSORPEEK_MAPPED_REMOTE_FILE on a mapped network drive"]
+    fn mapped_remote_drive_handle_is_rejected_before_path_acceptance() {
+        let path = env::var_os("CURSORPEEK_MAPPED_REMOTE_FILE")
+            .map(PathBuf::from)
+            .expect("set CURSORPEEK_MAPPED_REMOTE_FILE to an existing mapped-drive file");
+        assert!(matches!(
+            PreviewFile::open(&path),
+            Err(PreviewFileError::RemoteProtocol)
+        ));
     }
 
     fn wide(value: &str) -> Vec<u16> {
