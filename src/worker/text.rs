@@ -1,6 +1,9 @@
 use std::path::Path;
 
-use super::file::{PreviewFile, PreviewFileError};
+use super::{
+    file::{PreviewFile, PreviewFileError},
+    payload::{MAX_TEXT_UTF8_LEN, TextPreview},
+};
 
 const TEXT_SNIFF_LIMIT: usize = 64 * 1024;
 const NULL_PATTERN_SAMPLE_LIMIT: usize = 4 * 1024;
@@ -82,25 +85,40 @@ const TEXT_NAMES: &[&str] = &[
     ".eslintignore",
 ];
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum TextClassification {
-    Text,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum UnicodeTextResult {
+    Preview(TextPreview),
+    LegacyCandidate,
     Unsupported,
 }
 
-pub(super) fn classify(file: &PreviewFile) -> Result<TextClassification, PreviewFileError> {
+pub(super) fn decode_unicode(file: &PreviewFile) -> Result<UnicodeTextResult, PreviewFileError> {
     if !is_eligible_path(file.final_path()) {
-        return Ok(TextClassification::Unsupported);
+        return Ok(UnicodeTextResult::Unsupported);
     }
 
     let bytes = file.read_prefix(TEXT_SNIFF_LIMIT)?;
     let prefix_truncated = file.file_size()
         > u64::try_from(bytes.len()).expect("the bounded text prefix length fits u64");
-    Ok(if classify_prefix(&bytes, prefix_truncated).is_some() {
-        TextClassification::Text
-    } else {
-        TextClassification::Unsupported
-    })
+    let Some(kind) = classify_prefix(&bytes, prefix_truncated) else {
+        return Ok(UnicodeTextResult::Unsupported);
+    };
+    if kind == TextByteKind::LegacyCandidate {
+        return Ok(UnicodeTextResult::LegacyCandidate);
+    }
+
+    let Some(decoded) = decode_unicode_bytes(&bytes, kind, prefix_truncated) else {
+        return Ok(UnicodeTextResult::Unsupported);
+    };
+    let (text, output_truncated) = truncate_utf8(decoded.text, MAX_TEXT_UTF8_LEN);
+    Ok(UnicodeTextResult::Preview(TextPreview {
+        file_size: file.file_size(),
+        linked_content: file.is_linked_content(),
+        encoding_was_guessed: false,
+        truncated: prefix_truncated || decoded.incomplete_tail || output_truncated,
+        encoding: decoded.encoding.to_owned(),
+        text,
+    }))
 }
 
 fn is_eligible_path(path: &Path) -> bool {
@@ -136,6 +154,12 @@ enum TextByteKind {
     Utf32LeLikely,
     Utf32BeLikely,
     LegacyCandidate,
+}
+
+struct DecodedUnicode {
+    text: String,
+    encoding: &'static str,
+    incomplete_tail: bool,
 }
 
 #[cfg(test)]
@@ -174,6 +198,153 @@ fn classify_prefix(bytes: &[u8], prefix_truncated: bool) -> Option<TextByteKind>
         Err(error) if prefix_truncated && error.error_len().is_none() => Some(TextByteKind::Utf8),
         Err(_) => Some(TextByteKind::LegacyCandidate),
     }
+}
+
+fn decode_unicode_bytes(
+    bytes: &[u8],
+    kind: TextByteKind,
+    prefix_truncated: bool,
+) -> Option<DecodedUnicode> {
+    let (text, encoding, incomplete_tail) = match kind {
+        TextByteKind::Utf8Bom => {
+            let (text, incomplete_tail) = decode_utf8(&bytes[3..], prefix_truncated)?;
+            (text, "UTF-8", incomplete_tail)
+        }
+        TextByteKind::Utf16LeBom => {
+            let (text, incomplete_tail) = decode_utf16(&bytes[2..], true, prefix_truncated)?;
+            (text, "UTF-16 LE", incomplete_tail)
+        }
+        TextByteKind::Utf16BeBom => {
+            let (text, incomplete_tail) = decode_utf16(&bytes[2..], false, prefix_truncated)?;
+            (text, "UTF-16 BE", incomplete_tail)
+        }
+        TextByteKind::Utf32LeBom => {
+            let (text, incomplete_tail) = decode_utf32(&bytes[4..], true, prefix_truncated)?;
+            (text, "UTF-32 LE", incomplete_tail)
+        }
+        TextByteKind::Utf32BeBom => {
+            let (text, incomplete_tail) = decode_utf32(&bytes[4..], false, prefix_truncated)?;
+            (text, "UTF-32 BE", incomplete_tail)
+        }
+        TextByteKind::Utf8 => {
+            let (text, incomplete_tail) = decode_utf8(bytes, prefix_truncated)?;
+            (text, "UTF-8", incomplete_tail)
+        }
+        TextByteKind::Utf16LeLikely => {
+            let (text, incomplete_tail) = decode_utf16(bytes, true, prefix_truncated)?;
+            (text, "UTF-16 LE", incomplete_tail)
+        }
+        TextByteKind::Utf16BeLikely => {
+            let (text, incomplete_tail) = decode_utf16(bytes, false, prefix_truncated)?;
+            (text, "UTF-16 BE", incomplete_tail)
+        }
+        TextByteKind::Utf32LeLikely => {
+            let (text, incomplete_tail) = decode_utf32(bytes, true, prefix_truncated)?;
+            (text, "UTF-32 LE", incomplete_tail)
+        }
+        TextByteKind::Utf32BeLikely => {
+            let (text, incomplete_tail) = decode_utf32(bytes, false, prefix_truncated)?;
+            (text, "UTF-32 BE", incomplete_tail)
+        }
+        TextByteKind::LegacyCandidate => return None,
+    };
+
+    Some(DecodedUnicode {
+        text,
+        encoding,
+        incomplete_tail,
+    })
+}
+
+fn decode_utf8(bytes: &[u8], prefix_truncated: bool) -> Option<(String, bool)> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Some((text.to_owned(), false)),
+        Err(error) if prefix_truncated && error.error_len().is_none() => {
+            let text = std::str::from_utf8(&bytes[..error.valid_up_to()])
+                .expect("the UTF-8 validator reports a valid prefix");
+            Some((text.to_owned(), true))
+        }
+        Err(_) => None,
+    }
+}
+
+fn decode_utf16(
+    bytes: &[u8],
+    little_endian: bool,
+    prefix_truncated: bool,
+) -> Option<(String, bool)> {
+    let mut usable_len = bytes.len();
+    let mut incomplete_tail = false;
+    if !usable_len.is_multiple_of(2) {
+        if !prefix_truncated {
+            return None;
+        }
+        usable_len -= 1;
+        incomplete_tail = true;
+    }
+
+    let mut units = bytes[..usable_len]
+        .chunks_exact(2)
+        .map(|pair| {
+            if little_endian {
+                u16::from_le_bytes([pair[0], pair[1]])
+            } else {
+                u16::from_be_bytes([pair[0], pair[1]])
+            }
+        })
+        .collect::<Vec<_>>();
+    if prefix_truncated
+        && units
+            .last()
+            .is_some_and(|unit| (0xd800..=0xdbff).contains(unit))
+    {
+        units.pop();
+        incomplete_tail = true;
+    }
+
+    let text = char::decode_utf16(units)
+        .collect::<Result<String, _>>()
+        .ok()?;
+    Some((text, incomplete_tail))
+}
+
+fn decode_utf32(
+    bytes: &[u8],
+    little_endian: bool,
+    prefix_truncated: bool,
+) -> Option<(String, bool)> {
+    let mut usable_len = bytes.len();
+    let remainder = usable_len % 4;
+    if remainder != 0 {
+        if !prefix_truncated {
+            return None;
+        }
+        usable_len -= remainder;
+    }
+
+    let mut text = String::with_capacity(usable_len);
+    for quad in bytes[..usable_len].chunks_exact(4) {
+        let value = if little_endian {
+            u32::from_le_bytes([quad[0], quad[1], quad[2], quad[3]])
+        } else {
+            u32::from_be_bytes([quad[0], quad[1], quad[2], quad[3]])
+        };
+        text.push(char::from_u32(value)?);
+    }
+    Some((text, remainder != 0))
+}
+
+fn truncate_utf8(mut text: String, max_bytes: usize) -> (String, bool) {
+    if text.len() <= max_bytes {
+        return (text, false);
+    }
+
+    let mut boundary = max_bytes;
+    while !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    text.truncate(boundary);
+    (text, true)
 }
 
 fn has_known_binary_signature(bytes: &[u8]) -> bool {
@@ -263,8 +434,8 @@ const fn at_least(count: usize, total: usize, numerator: usize, denominator: usi
 #[cfg(test)]
 mod tests {
     use super::{
-        TEXT_EXTENSIONS, TEXT_NAMES, TextByteKind, TextClassification, classify, classify_bytes,
-        classify_prefix, is_eligible_path,
+        TEXT_EXTENSIONS, TEXT_NAMES, TextByteKind, UnicodeTextResult, classify_bytes,
+        classify_prefix, decode_unicode, decode_unicode_bytes, is_eligible_path, truncate_utf8,
     };
     use crate::worker::file::PreviewFile;
     use std::{
@@ -371,22 +542,100 @@ mod tests {
     }
 
     #[test]
-    fn classifier_reads_only_eligible_files_and_rejects_disguised_binary() {
+    fn decoder_reads_only_eligible_files_and_rejects_disguised_binary() {
         let root = TestDirectory::new("classify");
         let text_path = root.path().join("large.txt");
         fs::write(&text_path, vec![b'a'; 80 * 1024]).unwrap();
         let text = PreviewFile::open(&text_path).unwrap();
-        assert_eq!(classify(&text).unwrap(), TextClassification::Text);
+        let UnicodeTextResult::Preview(preview) = decode_unicode(&text).unwrap() else {
+            panic!("the bounded UTF-8 file should produce a preview");
+        };
+        assert_eq!(preview.text, "a".repeat(64 * 1024));
+        assert_eq!(preview.encoding, "UTF-8");
+        assert_eq!(preview.file_size, 80 * 1024);
+        assert!(preview.truncated);
+        assert!(!preview.encoding_was_guessed);
 
         let binary_path = root.path().join("disguised.txt");
         fs::write(&binary_path, b"\x89PNG\r\n\x1a\npayload").unwrap();
         let binary = PreviewFile::open(&binary_path).unwrap();
-        assert_eq!(classify(&binary).unwrap(), TextClassification::Unsupported);
+        assert_eq!(
+            decode_unicode(&binary).unwrap(),
+            UnicodeTextResult::Unsupported
+        );
 
         let image_path = root.path().join("image.png");
         fs::write(&image_path, b"not read by the text classifier").unwrap();
         let image = PreviewFile::open(&image_path).unwrap();
-        assert_eq!(classify(&image).unwrap(), TextClassification::Unsupported);
+        assert_eq!(
+            decode_unicode(&image).unwrap(),
+            UnicodeTextResult::Unsupported
+        );
+    }
+
+    #[test]
+    fn unicode_boms_take_precedence_and_are_not_displayed() {
+        for (bytes, kind, encoding) in [
+            (
+                &b"\xff\xfe\x00\x00A\x00\x00\x00"[..],
+                TextByteKind::Utf32LeBom,
+                "UTF-32 LE",
+            ),
+            (
+                &b"\x00\x00\xfe\xff\x00\x00\x00A"[..],
+                TextByteKind::Utf32BeBom,
+                "UTF-32 BE",
+            ),
+            (&b"\xef\xbb\xbfA"[..], TextByteKind::Utf8Bom, "UTF-8"),
+            (&b"\xff\xfeA\x00"[..], TextByteKind::Utf16LeBom, "UTF-16 LE"),
+            (&b"\xfe\xff\x00A"[..], TextByteKind::Utf16BeBom, "UTF-16 BE"),
+        ] {
+            let decoded = decode_unicode_bytes(bytes, kind, false).unwrap();
+            assert_eq!(decoded.text, "A");
+            assert_eq!(decoded.encoding, encoding);
+            assert!(!decoded.incomplete_tail);
+        }
+    }
+
+    #[test]
+    fn unicode_decoding_is_strict_except_for_an_incomplete_bounded_tail() {
+        let decoded = decode_unicode_bytes(b"prefix \xe2\x82", TextByteKind::Utf8, true).unwrap();
+        assert_eq!(decoded.text, "prefix ");
+        assert!(decoded.incomplete_tail);
+        assert!(
+            decode_unicode_bytes(b"\xff", TextByteKind::Utf8, false).is_none(),
+            "malformed complete UTF-8 must fail closed"
+        );
+
+        let decoded =
+            decode_unicode_bytes(b"A\x00=\xd8", TextByteKind::Utf16LeLikely, true).unwrap();
+        assert_eq!(decoded.text, "A");
+        assert!(decoded.incomplete_tail);
+        assert!(decode_unicode_bytes(b"A\x00=\xd8", TextByteKind::Utf16LeLikely, false).is_none());
+
+        let decoded =
+            decode_unicode_bytes(b"\x00\x00\x00A\x00\x00", TextByteKind::Utf32BeLikely, true)
+                .unwrap();
+        assert_eq!(decoded.text, "A");
+        assert!(decoded.incomplete_tail);
+        assert!(
+            decode_unicode_bytes(b"\x00\x00\x00A\x00\x00", TextByteKind::Utf32BeLikely, false)
+                .is_none()
+        );
+        assert!(
+            decode_unicode_bytes(b"\x00\x00\x11\x00", TextByteKind::Utf32LeLikely, false).is_none(),
+            "out-of-range Unicode scalars must fail closed"
+        );
+    }
+
+    #[test]
+    fn utf8_output_truncation_preserves_scalar_boundaries() {
+        let (text, truncated) = truncate_utf8("ab世cd".to_owned(), 4);
+        assert_eq!(text, "ab");
+        assert!(truncated);
+        let (text, truncated) = truncate_utf8("世界".to_owned(), 6);
+        assert_eq!(text, "世界");
+        assert!(!truncated);
     }
 
     struct TestDirectory(PathBuf);

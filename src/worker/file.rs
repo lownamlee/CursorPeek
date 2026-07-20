@@ -160,8 +160,7 @@ impl PreviewFile {
         self.snapshot
     }
 
-    #[cfg(test)]
-    fn is_linked_content(&self) -> bool {
+    pub(super) fn is_linked_content(&self) -> bool {
         self.opened_path != self.final_path
     }
 }

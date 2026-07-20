@@ -14,7 +14,7 @@ use crate::resolver::{PointResolver, ResolveOutcome};
 use file::PreviewFile;
 use payload::{PreviewResult, ResolverStatus};
 use protocol::{ProtocolStreamError, WorkerMessage};
-use text::TextClassification;
+use text::UnicodeTextResult;
 
 pub(crate) use manager::{
     CompletionNotifier, PendingWorkerPoll, PendingWorkerResolution, WorkerManager,
@@ -49,20 +49,27 @@ where
 }
 
 fn resolver_result(outcome: ResolveOutcome) -> PreviewResult {
-    PreviewResult::Status(match outcome {
+    match outcome {
         ResolveOutcome::Resolved(target) => match PreviewFile::open(target.path()) {
-            Ok(file) => match text::classify(&file) {
-                Ok(TextClassification::Text) => ResolverStatus::Resolved,
-                Ok(TextClassification::Unsupported) => ResolverStatus::Unsupported,
-                Err(_) => ResolverStatus::Unavailable,
+            Ok(file) => match text::decode_unicode(&file) {
+                Ok(UnicodeTextResult::Preview(preview)) => PreviewResult::Text(preview),
+                Ok(UnicodeTextResult::LegacyCandidate) => {
+                    PreviewResult::Status(ResolverStatus::Resolved)
+                }
+                Ok(UnicodeTextResult::Unsupported) => {
+                    PreviewResult::Status(ResolverStatus::Unsupported)
+                }
+                Err(_) => PreviewResult::Status(ResolverStatus::Unavailable),
             },
-            Err(error) if error.is_unsupported() => ResolverStatus::Unsupported,
-            Err(_) => ResolverStatus::Unavailable,
+            Err(error) if error.is_unsupported() => {
+                PreviewResult::Status(ResolverStatus::Unsupported)
+            }
+            Err(_) => PreviewResult::Status(ResolverStatus::Unavailable),
         },
-        ResolveOutcome::Unsupported => ResolverStatus::Unsupported,
-        ResolveOutcome::Ambiguous => ResolverStatus::Ambiguous,
-        ResolveOutcome::Unavailable => ResolverStatus::Unavailable,
-    })
+        ResolveOutcome::Unsupported => PreviewResult::Status(ResolverStatus::Unsupported),
+        ResolveOutcome::Ambiguous => PreviewResult::Status(ResolverStatus::Ambiguous),
+        ResolveOutcome::Unavailable => PreviewResult::Status(ResolverStatus::Unavailable),
+    }
 }
 
 #[derive(Debug)]
@@ -136,10 +143,17 @@ mod tests {
             NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed)
         ));
         fs::write(&path, b"preview").expect("the resolved fixture should be written");
-        assert_eq!(
-            resolver_result(ResolveOutcome::Resolved(ResolvedTarget::new(path.clone()))),
-            PreviewResult::Status(ResolverStatus::Resolved)
-        );
+        let PreviewResult::Text(preview) =
+            resolver_result(ResolveOutcome::Resolved(ResolvedTarget::new(path.clone())))
+        else {
+            panic!("the resolved UTF-8 fixture should produce a text preview");
+        };
+        assert_eq!(preview.text, "preview");
+        assert_eq!(preview.encoding, "UTF-8");
+        assert_eq!(preview.file_size, 7);
+        assert!(!preview.linked_content);
+        assert!(!preview.encoding_was_guessed);
+        assert!(!preview.truncated);
         fs::remove_file(&path).expect("the resolved fixture should be removed");
         assert_eq!(
             resolver_result(ResolveOutcome::Resolved(ResolvedTarget::new(path))),
