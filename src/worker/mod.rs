@@ -1,4 +1,6 @@
+mod file;
 mod manager;
+mod payload;
 mod protocol;
 
 use std::{
@@ -8,7 +10,9 @@ use std::{
 };
 
 use crate::resolver::{PointResolver, ResolveOutcome};
-use protocol::{ProtocolStreamError, ResolverStatus, WorkerMessage};
+use file::PreviewFile;
+use payload::{PreviewResult, ResolverStatus};
+use protocol::{ProtocolStreamError, WorkerMessage};
 
 pub(crate) use manager::{
     CompletionNotifier, PendingWorkerPoll, PendingWorkerResolution, WorkerManager,
@@ -37,21 +41,25 @@ where
             Some(_) => return Err(WorkerSessionError::ExpectedResolvePoint),
             None => return Ok(()),
         };
-        let status = resolver_status(resolver.resolve(point));
-        protocol::write_message(writer, WorkerMessage::ResolverResult { generation, status })?;
+        let result = resolver_result(resolver.resolve(point));
+        protocol::write_message(writer, WorkerMessage::PreviewResult { generation, result })?;
     }
 }
 
-fn resolver_status(outcome: ResolveOutcome) -> ResolverStatus {
-    match outcome {
-        ResolveOutcome::Resolved(target) => {
-            debug_assert!(target.path().is_absolute());
-            ResolverStatus::Resolved
-        }
+fn resolver_result(outcome: ResolveOutcome) -> PreviewResult {
+    PreviewResult::Status(match outcome {
+        ResolveOutcome::Resolved(target) => match PreviewFile::open(target.path()) {
+            Ok(file) => match file.is_unchanged() {
+                Ok(true) => ResolverStatus::Resolved,
+                Ok(false) | Err(_) => ResolverStatus::Unavailable,
+            },
+            Err(error) if error.is_unsupported() => ResolverStatus::Unsupported,
+            Err(_) => ResolverStatus::Unavailable,
+        },
         ResolveOutcome::Unsupported => ResolverStatus::Unsupported,
         ResolveOutcome::Ambiguous => ResolverStatus::Ambiguous,
         ResolveOutcome::Unavailable => ResolverStatus::Unavailable,
-    }
+    })
 }
 
 #[derive(Debug)]
@@ -92,16 +100,22 @@ impl From<ProtocolStreamError> for WorkerSessionError {
 
 #[cfg(test)]
 mod tests {
-    use super::{WorkerSessionError, protocol, resolver_status, run_session};
+    use super::{WorkerSessionError, protocol, resolver_result, run_session};
     use crate::hover::{Generation, PhysicalScreenPoint};
     use crate::resolver::{PointResolver, ResolveOutcome, ResolvedTarget};
-    use protocol::{ResolverStatus, SessionNonce, WorkerMessage};
-    use std::{io::Cursor, path::PathBuf};
+    use crate::worker::payload::{PreviewResult, ResolverStatus};
+    use protocol::{SessionNonce, WorkerMessage};
+    use std::{
+        env, fs,
+        io::Cursor,
+        sync::atomic::{AtomicU64, Ordering},
+    };
 
     const NONCE: SessionNonce = SessionNonce::from_bytes([
         0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe, 0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23,
         0x01,
     ]);
+    static NEXT_TEST_FILE: AtomicU64 = AtomicU64::new(1);
 
     struct UnavailableResolver;
 
@@ -112,24 +126,33 @@ mod tests {
     }
 
     #[test]
-    fn resolver_outcomes_map_to_the_existing_typed_statuses() {
+    fn resolver_outcomes_map_to_typed_preview_statuses() {
+        let path = env::temp_dir().join(format!(
+            "cursorpeek-resolved-target-{}-{}",
+            std::process::id(),
+            NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&path, b"preview").expect("the resolved fixture should be written");
         assert_eq!(
-            resolver_status(ResolveOutcome::Resolved(ResolvedTarget::new(
-                PathBuf::from(r"C:\preview.txt")
-            ))),
-            ResolverStatus::Resolved
+            resolver_result(ResolveOutcome::Resolved(ResolvedTarget::new(path.clone()))),
+            PreviewResult::Status(ResolverStatus::Resolved)
+        );
+        fs::remove_file(&path).expect("the resolved fixture should be removed");
+        assert_eq!(
+            resolver_result(ResolveOutcome::Resolved(ResolvedTarget::new(path))),
+            PreviewResult::Status(ResolverStatus::Unavailable)
         );
         assert_eq!(
-            resolver_status(ResolveOutcome::Unsupported),
-            ResolverStatus::Unsupported
+            resolver_result(ResolveOutcome::Unsupported),
+            PreviewResult::Status(ResolverStatus::Unsupported)
         );
         assert_eq!(
-            resolver_status(ResolveOutcome::Ambiguous),
-            ResolverStatus::Ambiguous
+            resolver_result(ResolveOutcome::Ambiguous),
+            PreviewResult::Status(ResolverStatus::Ambiguous)
         );
         assert_eq!(
-            resolver_status(ResolveOutcome::Unavailable),
-            ResolverStatus::Unavailable
+            resolver_result(ResolveOutcome::Unavailable),
+            PreviewResult::Status(ResolverStatus::Unavailable)
         );
     }
 
@@ -165,9 +188,9 @@ mod tests {
         for generation in generations {
             assert_eq!(
                 protocol::read_message(&mut output).unwrap(),
-                Some(WorkerMessage::ResolverResult {
+                Some(WorkerMessage::PreviewResult {
                     generation,
-                    status: ResolverStatus::Unavailable,
+                    result: PreviewResult::Status(ResolverStatus::Unavailable),
                 })
             );
         }
@@ -185,9 +208,9 @@ mod tests {
         let mut wrong_first = Vec::new();
         protocol::write_message(
             &mut wrong_first,
-            WorkerMessage::ResolverResult {
+            WorkerMessage::PreviewResult {
                 generation: Generation::from_raw(1),
-                status: ResolverStatus::Unavailable,
+                result: PreviewResult::Status(ResolverStatus::Unavailable),
             },
         )
         .unwrap();

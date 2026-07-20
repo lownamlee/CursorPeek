@@ -6,13 +6,15 @@ use std::{
 
 use crate::hover::{Generation, PhysicalScreenPoint};
 
+use super::payload::{
+    MAX_PREVIEW_PAYLOAD_LEN, MIN_PREVIEW_RESULT_LEN, PayloadError, PreviewResult, decode_result,
+    encode_result,
+};
+
 const MAGIC: [u8; 4] = *b"CPWK";
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 const HEADER_LEN: usize = 24;
 const NONCE_LEN: usize = 16;
-const MAX_CONTROL_PAYLOAD_LEN: usize = NONCE_LEN;
-const MAX_CONTROL_FRAME_LEN: usize = HEADER_LEN + MAX_CONTROL_PAYLOAD_LEN;
-const MAX_PREVIEW_PAYLOAD_LEN: u32 = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SessionNonce([u8; NONCE_LEN]);
@@ -23,29 +25,7 @@ impl SessionNonce {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ResolverStatus {
-    Resolved = 0,
-    Unsupported = 1,
-    Ambiguous = 2,
-    Unavailable = 3,
-    TimedOut = 4,
-}
-
-impl ResolverStatus {
-    fn from_raw(value: u32) -> Result<Self, ProtocolError> {
-        match value {
-            0 => Ok(Self::Resolved),
-            1 => Ok(Self::Unsupported),
-            2 => Ok(Self::Ambiguous),
-            3 => Ok(Self::Unavailable),
-            4 => Ok(Self::TimedOut),
-            _ => Err(ProtocolError::UnknownResolverStatus(value)),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum WorkerMessage {
     Hello {
         nonce: SessionNonce,
@@ -57,27 +37,27 @@ pub(super) enum WorkerMessage {
         generation: Generation,
         point: PhysicalScreenPoint,
     },
-    ResolverResult {
+    PreviewResult {
         generation: Generation,
-        status: ResolverStatus,
+        result: PreviewResult,
     },
 }
 
 impl WorkerMessage {
-    fn kind(self) -> MessageKind {
+    fn kind(&self) -> MessageKind {
         match self {
             Self::Hello { .. } => MessageKind::Hello,
             Self::Ready { .. } => MessageKind::Ready,
             Self::ResolvePoint { .. } => MessageKind::ResolvePoint,
-            Self::ResolverResult { .. } => MessageKind::ResolverResult,
+            Self::PreviewResult { .. } => MessageKind::PreviewResult,
         }
     }
 
-    fn generation(self) -> Generation {
+    fn generation(&self) -> Generation {
         match self {
             Self::Hello { .. } | Self::Ready { .. } => Generation::from_raw(0),
-            Self::ResolvePoint { generation, .. } | Self::ResolverResult { generation, .. } => {
-                generation
+            Self::ResolvePoint { generation, .. } | Self::PreviewResult { generation, .. } => {
+                *generation
             }
         }
     }
@@ -88,7 +68,7 @@ enum MessageKind {
     Hello = 1,
     Ready = 2,
     ResolvePoint = 3,
-    ResolverResult = 4,
+    PreviewResult = 4,
 }
 
 impl MessageKind {
@@ -97,16 +77,16 @@ impl MessageKind {
             1 => Ok(Self::Hello),
             2 => Ok(Self::Ready),
             3 => Ok(Self::ResolvePoint),
-            4 => Ok(Self::ResolverResult),
+            4 => Ok(Self::PreviewResult),
             _ => Err(ProtocolError::UnknownMessageKind(value)),
         }
     }
 
-    fn payload_len(self) -> usize {
+    fn payload_limits(self) -> (usize, usize) {
         match self {
-            Self::Hello | Self::Ready => NONCE_LEN,
-            Self::ResolvePoint => 8,
-            Self::ResolverResult => 4,
+            Self::Hello | Self::Ready => (NONCE_LEN, NONCE_LEN),
+            Self::ResolvePoint => (8, 8),
+            Self::PreviewResult => (MIN_PREVIEW_RESULT_LEN, MAX_PREVIEW_PAYLOAD_LEN),
         }
     }
 
@@ -135,7 +115,7 @@ impl FrameHeader {
 
         let kind = MessageKind::from_raw(u16::from_le_bytes([bytes[6], bytes[7]]))?;
         let payload_len = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-        if payload_len > MAX_PREVIEW_PAYLOAD_LEN {
+        if payload_len > MAX_PREVIEW_PAYLOAD_LEN as u32 {
             return Err(ProtocolError::PayloadTooLarge(payload_len));
         }
 
@@ -152,10 +132,11 @@ impl FrameHeader {
         }
 
         let payload_len = payload_len as usize;
-        let expected = kind.payload_len();
-        if payload_len != expected {
+        let (minimum, maximum) = kind.payload_limits();
+        if !(minimum..=maximum).contains(&payload_len) {
             return Err(ProtocolError::InvalidPayloadLength {
-                expected,
+                minimum,
+                maximum,
                 actual: payload_len,
             });
         }
@@ -170,21 +151,32 @@ impl FrameHeader {
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum ProtocolError {
-    TruncatedHeader { actual: usize },
+    #[cfg(test)]
+    TruncatedHeader {
+        actual: usize,
+    },
     InvalidMagic,
     UnsupportedVersion(u16),
     UnknownMessageKind(u16),
     PayloadTooLarge(u32),
     ReservedFieldSet(u32),
     HandshakeGeneration(u64),
-    InvalidPayloadLength { expected: usize, actual: usize },
-    FrameLengthMismatch { expected: usize, actual: usize },
-    UnknownResolverStatus(u32),
+    InvalidPayloadLength {
+        minimum: usize,
+        maximum: usize,
+        actual: usize,
+    },
+    FrameLengthMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    Payload(PayloadError),
 }
 
 impl fmt::Display for ProtocolError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            #[cfg(test)]
             Self::TruncatedHeader { actual } => {
                 write!(
                     formatter,
@@ -216,22 +208,46 @@ impl fmt::Display for ProtocolError {
                     "handshake frame has generation {generation}, expected zero"
                 )
             }
-            Self::InvalidPayloadLength { expected, actual } => write!(
+            Self::InvalidPayloadLength {
+                minimum,
+                maximum,
+                actual,
+            } if minimum == maximum => write!(
                 formatter,
-                "invalid control payload length: expected {expected} bytes, received {actual}"
+                "invalid worker payload length: expected {minimum} bytes, received {actual}"
+            ),
+            Self::InvalidPayloadLength {
+                minimum,
+                maximum,
+                actual,
+            } => write!(
+                formatter,
+                "invalid worker payload length: expected {minimum}-{maximum} bytes, \
+                 received {actual}"
             ),
             Self::FrameLengthMismatch { expected, actual } => write!(
                 formatter,
                 "worker frame length mismatch: expected {expected} bytes, received {actual}"
             ),
-            Self::UnknownResolverStatus(status) => {
-                write!(formatter, "unknown resolver status {status}")
-            }
+            Self::Payload(error) => write!(formatter, "invalid preview payload: {error}"),
         }
     }
 }
 
-impl Error for ProtocolError {}
+impl Error for ProtocolError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Payload(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<PayloadError> for ProtocolError {
+    fn from(error: PayloadError) -> Self {
+        Self::Payload(error)
+    }
+}
 
 #[derive(Debug)]
 pub(crate) enum ProtocolStreamError {
@@ -276,20 +292,17 @@ impl From<ProtocolError> for ProtocolStreamError {
 pub(super) fn read_message<R: Read>(
     reader: &mut R,
 ) -> Result<Option<WorkerMessage>, ProtocolStreamError> {
-    let mut frame = [0_u8; MAX_CONTROL_FRAME_LEN];
-    if !read_first_byte(reader, &mut frame[0])? {
+    let mut header_bytes = [0_u8; HEADER_LEN];
+    if !read_first_byte(reader, &mut header_bytes[0])? {
         return Ok(None);
     }
-    read_exact_frame(reader, &mut frame[1..HEADER_LEN])?;
+    read_exact_frame(reader, &mut header_bytes[1..])?;
 
-    let header_bytes: &[u8; HEADER_LEN] = (&frame[..HEADER_LEN])
-        .try_into()
-        .expect("the header slice has the fixed header length");
-    let header = FrameHeader::decode(header_bytes)?;
-    let frame_len = HEADER_LEN + header.payload_len;
-    read_exact_frame(reader, &mut frame[HEADER_LEN..frame_len])?;
+    let header = FrameHeader::decode(&header_bytes)?;
+    let mut payload = vec![0_u8; header.payload_len];
+    read_exact_frame(reader, &mut payload)?;
 
-    decode_frame(&frame[..frame_len])
+    decode_payload(header, &payload)
         .map(Some)
         .map_err(Into::into)
 }
@@ -298,7 +311,7 @@ pub(super) fn write_message<W: Write>(
     writer: &mut W,
     message: WorkerMessage,
 ) -> Result<(), ProtocolStreamError> {
-    let encoded = encode_message(message);
+    let encoded = encode_message(message)?;
     writer
         .write_all(encoded.as_bytes())
         .map_err(ProtocolStreamError::Io)?;
@@ -327,67 +340,58 @@ fn read_exact_frame<R: Read>(reader: &mut R, buffer: &mut [u8]) -> Result<(), Pr
     }
 }
 
-#[derive(Clone, Copy)]
 struct EncodedMessage {
-    bytes: [u8; MAX_CONTROL_FRAME_LEN],
-    len: usize,
+    bytes: Vec<u8>,
 }
 
 impl EncodedMessage {
     fn as_bytes(&self) -> &[u8] {
-        &self.bytes[..self.len]
+        &self.bytes
     }
 }
 
-fn encode_message(message: WorkerMessage) -> EncodedMessage {
+fn encode_message(message: WorkerMessage) -> Result<EncodedMessage, ProtocolError> {
     let kind = message.kind();
-    let payload_len = kind.payload_len();
-    let mut bytes = [0_u8; MAX_CONTROL_FRAME_LEN];
-
-    bytes[..4].copy_from_slice(&MAGIC);
-    bytes[4..6].copy_from_slice(&VERSION.to_le_bytes());
-    bytes[6..8].copy_from_slice(&(kind as u16).to_le_bytes());
-    bytes[8..12].copy_from_slice(&(payload_len as u32).to_le_bytes());
-    bytes[16..24].copy_from_slice(&message.generation().get().to_le_bytes());
-
-    match message {
-        WorkerMessage::Hello { nonce } | WorkerMessage::Ready { nonce } => {
-            bytes[HEADER_LEN..HEADER_LEN + NONCE_LEN].copy_from_slice(&nonce.0);
-        }
+    let generation = message.generation();
+    let payload = match message {
+        WorkerMessage::Hello { nonce } | WorkerMessage::Ready { nonce } => nonce.0.to_vec(),
         WorkerMessage::ResolvePoint { point, .. } => {
-            bytes[HEADER_LEN..HEADER_LEN + 4].copy_from_slice(&point.x.to_le_bytes());
-            bytes[HEADER_LEN + 4..HEADER_LEN + 8].copy_from_slice(&point.y.to_le_bytes());
+            let mut payload = Vec::with_capacity(8);
+            payload.extend_from_slice(&point.x.to_le_bytes());
+            payload.extend_from_slice(&point.y.to_le_bytes());
+            payload
         }
-        WorkerMessage::ResolverResult { status, .. } => {
-            bytes[HEADER_LEN..HEADER_LEN + 4].copy_from_slice(&(status as u32).to_le_bytes());
-        }
-    }
-
-    EncodedMessage {
-        bytes,
-        len: HEADER_LEN + payload_len,
-    }
-}
-
-fn decode_frame(bytes: &[u8]) -> Result<WorkerMessage, ProtocolError> {
-    if bytes.len() < HEADER_LEN {
-        return Err(ProtocolError::TruncatedHeader {
-            actual: bytes.len(),
-        });
-    }
+        WorkerMessage::PreviewResult { result, .. } => encode_result(&result)?,
+    };
+    let payload_len =
+        u32::try_from(payload.len()).map_err(|_| ProtocolError::PayloadTooLarge(u32::MAX))?;
+    let mut bytes = Vec::with_capacity(
+        HEADER_LEN
+            .checked_add(payload.len())
+            .expect("the bounded payload length fits usize"),
+    );
+    bytes.extend_from_slice(&MAGIC);
+    bytes.extend_from_slice(&VERSION.to_le_bytes());
+    bytes.extend_from_slice(&(kind as u16).to_le_bytes());
+    bytes.extend_from_slice(&payload_len.to_le_bytes());
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    bytes.extend_from_slice(&generation.get().to_le_bytes());
+    bytes.extend_from_slice(&payload);
 
     let header_bytes: &[u8; HEADER_LEN] = bytes[..HEADER_LEN]
         .try_into()
-        .expect("the length check guarantees a complete fixed header");
-    let header = FrameHeader::decode(header_bytes)?;
-    let expected_len = HEADER_LEN + header.payload_len;
-    if bytes.len() != expected_len {
+        .expect("the encoder always emits a complete fixed header");
+    FrameHeader::decode(header_bytes)?;
+    Ok(EncodedMessage { bytes })
+}
+
+fn decode_payload(header: FrameHeader, payload: &[u8]) -> Result<WorkerMessage, ProtocolError> {
+    if payload.len() != header.payload_len {
         return Err(ProtocolError::FrameLengthMismatch {
-            expected: expected_len,
-            actual: bytes.len(),
+            expected: HEADER_LEN + header.payload_len,
+            actual: HEADER_LEN + payload.len(),
         });
     }
-    let payload = &bytes[HEADER_LEN..];
 
     match header.kind {
         MessageKind::Hello | MessageKind::Ready => {
@@ -407,22 +411,43 @@ fn decode_frame(bytes: &[u8]) -> Result<WorkerMessage, ProtocolError> {
                 i32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]),
             ),
         }),
-        MessageKind::ResolverResult => Ok(WorkerMessage::ResolverResult {
+        MessageKind::PreviewResult => Ok(WorkerMessage::PreviewResult {
             generation: header.generation,
-            status: ResolverStatus::from_raw(u32::from_le_bytes([
-                payload[0], payload[1], payload[2], payload[3],
-            ]))?,
+            result: decode_result(payload)?,
         }),
     }
 }
 
 #[cfg(test)]
+fn decode_frame(bytes: &[u8]) -> Result<WorkerMessage, ProtocolError> {
+    if bytes.len() < HEADER_LEN {
+        return Err(ProtocolError::TruncatedHeader {
+            actual: bytes.len(),
+        });
+    }
+
+    let header_bytes: &[u8; HEADER_LEN] = bytes[..HEADER_LEN]
+        .try_into()
+        .expect("the length check guarantees a complete fixed header");
+    let header = FrameHeader::decode(header_bytes)?;
+    let expected_len = HEADER_LEN + header.payload_len;
+    if bytes.len() != expected_len {
+        return Err(ProtocolError::FrameLengthMismatch {
+            expected: expected_len,
+            actual: bytes.len(),
+        });
+    }
+    decode_payload(header, &bytes[HEADER_LEN..])
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
-        HEADER_LEN, MAGIC, ProtocolError, ProtocolStreamError, ResolverStatus, SessionNonce,
-        VERSION, WorkerMessage, decode_frame, encode_message, read_message, write_message,
+        HEADER_LEN, MAGIC, ProtocolError, ProtocolStreamError, SessionNonce, VERSION,
+        WorkerMessage, decode_frame, encode_message, read_message, write_message,
     };
     use crate::hover::{Generation, PhysicalScreenPoint};
+    use crate::worker::payload::{PayloadError, PreviewResult, ResolverStatus, TextPreview};
     use std::io::{self, ErrorKind, Read, Write};
 
     const NONCE: SessionNonce = SessionNonce::from_bytes([
@@ -430,31 +455,35 @@ mod tests {
         0xff,
     ]);
 
-    fn messages() -> [WorkerMessage; 4] {
-        [
+    fn messages() -> Vec<WorkerMessage> {
+        vec![
             WorkerMessage::Hello { nonce: NONCE },
             WorkerMessage::Ready { nonce: NONCE },
-            WorkerMessage::ResolvePoint {
-                generation: Generation::from_raw(0x0102_0304_0506_0708),
-                point: PhysicalScreenPoint::new(-2, 0x0102_0304),
-            },
-            WorkerMessage::ResolverResult {
+            request_message(),
+            WorkerMessage::PreviewResult {
                 generation: Generation::from_raw(u64::MAX),
-                status: ResolverStatus::TimedOut,
+                result: PreviewResult::Status(ResolverStatus::TimedOut),
             },
         ]
+    }
+
+    fn request_message() -> WorkerMessage {
+        WorkerMessage::ResolvePoint {
+            generation: Generation::from_raw(0x0102_0304_0506_0708),
+            point: PhysicalScreenPoint::new(-2, 0x0102_0304),
+        }
     }
 
     #[test]
     fn every_control_message_round_trips() {
         for message in messages() {
-            let encoded = encode_message(message);
+            let encoded = encode_message(message.clone()).unwrap();
             assert_eq!(decode_frame(encoded.as_bytes()), Ok(message));
         }
     }
 
     #[test]
-    fn every_resolver_status_round_trips_without_payload_growth() {
+    fn every_resolver_status_round_trips_in_the_typed_result_envelope() {
         for status in [
             ResolverStatus::Resolved,
             ResolverStatus::Unsupported,
@@ -462,20 +491,20 @@ mod tests {
             ResolverStatus::Unavailable,
             ResolverStatus::TimedOut,
         ] {
-            let message = WorkerMessage::ResolverResult {
+            let message = WorkerMessage::PreviewResult {
                 generation: Generation::from_raw(9),
-                status,
+                result: PreviewResult::Status(status),
             };
-            let encoded = encode_message(message);
+            let encoded = encode_message(message.clone()).unwrap();
 
-            assert_eq!(encoded.as_bytes().len(), HEADER_LEN + 4);
+            assert_eq!(encoded.as_bytes().len(), HEADER_LEN + 8);
             assert_eq!(decode_frame(encoded.as_bytes()), Ok(message));
         }
     }
 
     #[test]
     fn encoding_has_a_stable_little_endian_layout() {
-        let encoded = encode_message(messages()[2]);
+        let encoded = encode_message(request_message()).unwrap();
         let bytes = encoded.as_bytes();
 
         assert_eq!(&bytes[..4], &MAGIC);
@@ -490,47 +519,44 @@ mod tests {
 
     #[test]
     fn malformed_headers_are_rejected_before_payload_use() {
-        let encoded = encode_message(WorkerMessage::Hello { nonce: NONCE });
+        let encoded = encode_message(WorkerMessage::Hello { nonce: NONCE }).unwrap();
 
-        let mut bad_magic = encoded.bytes;
+        let mut bad_magic = encoded.bytes.clone();
         bad_magic[0] ^= 0xff;
+        assert_eq!(decode_frame(&bad_magic), Err(ProtocolError::InvalidMagic));
+
+        let mut bad_version = encoded.bytes.clone();
+        bad_version[4..6].copy_from_slice(&(VERSION + 1).to_le_bytes());
         assert_eq!(
-            decode_frame(&bad_magic[..encoded.len]),
-            Err(ProtocolError::InvalidMagic)
+            decode_frame(&bad_version),
+            Err(ProtocolError::UnsupportedVersion(VERSION + 1))
         );
 
-        let mut bad_version = encoded.bytes;
-        bad_version[4..6].copy_from_slice(&2_u16.to_le_bytes());
-        assert_eq!(
-            decode_frame(&bad_version[..encoded.len]),
-            Err(ProtocolError::UnsupportedVersion(2))
-        );
-
-        let mut bad_kind = encoded.bytes;
+        let mut bad_kind = encoded.bytes.clone();
         bad_kind[6..8].copy_from_slice(&99_u16.to_le_bytes());
         assert_eq!(
-            decode_frame(&bad_kind[..encoded.len]),
+            decode_frame(&bad_kind),
             Err(ProtocolError::UnknownMessageKind(99))
         );
 
-        let mut oversized = encoded.bytes;
+        let mut oversized = encoded.bytes.clone();
         oversized[8..12].copy_from_slice(&(4 * 1024 * 1024_u32 + 1).to_le_bytes());
         assert_eq!(
-            decode_frame(&oversized[..encoded.len]),
+            decode_frame(&oversized),
             Err(ProtocolError::PayloadTooLarge(4 * 1024 * 1024 + 1))
         );
 
-        let mut reserved = encoded.bytes;
+        let mut reserved = encoded.bytes.clone();
         reserved[12..16].copy_from_slice(&1_u32.to_le_bytes());
         assert_eq!(
-            decode_frame(&reserved[..encoded.len]),
+            decode_frame(&reserved),
             Err(ProtocolError::ReservedFieldSet(1))
         );
 
         let mut generated_handshake = encoded.bytes;
         generated_handshake[16..24].copy_from_slice(&1_u64.to_le_bytes());
         assert_eq!(
-            decode_frame(&generated_handshake[..encoded.len]),
+            decode_frame(&generated_handshake),
             Err(ProtocolError::HandshakeGeneration(1))
         );
     }
@@ -544,13 +570,14 @@ mod tests {
             })
         );
 
-        let hello = encode_message(WorkerMessage::Hello { nonce: NONCE });
-        let mut bad_payload_len = hello.bytes;
+        let hello = encode_message(WorkerMessage::Hello { nonce: NONCE }).unwrap();
+        let mut bad_payload_len = hello.bytes.clone();
         bad_payload_len[8..12].copy_from_slice(&15_u32.to_le_bytes());
         assert_eq!(
-            decode_frame(&bad_payload_len[..hello.len]),
+            decode_frame(&bad_payload_len),
             Err(ProtocolError::InvalidPayloadLength {
-                expected: 16,
+                minimum: 16,
+                maximum: 16,
                 actual: 15,
             })
         );
@@ -560,20 +587,23 @@ mod tests {
         assert_eq!(
             decode_frame(&trailing),
             Err(ProtocolError::FrameLengthMismatch {
-                expected: hello.len,
-                actual: hello.len + 1,
+                expected: hello.bytes.len(),
+                actual: hello.bytes.len() + 1,
             })
         );
 
-        let result = encode_message(WorkerMessage::ResolverResult {
+        let result = encode_message(WorkerMessage::PreviewResult {
             generation: Generation::from_raw(7),
-            status: ResolverStatus::Resolved,
-        });
+            result: PreviewResult::Status(ResolverStatus::Resolved),
+        })
+        .unwrap();
         let mut bad_status = result.bytes;
-        bad_status[HEADER_LEN..HEADER_LEN + 4].copy_from_slice(&99_u32.to_le_bytes());
+        bad_status[HEADER_LEN + 4..HEADER_LEN + 8].copy_from_slice(&99_u32.to_le_bytes());
         assert_eq!(
-            decode_frame(&bad_status[..result.len]),
-            Err(ProtocolError::UnknownResolverStatus(99))
+            decode_frame(&bad_status),
+            Err(ProtocolError::Payload(PayloadError::UnknownResolverStatus(
+                99
+            )))
         );
     }
 
@@ -584,7 +614,7 @@ mod tests {
             point: PhysicalScreenPoint::new(i32::MIN, i32::MAX),
         };
         let mut writer = FragmentedWriter::default();
-        write_message(&mut writer, message).unwrap();
+        write_message(&mut writer, message.clone()).unwrap();
         assert!(writer.flushed);
 
         let mut reader = FragmentedReader::new(&writer.bytes);
@@ -593,11 +623,32 @@ mod tests {
     }
 
     #[test]
+    fn stream_allocates_only_the_validated_variable_payload() {
+        let message = WorkerMessage::PreviewResult {
+            generation: Generation::from_raw(77),
+            result: PreviewResult::Text(TextPreview {
+                file_size: 1_000_000,
+                linked_content: false,
+                encoding_was_guessed: false,
+                truncated: true,
+                encoding: "utf-8".to_owned(),
+                text: "bounded 世界\n".repeat(128),
+            }),
+        };
+        let mut stream = Vec::new();
+        write_message(&mut stream, message.clone()).unwrap();
+
+        let mut stream = stream.as_slice();
+        assert_eq!(read_message(&mut stream).unwrap(), Some(message));
+        assert_eq!(read_message(&mut stream).unwrap(), None);
+    }
+
+    #[test]
     fn stream_distinguishes_clean_eof_from_truncation() {
         assert_eq!(read_message(&mut &[][..]).unwrap(), None);
 
-        let encoded = encode_message(WorkerMessage::Hello { nonce: NONCE });
-        for truncated_len in [1, HEADER_LEN - 1, HEADER_LEN, encoded.len - 1] {
+        let encoded = encode_message(WorkerMessage::Hello { nonce: NONCE }).unwrap();
+        for truncated_len in [1, HEADER_LEN - 1, HEADER_LEN, encoded.bytes.len() - 1] {
             assert!(matches!(
                 read_message(&mut &encoded.as_bytes()[..truncated_len]),
                 Err(ProtocolStreamError::TruncatedFrame)

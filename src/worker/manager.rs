@@ -24,7 +24,10 @@ use crate::{
     platform::{ContainedWorker, ProcessError, WorkerPipes},
 };
 
-use super::protocol::{self, ProtocolStreamError, ResolverStatus, SessionNonce, WorkerMessage};
+use super::{
+    payload::{PreviewResult, ResolverStatus},
+    protocol::{self, ProtocolStreamError, SessionNonce, WorkerMessage},
+};
 
 const WORKER_DEADLINE: Duration = Duration::from_secs(2);
 const DEFAULT_WORKER_IDLE_LIFETIME: Duration = Duration::from_secs(15);
@@ -39,10 +42,10 @@ pub(crate) fn run_launch_diagnostic() -> Result<WorkerDiagnosticReport, WorkerMa
 
     let diagnostic_result = (|| {
         let first = manager.resolve(Generation::from_raw(1), PhysicalScreenPoint::new(0, 0))?;
-        ensure_unavailable(first.status)?;
+        ensure_unavailable(&first.result)?;
 
         let second = manager.resolve(Generation::from_raw(2), PhysicalScreenPoint::new(0, 0))?;
-        ensure_unavailable(second.status)?;
+        ensure_unavailable(&second.result)?;
         if second.session_id != first.session_id {
             return Err(WorkerManagerError::SessionNotReused);
         }
@@ -53,7 +56,7 @@ pub(crate) fn run_launch_diagnostic() -> Result<WorkerDiagnosticReport, WorkerMa
         }
 
         let third = manager.resolve(Generation::from_raw(3), PhysicalScreenPoint::new(0, 0))?;
-        ensure_unavailable(third.status)?;
+        ensure_unavailable(&third.result)?;
         if third.session_id == first.session_id {
             return Err(WorkerManagerError::SessionNotRestarted);
         }
@@ -132,8 +135,8 @@ pub(crate) fn run_timeout_diagnostic() -> Result<(), WorkerManagerError> {
     }
 }
 
-fn ensure_unavailable(status: ResolverStatus) -> Result<(), WorkerManagerError> {
-    if status == ResolverStatus::Unavailable {
+fn ensure_unavailable(result: &PreviewResult) -> Result<(), WorkerManagerError> {
+    if result.status() == Some(ResolverStatus::Unavailable) {
         Ok(())
     } else {
         Err(WorkerManagerError::UnexpectedDiagnosticStatus)
@@ -247,15 +250,15 @@ impl Drop for WorkerManager {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WorkerResolution {
     generation: Generation,
     session_id: u64,
-    status: ResolverStatus,
+    result: PreviewResult,
 }
 
 impl WorkerResolution {
-    pub(crate) const fn generation(self) -> Generation {
+    pub(crate) const fn generation(&self) -> Generation {
         self.generation
     }
 }
@@ -506,7 +509,7 @@ fn manager_loop(
                 last_used = Instant::now();
 
                 match result {
-                    Ok(status) => {
+                    Ok(result) => {
                         let session_id = session
                             .as_ref()
                             .expect("a successful request keeps its session")
@@ -517,7 +520,7 @@ fn manager_loop(
                             Ok(WorkerResolution {
                                 generation,
                                 session_id,
-                                status,
+                                result,
                             }),
                         );
                     }
@@ -641,7 +644,7 @@ impl WorkerSession {
         &self,
         generation: Generation,
         point: PhysicalScreenPoint,
-    ) -> Result<ResolverStatus, WorkerManagerError> {
+    ) -> Result<PreviewResult, WorkerManagerError> {
         let (response_sender, response_receiver) = mpsc::sync_channel(1);
         self.command_sender
             .as_ref()
@@ -715,7 +718,7 @@ impl WorkerSession {
 struct ProtocolCommand {
     generation: Generation,
     point: PhysicalScreenPoint,
-    response_sender: SyncSender<Result<ResolverStatus, WorkerManagerError>>,
+    response_sender: SyncSender<Result<PreviewResult, WorkerManagerError>>,
 }
 
 fn protocol_loop(
@@ -773,14 +776,14 @@ fn validate_ready(
 fn validate_result(
     message: Option<WorkerMessage>,
     expected_generation: Generation,
-) -> Result<ResolverStatus, WorkerManagerError> {
+) -> Result<PreviewResult, WorkerManagerError> {
     match message {
-        Some(WorkerMessage::ResolverResult { generation, status })
+        Some(WorkerMessage::PreviewResult { generation, result })
             if generation == expected_generation =>
         {
-            Ok(status)
+            Ok(result)
         }
-        Some(WorkerMessage::ResolverResult { .. }) => Err(WorkerManagerError::GenerationMismatch),
+        Some(WorkerMessage::PreviewResult { .. }) => Err(WorkerManagerError::GenerationMismatch),
         Some(_) => Err(WorkerManagerError::UnexpectedResult),
         None => Err(WorkerManagerError::WorkerExitedBeforeResult),
     }
@@ -1040,7 +1043,10 @@ mod tests {
     };
     use crate::{
         hover::{Generation, PhysicalScreenPoint},
-        worker::protocol::{ResolverStatus, SessionNonce, WorkerMessage},
+        worker::{
+            payload::{PreviewResult, ResolverStatus},
+            protocol::{SessionNonce, WorkerMessage},
+        },
     };
     use std::{
         sync::atomic::{AtomicUsize, Ordering},
@@ -1076,9 +1082,9 @@ mod tests {
     fn parent_rejects_a_result_with_the_wrong_generation() {
         assert!(matches!(
             validate_result(
-                Some(WorkerMessage::ResolverResult {
+                Some(WorkerMessage::PreviewResult {
                     generation: Generation::from_raw(2),
-                    status: ResolverStatus::Unavailable,
+                    result: PreviewResult::Status(ResolverStatus::Unavailable),
                 }),
                 Generation::from_raw(1),
             ),
@@ -1111,7 +1117,7 @@ mod tests {
             .send(Ok(WorkerResolution {
                 generation: Generation::from_raw(2),
                 session_id: 7,
-                status: ResolverStatus::Unavailable,
+                result: PreviewResult::Status(ResolverStatus::Unavailable),
             }))
             .unwrap();
         assert_eq!(
@@ -1119,7 +1125,7 @@ mod tests {
             WorkerResolution {
                 generation: Generation::from_raw(2),
                 session_id: 7,
-                status: ResolverStatus::Unavailable,
+                result: PreviewResult::Status(ResolverStatus::Unavailable),
             }
         );
     }
@@ -1158,7 +1164,7 @@ mod tests {
             .send(Ok(WorkerResolution {
                 generation: Generation::from_raw(9),
                 session_id: 4,
-                status: ResolverStatus::Resolved,
+                result: PreviewResult::Status(ResolverStatus::Resolved),
             }))
             .unwrap();
 
@@ -1229,7 +1235,7 @@ mod tests {
             .send(Ok(WorkerResolution {
                 generation: Generation::from_raw(1),
                 session_id: 1,
-                status: ResolverStatus::Unavailable,
+                result: PreviewResult::Status(ResolverStatus::Unavailable),
             }))
             .unwrap();
         assert!(active_receiver.recv().unwrap().is_ok());
@@ -1244,7 +1250,7 @@ mod tests {
             .send(Ok(WorkerResolution {
                 generation: Generation::from_raw(10_000),
                 session_id: 1,
-                status: ResolverStatus::Unavailable,
+                result: PreviewResult::Status(ResolverStatus::Unavailable),
             }))
             .unwrap();
         assert!(previous.recv().unwrap().is_ok());
