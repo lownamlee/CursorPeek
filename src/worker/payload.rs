@@ -3,6 +3,8 @@ use std::{error::Error, fmt};
 pub(super) const MAX_PREVIEW_PAYLOAD_LEN: usize = 4 * 1024 * 1024;
 pub(super) const MIN_PREVIEW_RESULT_LEN: usize = 8;
 pub(super) const MAX_TEXT_UTF8_LEN: usize = 128 * 1024;
+pub(super) const MAX_TEXT_SCALARS: usize = 32_000;
+pub(super) const MAX_TEXT_LINES: usize = 200;
 pub(super) const MAX_ENCODING_LABEL_LEN: usize = 40;
 pub(super) const MAX_SOURCE_IMAGE_AXIS: u32 = 20_000;
 pub(super) const MAX_PREVIEW_IMAGE_WIDTH: u32 = 960;
@@ -24,7 +26,7 @@ const FLAG_IMAGE_FIRST_FRAME_ONLY: u32 = 1 << 1;
 const IMAGE_FLAGS: u32 = FLAG_LINKED_CONTENT | FLAG_IMAGE_FIRST_FRAME_ONLY;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ResolverStatus {
+pub(crate) enum ResolverStatus {
     Resolved = 0,
     Unsupported = 1,
     Ambiguous = 2,
@@ -46,7 +48,7 @@ impl ResolverStatus {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ImageFormat {
+pub(crate) enum ImageFormat {
     Jpeg = 0,
     Png = 1,
     Gif = 2,
@@ -72,30 +74,30 @@ impl ImageFormat {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct TextPreview {
-    pub(super) file_size: u64,
-    pub(super) linked_content: bool,
-    pub(super) encoding_was_guessed: bool,
-    pub(super) truncated: bool,
-    pub(super) encoding: String,
-    pub(super) text: String,
+pub(crate) struct TextPreview {
+    pub(crate) file_size: u64,
+    pub(crate) linked_content: bool,
+    pub(crate) encoding_was_guessed: bool,
+    pub(crate) truncated: bool,
+    pub(crate) encoding: String,
+    pub(crate) text: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct ImagePreview {
-    pub(super) file_size: u64,
-    pub(super) linked_content: bool,
-    pub(super) first_frame_only: bool,
-    pub(super) format: ImageFormat,
-    pub(super) source_width: u32,
-    pub(super) source_height: u32,
-    pub(super) width: u32,
-    pub(super) height: u32,
-    pub(super) premultiplied_bgra: Vec<u8>,
+pub(crate) struct ImagePreview {
+    pub(crate) file_size: u64,
+    pub(crate) linked_content: bool,
+    pub(crate) first_frame_only: bool,
+    pub(crate) format: ImageFormat,
+    pub(crate) source_width: u32,
+    pub(crate) source_height: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) premultiplied_bgra: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum PreviewResult {
+pub(crate) enum PreviewResult {
     Status(ResolverStatus),
     Text(TextPreview),
     Image(ImagePreview),
@@ -295,7 +297,44 @@ fn validate_text(preview: &TextPreview) -> Result<(), PayloadError> {
             actual: preview.text.len(),
         });
     }
+
+    let mut scalar_count = 0;
+    let mut line_count = usize::from(!preview.text.is_empty());
+    for scalar in preview.text.chars() {
+        scalar_count += 1;
+        if scalar_count > MAX_TEXT_SCALARS {
+            return Err(PayloadError::TooManyTextScalars {
+                actual: scalar_count,
+            });
+        }
+        if scalar == '\n' {
+            line_count += 1;
+            if line_count > MAX_TEXT_LINES {
+                return Err(PayloadError::TooManyTextLines { actual: line_count });
+            }
+        } else if is_noncanonical_text_line_break(scalar) || is_unsafe_text_control(scalar) {
+            return Err(PayloadError::UnsafeTextScalar(u32::from(scalar)));
+        }
+    }
     Ok(())
+}
+
+pub(super) const fn is_noncanonical_text_line_break(scalar: char) -> bool {
+    matches!(scalar, '\r' | '\u{0085}' | '\u{2028}' | '\u{2029}')
+}
+
+pub(super) const fn is_unsafe_text_control(scalar: char) -> bool {
+    matches!(
+        scalar,
+        '\u{0000}'..='\u{0008}'
+            | '\u{000b}'..='\u{001f}'
+            | '\u{007f}'..='\u{009f}'
+            | '\u{061c}'
+            | '\u{200e}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{206f}'
+            | '\u{feff}'
+    )
 }
 
 fn validate_image(preview: &ImagePreview) -> Result<(), PayloadError> {
@@ -440,6 +479,13 @@ pub(crate) enum PayloadError {
     TextTooLarge {
         actual: usize,
     },
+    TooManyTextScalars {
+        actual: usize,
+    },
+    TooManyTextLines {
+        actual: usize,
+    },
+    UnsafeTextScalar(u32),
     InvalidTextUtf8,
     InvalidSourceDimensions {
         width: u32,
@@ -497,6 +543,21 @@ impl fmt::Display for PayloadError {
                 formatter,
                 "text preview length {actual} exceeds {MAX_TEXT_UTF8_LEN} UTF-8 bytes"
             ),
+            Self::TooManyTextScalars { actual } => write!(
+                formatter,
+                "text preview contains at least {actual} Unicode scalars; the limit is \
+                 {MAX_TEXT_SCALARS}"
+            ),
+            Self::TooManyTextLines { actual } => write!(
+                formatter,
+                "text preview contains at least {actual} lines; the limit is {MAX_TEXT_LINES}"
+            ),
+            Self::UnsafeTextScalar(scalar) => {
+                write!(
+                    formatter,
+                    "text preview contains unsafe scalar U+{scalar:04X}"
+                )
+            }
             Self::InvalidTextUtf8 => write!(formatter, "text preview is not valid UTF-8"),
             Self::InvalidSourceDimensions { width, height } => write!(
                 formatter,
@@ -530,8 +591,8 @@ mod tests {
     use super::{
         FLAG_IMAGE_FIRST_FRAME_ONLY, FLAG_TEXT_TRUNCATED, IMAGE_FIXED_LEN, ImageFormat,
         ImagePreview, MAX_ENCODING_LABEL_LEN, MAX_PREVIEW_IMAGE_WIDTH, MAX_SOURCE_IMAGE_AXIS,
-        MAX_TEXT_UTF8_LEN, PayloadError, PreviewResult, ResolverStatus, TEXT_FIXED_LEN,
-        TextPreview, decode_result, encode_result,
+        MAX_TEXT_LINES, MAX_TEXT_SCALARS, MAX_TEXT_UTF8_LEN, PayloadError, PreviewResult,
+        ResolverStatus, TEXT_FIXED_LEN, TextPreview, decode_result, encode_result,
     };
 
     fn text_preview() -> TextPreview {
@@ -617,6 +678,33 @@ mod tests {
             encode_result(&PreviewResult::Text(preview)),
             Err(PayloadError::InvalidEncodingLabel)
         );
+
+        let mut preview = text_preview();
+        preview.text = "世".repeat(MAX_TEXT_SCALARS + 1);
+        assert_eq!(
+            encode_result(&PreviewResult::Text(preview)),
+            Err(PayloadError::TooManyTextScalars {
+                actual: MAX_TEXT_SCALARS + 1
+            })
+        );
+
+        let mut preview = text_preview();
+        preview.text = "line\n".repeat(MAX_TEXT_LINES);
+        assert_eq!(
+            encode_result(&PreviewResult::Text(preview)),
+            Err(PayloadError::TooManyTextLines {
+                actual: MAX_TEXT_LINES + 1
+            })
+        );
+
+        for scalar in ['\r', '\u{001b}', '\u{0085}', '\u{202e}', '\u{2066}'] {
+            let mut preview = text_preview();
+            preview.text = format!("before{scalar}after");
+            assert_eq!(
+                encode_result(&PreviewResult::Text(preview)),
+                Err(PayloadError::UnsafeTextScalar(u32::from(scalar)))
+            );
+        }
     }
 
     #[test]

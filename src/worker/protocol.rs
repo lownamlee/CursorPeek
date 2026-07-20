@@ -4,7 +4,10 @@ use std::{
     io::{self, ErrorKind, Read, Write},
 };
 
-use crate::hover::{Generation, PhysicalScreenPoint};
+use crate::{
+    hover::{Generation, PhysicalScreenPoint},
+    settings::LegacyEncoding,
+};
 
 use super::payload::{
     MAX_PREVIEW_PAYLOAD_LEN, MIN_PREVIEW_RESULT_LEN, PayloadError, PreviewResult, decode_result,
@@ -12,9 +15,10 @@ use super::payload::{
 };
 
 const MAGIC: [u8; 4] = *b"CPWK";
-const VERSION: u16 = 2;
+const VERSION: u16 = 3;
 const HEADER_LEN: usize = 24;
 const NONCE_LEN: usize = 16;
+const MAX_LEGACY_ENCODING_WIRE_LEN: usize = 40;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SessionNonce([u8; NONCE_LEN]);
@@ -29,6 +33,7 @@ impl SessionNonce {
 pub(super) enum WorkerMessage {
     Hello {
         nonce: SessionNonce,
+        legacy_encoding: LegacyEncoding,
     },
     Ready {
         nonce: SessionNonce,
@@ -84,7 +89,8 @@ impl MessageKind {
 
     fn payload_limits(self) -> (usize, usize) {
         match self {
-            Self::Hello | Self::Ready => (NONCE_LEN, NONCE_LEN),
+            Self::Hello => (NONCE_LEN + 3, NONCE_LEN + MAX_LEGACY_ENCODING_WIRE_LEN),
+            Self::Ready => (NONCE_LEN, NONCE_LEN),
             Self::ResolvePoint => (8, 8),
             Self::PreviewResult => (MIN_PREVIEW_RESULT_LEN, MAX_PREVIEW_PAYLOAD_LEN),
         }
@@ -166,6 +172,7 @@ pub(crate) enum ProtocolError {
         maximum: usize,
         actual: usize,
     },
+    InvalidLegacyEncoding,
     FrameLengthMismatch {
         expected: usize,
         actual: usize,
@@ -223,8 +230,11 @@ impl fmt::Display for ProtocolError {
             } => write!(
                 formatter,
                 "invalid worker payload length: expected {minimum}-{maximum} bytes, \
-                 received {actual}"
+                received {actual}"
             ),
+            Self::InvalidLegacyEncoding => {
+                write!(formatter, "invalid legacy encoding in worker handshake")
+            }
             Self::FrameLengthMismatch { expected, actual } => write!(
                 formatter,
                 "worker frame length mismatch: expected {expected} bytes, received {actual}"
@@ -354,7 +364,23 @@ fn encode_message(message: WorkerMessage) -> Result<EncodedMessage, ProtocolErro
     let kind = message.kind();
     let generation = message.generation();
     let payload = match message {
-        WorkerMessage::Hello { nonce } | WorkerMessage::Ready { nonce } => nonce.0.to_vec(),
+        WorkerMessage::Hello {
+            nonce,
+            legacy_encoding,
+        } => {
+            let label = legacy_encoding.as_str().as_bytes();
+            if !(3..=MAX_LEGACY_ENCODING_WIRE_LEN).contains(&label.len())
+                || LegacyEncoding::parse(legacy_encoding.as_str()).as_ref()
+                    != Some(&legacy_encoding)
+            {
+                return Err(ProtocolError::InvalidLegacyEncoding);
+            }
+            let mut payload = Vec::with_capacity(NONCE_LEN + label.len());
+            payload.extend_from_slice(&nonce.0);
+            payload.extend_from_slice(label);
+            payload
+        }
+        WorkerMessage::Ready { nonce } => nonce.0.to_vec(),
         WorkerMessage::ResolvePoint { point, .. } => {
             let mut payload = Vec::with_capacity(8);
             payload.extend_from_slice(&point.x.to_le_bytes());
@@ -394,14 +420,24 @@ fn decode_payload(header: FrameHeader, payload: &[u8]) -> Result<WorkerMessage, 
     }
 
     match header.kind {
-        MessageKind::Hello | MessageKind::Ready => {
+        MessageKind::Hello => {
+            let mut nonce = [0_u8; NONCE_LEN];
+            nonce.copy_from_slice(&payload[..NONCE_LEN]);
+            let nonce = SessionNonce(nonce);
+            let label = std::str::from_utf8(&payload[NONCE_LEN..])
+                .map_err(|_| ProtocolError::InvalidLegacyEncoding)?;
+            let legacy_encoding =
+                LegacyEncoding::parse(label).ok_or(ProtocolError::InvalidLegacyEncoding)?;
+            Ok(WorkerMessage::Hello {
+                nonce,
+                legacy_encoding,
+            })
+        }
+        MessageKind::Ready => {
             let mut nonce = [0_u8; NONCE_LEN];
             nonce.copy_from_slice(payload);
-            let nonce = SessionNonce(nonce);
-            Ok(if header.kind == MessageKind::Hello {
-                WorkerMessage::Hello { nonce }
-            } else {
-                WorkerMessage::Ready { nonce }
+            Ok(WorkerMessage::Ready {
+                nonce: SessionNonce(nonce),
             })
         }
         MessageKind::ResolvePoint => Ok(WorkerMessage::ResolvePoint {
@@ -443,10 +479,11 @@ fn decode_frame(bytes: &[u8]) -> Result<WorkerMessage, ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HEADER_LEN, MAGIC, ProtocolError, ProtocolStreamError, SessionNonce, VERSION,
+        HEADER_LEN, MAGIC, NONCE_LEN, ProtocolError, ProtocolStreamError, SessionNonce, VERSION,
         WorkerMessage, decode_frame, encode_message, read_message, write_message,
     };
     use crate::hover::{Generation, PhysicalScreenPoint};
+    use crate::settings::LegacyEncoding;
     use crate::worker::payload::{PayloadError, PreviewResult, ResolverStatus, TextPreview};
     use std::io::{self, ErrorKind, Read, Write};
 
@@ -457,7 +494,7 @@ mod tests {
 
     fn messages() -> Vec<WorkerMessage> {
         vec![
-            WorkerMessage::Hello { nonce: NONCE },
+            hello(LegacyEncoding::Auto),
             WorkerMessage::Ready { nonce: NONCE },
             request_message(),
             WorkerMessage::PreviewResult {
@@ -465,6 +502,13 @@ mod tests {
                 result: PreviewResult::Status(ResolverStatus::TimedOut),
             },
         ]
+    }
+
+    fn hello(legacy_encoding: LegacyEncoding) -> WorkerMessage {
+        WorkerMessage::Hello {
+            nonce: NONCE,
+            legacy_encoding,
+        }
     }
 
     fn request_message() -> WorkerMessage {
@@ -477,6 +521,20 @@ mod tests {
     #[test]
     fn every_control_message_round_trips() {
         for message in messages() {
+            let encoded = encode_message(message.clone()).unwrap();
+            assert_eq!(decode_frame(encoded.as_bytes()), Ok(message));
+        }
+    }
+
+    #[test]
+    fn handshake_round_trips_each_legacy_encoding_policy() {
+        for policy in [
+            LegacyEncoding::Auto,
+            LegacyEncoding::System,
+            LegacyEncoding::Off,
+            LegacyEncoding::Label("windows-1252".to_owned()),
+        ] {
+            let message = hello(policy);
             let encoded = encode_message(message.clone()).unwrap();
             assert_eq!(decode_frame(encoded.as_bytes()), Ok(message));
         }
@@ -519,7 +577,7 @@ mod tests {
 
     #[test]
     fn malformed_headers_are_rejected_before_payload_use() {
-        let encoded = encode_message(WorkerMessage::Hello { nonce: NONCE }).unwrap();
+        let encoded = encode_message(hello(LegacyEncoding::Auto)).unwrap();
 
         let mut bad_magic = encoded.bytes.clone();
         bad_magic[0] ^= 0xff;
@@ -570,25 +628,36 @@ mod tests {
             })
         );
 
-        let hello = encode_message(WorkerMessage::Hello { nonce: NONCE }).unwrap();
-        let mut bad_payload_len = hello.bytes.clone();
+        let encoded_hello = encode_message(hello(LegacyEncoding::Auto)).unwrap();
+        let mut bad_payload_len = encoded_hello.bytes.clone();
         bad_payload_len[8..12].copy_from_slice(&15_u32.to_le_bytes());
         assert_eq!(
             decode_frame(&bad_payload_len),
             Err(ProtocolError::InvalidPayloadLength {
-                minimum: 16,
-                maximum: 16,
+                minimum: 19,
+                maximum: 56,
                 actual: 15,
             })
         );
 
-        let mut trailing = hello.as_bytes().to_vec();
+        let mut invalid_legacy = encoded_hello.bytes.clone();
+        invalid_legacy[HEADER_LEN + NONCE_LEN..].copy_from_slice(b"nope");
+        assert_eq!(
+            decode_frame(&invalid_legacy),
+            Err(ProtocolError::InvalidLegacyEncoding)
+        );
+        assert!(matches!(
+            encode_message(hello(LegacyEncoding::Label("nope".to_owned()))),
+            Err(ProtocolError::InvalidLegacyEncoding)
+        ));
+
+        let mut trailing = encoded_hello.as_bytes().to_vec();
         trailing.push(0);
         assert_eq!(
             decode_frame(&trailing),
             Err(ProtocolError::FrameLengthMismatch {
-                expected: hello.bytes.len(),
-                actual: hello.bytes.len() + 1,
+                expected: encoded_hello.bytes.len(),
+                actual: encoded_hello.bytes.len() + 1,
             })
         );
 
@@ -647,7 +716,7 @@ mod tests {
     fn stream_distinguishes_clean_eof_from_truncation() {
         assert_eq!(read_message(&mut &[][..]).unwrap(), None);
 
-        let encoded = encode_message(WorkerMessage::Hello { nonce: NONCE }).unwrap();
+        let encoded = encode_message(hello(LegacyEncoding::Auto)).unwrap();
         for truncated_len in [1, HEADER_LEN - 1, HEADER_LEN, encoded.bytes.len() - 1] {
             assert!(matches!(
                 read_message(&mut &encoded.as_bytes()[..truncated_len]),

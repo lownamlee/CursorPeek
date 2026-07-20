@@ -19,9 +19,9 @@ use crate::hover::{
     DEFAULT_DWELL_DELAY, DwellTimerEvent, Generation, HoverState, INPUT_SAMPLE_INTERVAL,
     InputCoverage, InputCoverageReport, PhysicalScreenPoint,
 };
-use crate::preview::PreviewPlacement;
+use crate::preview::{PreviewPlacement, PreviewSize};
 use crate::worker::{
-    CompletionNotifier, PendingWorkerPoll, PendingWorkerResolution, WorkerManager,
+    CompletionNotifier, PendingWorkerPoll, PendingWorkerResolution, PreviewResult, WorkerManager,
     WorkerManagerError,
 };
 
@@ -64,6 +64,7 @@ pub(crate) struct MessageWindow {
     hwnd: HWND,
     dwell_timer: Option<WindowTimer>,
     hover_state: HoverState,
+    preview_size: PreviewSize,
     input_diagnostics: Option<InputDiagnostics>,
     preview_diagnostics: Option<ActivePreviewDiagnostics>,
     preview_window: Option<PreviewWindow>,
@@ -71,6 +72,7 @@ pub(crate) struct MessageWindow {
     paused: bool,
     worker_manager: Option<WorkerManager>,
     pending_worker_resolution: Option<PendingWorkerResolution>,
+    pending_worker_anchor: Option<(Generation, PhysicalScreenPoint)>,
     latest_worker_completion: Option<Generation>,
     raw_mouse_input: Option<RawMouseInputRegistration>,
     _class: RegisteredWindowClass,
@@ -83,6 +85,17 @@ impl MessageWindow {
     }
 
     pub(crate) fn create_with_dwell_delay(dwell_delay: Duration) -> Result<Self> {
+        Self::create_with_preview_size(dwell_delay, PreviewSize::diagnostic())
+    }
+
+    pub(crate) fn create_for_application(
+        dwell_delay: Duration,
+        preview_size: PreviewSize,
+    ) -> Result<Self> {
+        Self::create_with_preview_size(dwell_delay, preview_size)
+    }
+
+    fn create_with_preview_size(dwell_delay: Duration, preview_size: PreviewSize) -> Result<Self> {
         let class = RegisteredWindowClass::register()?;
 
         // SAFETY: The class remains registered in `class`, all string pointers are static, the
@@ -109,6 +122,7 @@ impl MessageWindow {
             hwnd,
             dwell_timer: Some(WindowTimer::new(hwnd, DWELL_TIMER_ID)),
             hover_state: HoverState::new(dwell_delay),
+            preview_size,
             input_diagnostics: None,
             preview_diagnostics: None,
             preview_window: None,
@@ -116,6 +130,7 @@ impl MessageWindow {
             paused: false,
             worker_manager: None,
             pending_worker_resolution: None,
+            pending_worker_anchor: None,
             latest_worker_completion: None,
             raw_mouse_input: None,
             _class: class,
@@ -492,7 +507,9 @@ impl MessageWindow {
 
     fn invalidate_worker_delivery(&mut self) {
         drop(self.pending_worker_resolution.take());
+        self.pending_worker_anchor = None;
         self.latest_worker_completion = None;
+        self.hide_product_preview();
     }
 
     fn handle_dwell_timer(&mut self, now: Instant) {
@@ -543,6 +560,7 @@ impl MessageWindow {
                 };
 
                 self.pending_worker_resolution = Some(pending);
+                self.pending_worker_anchor = Some((generation, point));
             }
         }
     }
@@ -556,11 +574,65 @@ impl MessageWindow {
             PendingWorkerPoll::Pending => {}
             PendingWorkerPoll::Ready(result) => {
                 self.pending_worker_resolution = None;
-                self.latest_worker_completion = accept_worker_completion(
-                    self.hover_state.generation(),
-                    result.ok().map(|resolution| resolution.generation()),
-                );
+                let anchor = self.pending_worker_anchor.take();
+                match result {
+                    Ok(resolution) => {
+                        let generation = accept_worker_completion(
+                            self.hover_state.generation(),
+                            Some(resolution.generation()),
+                        );
+                        self.latest_worker_completion = generation;
+
+                        if let (Some(generation), Some((anchor_generation, point))) =
+                            (generation, anchor)
+                            && generation == anchor_generation
+                        {
+                            self.show_worker_result(point, resolution.into_result());
+                        } else {
+                            self.hide_product_preview();
+                        }
+                    }
+                    Err(_) => {
+                        self.latest_worker_completion = None;
+                        self.hide_product_preview();
+                    }
+                }
             }
+        }
+    }
+
+    fn show_worker_result(&mut self, anchor: PhysicalScreenPoint, result: PreviewResult) {
+        let PreviewResult::Text(text) = result else {
+            self.hide_product_preview();
+            return;
+        };
+
+        if self.preview_diagnostics.is_some() {
+            return;
+        }
+
+        if self.preview_window.is_none() {
+            let Ok(preview) = PreviewWindow::create() else {
+                return;
+            };
+            self.preview_window = Some(preview);
+        }
+
+        let shown = self
+            .preview_window
+            .as_ref()
+            .expect("the preview window was created above")
+            .show_text_at(anchor, self.preview_size, &text);
+        if shown.is_err() {
+            drop(self.preview_window.take());
+        }
+    }
+
+    fn hide_product_preview(&self) {
+        if self.preview_diagnostics.is_none()
+            && let Some(preview) = self.preview_window.as_ref()
+        {
+            let _ = preview.hide();
         }
     }
 
@@ -1037,8 +1109,8 @@ mod tests {
                 .expect("the application message window should be created");
             assert_eq!(application.dwell_delay(), Duration::from_millis(650));
             let application_handle = application.handle();
-            let worker_manager =
-                WorkerManager::start().expect("the lazy worker manager should start");
+            let worker_manager = WorkerManager::start(crate::settings::LegacyEncoding::Auto)
+                .expect("the lazy worker manager should start");
             application
                 .request_shutdown()
                 .expect("the application shutdown message should be queued");

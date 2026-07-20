@@ -1,36 +1,72 @@
-use std::{marker::PhantomData, mem::size_of, panic::AssertUnwindSafe, rc::Rc};
+use std::{
+    cell::RefCell,
+    ffi::c_void,
+    marker::PhantomData,
+    mem::size_of,
+    panic::AssertUnwindSafe,
+    rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use crate::{
     hover::PhysicalScreenPoint,
-    preview::{PreviewPlacement, ScreenRect, place_diagnostic_preview},
+    preview::{PreviewPlacement, PreviewSize, ScreenRect, place_preview},
+    worker::TextPreview,
 };
 
 use windows::{
     Win32::{
-        Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM},
-        Graphics::Gdi::{
-            COLOR_HIGHLIGHT, GetMonitorInfoW, GetSysColorBrush, MONITOR_DEFAULTTONEAREST,
-            MONITORINFO, MonitorFromPoint,
+        Foundation::{D2DERR_RECREATE_TARGET, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Graphics::{
+            Direct2D::{
+                Common::{D2D_SIZE_U, D2D1_COLOR_F},
+                D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+                D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE,
+                D2D1_RENDER_TARGET_PROPERTIES, D2D1CreateFactory, ID2D1Factory,
+                ID2D1HwndRenderTarget, ID2D1SolidColorBrush,
+            },
+            DirectWrite::{
+                DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                DWRITE_PARAGRAPH_ALIGNMENT_NEAR, DWRITE_TEXT_ALIGNMENT_LEADING,
+                DWRITE_WORD_WRAPPING_NO_WRAP, DWRITE_WORD_WRAPPING_WRAP, DWriteCreateFactory,
+                IDWriteFactory, IDWriteFontCollection, IDWriteTextFormat, IDWriteTextLayout,
+            },
+            Gdi::{
+                BeginPaint, COLOR_GRAYTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, EndPaint,
+                GetMonitorInfoW, GetSysColor, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+                MonitorFromPoint, PAINTSTRUCT, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW,
+                RedrawWindow,
+            },
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             HiDpi::GetDpiForWindow,
             WindowsAndMessaging::{
-                CreateWindowExW, DefWindowProcW, DestroyWindow, HWND_TOPMOST, MA_NOACTIVATEANDEAT,
+                CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA,
+                GetClientRect, GetWindowLongPtrW, HWND_TOPMOST, MA_NOACTIVATEANDEAT,
                 RegisterClassW, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-                SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageW, SetWindowPos, UnregisterClassW,
-                WINDOW_EX_STYLE, WM_MOUSEACTIVATE, WNDCLASSW, WS_BORDER, WS_EX_NOACTIVATE,
+                SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageW, SetWindowLongPtrW, SetWindowPos,
+                UnregisterClassW, WINDOW_EX_STYLE, WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_NCCREATE,
+                WM_NCDESTROY, WM_PAINT, WM_SIZE, WNDCLASSW, WS_BORDER, WS_EX_NOACTIVATE,
                 WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
             },
         },
     },
-    core::{Error, PCWSTR, Result, w},
+    core::{Error, HRESULT, PCWSTR, Result, w},
 };
+use windows_numerics::Vector2;
 
-const CLASS_NAME: PCWSTR = w!("CursorPeek.PreviewWindow");
+const CLASS_NAME_PREFIX: &str = "CursorPeek.PreviewWindow";
+static NEXT_CLASS_ID: AtomicU64 = AtomicU64::new(1);
+const BASE_DPI: f32 = 96.0;
+const CONTENT_MARGIN: f32 = 12.0;
+const HEADER_HEIGHT: f32 = 18.0;
+const HEADER_BODY_GAP: f32 = 8.0;
 
 pub(crate) struct PreviewWindow {
     hwnd: HWND,
+    state: Box<RefCell<PreviewWindowState>>,
     _class: RegisteredPreviewClass,
     _thread_affinity: PhantomData<Rc<()>>,
 }
@@ -38,15 +74,19 @@ pub(crate) struct PreviewWindow {
 impl PreviewWindow {
     pub(crate) fn create() -> Result<Self> {
         let class = RegisteredPreviewClass::register()?;
+        let class_name = class.name();
+        let state = Box::new(RefCell::new(PreviewWindowState::new()?));
+        let state_pointer = std::ptr::from_ref(state.as_ref()).cast::<c_void>();
         let ex_style: WINDOW_EX_STYLE = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
 
-        // SAFETY: The registered class remains owned by `class`, all strings are static, the
-        // module instance belongs to this process, and the top-level popup starts hidden.
+        // SAFETY: The registered class and boxed state outlive the HWND. WM_NCCREATE copies the
+        // stable RefCell pointer into GWLP_USERDATA, and Drop clears that pointer before destroying
+        // the window.
         let hwnd = unsafe {
             CreateWindowExW(
                 ex_style,
-                CLASS_NAME,
-                w!("CursorPeek preview diagnostic"),
+                class_name,
+                w!("CursorPeek preview"),
                 WS_POPUP | WS_BORDER,
                 0,
                 0,
@@ -55,21 +95,39 @@ impl PreviewWindow {
                 None,
                 None,
                 Some(class.instance),
-                None,
+                Some(state_pointer),
             )?
         };
 
         Ok(Self {
             hwnd,
+            state,
             _class: class,
             _thread_affinity: PhantomData,
         })
     }
 
     pub(crate) fn show_at(&self, anchor: PhysicalScreenPoint) -> Result<PreviewPlacement> {
-        // SAFETY: `self.hwnd` is a live hidden top-level window owned by this UI thread. Moving it
-        // to the anchor monitor before querying DPI associates the correct monitor without making
-        // the one-pixel setup window visible or active.
+        self.show(anchor, PreviewSize::diagnostic(), None)
+    }
+
+    pub(crate) fn show_text_at(
+        &self,
+        anchor: PhysicalScreenPoint,
+        size: PreviewSize,
+        preview: &TextPreview,
+    ) -> Result<PreviewPlacement> {
+        self.show(anchor, size, Some(preview))
+    }
+
+    fn show(
+        &self,
+        anchor: PhysicalScreenPoint,
+        size: PreviewSize,
+        text: Option<&TextPreview>,
+    ) -> Result<PreviewPlacement> {
+        // SAFETY: The hidden top-level HWND is owned by this UI thread. Moving the one-pixel setup
+        // window first associates it with the anchor monitor without activating or showing it.
         unsafe {
             SetWindowPos(
                 self.hwnd,
@@ -82,15 +140,16 @@ impl PreviewWindow {
             )?;
         }
 
-        // SAFETY: `self.hwnd` remains live after the successful positioning call.
+        // SAFETY: The HWND remains live after the successful positioning call.
         let dpi = unsafe { GetDpiForWindow(self.hwnd) };
         if dpi == 0 {
             return Err(Error::from_thread());
         }
 
+        // SAFETY: MonitorFromPoint returns a borrowed monitor handle and transfers no ownership.
         let monitor = unsafe {
             MonitorFromPoint(
-                POINT {
+                windows::Win32::Foundation::POINT {
                     x: anchor.x,
                     y: anchor.y,
                 },
@@ -105,13 +164,13 @@ impl PreviewWindow {
             cbSize: size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
-        // SAFETY: `monitor` is the borrowed nearest-monitor handle and `monitor_info` is valid
-        // writable storage with its required size initialized.
+        // SAFETY: The borrowed monitor is valid and monitor_info is writable storage with the
+        // required size initialized.
         if !unsafe { GetMonitorInfoW(monitor, &mut monitor_info) }.as_bool() {
             return Err(Error::from_thread());
         }
 
-        let placement = place_diagnostic_preview(
+        let placement = place_preview(
             anchor,
             ScreenRect {
                 left: monitor_info.rcWork.left,
@@ -120,11 +179,18 @@ impl PreviewWindow {
                 bottom: monitor_info.rcWork.bottom,
             },
             dpi,
+            size,
         )
         .ok_or_else(Error::from_thread)?;
 
-        // SAFETY: The same live HWND is positioned wholly inside the selected work area. TOPMOST
-        // plus SHOWWINDOW displays it, while NOACTIVATE and WS_EX_NOACTIVATE preserve focus.
+        {
+            let mut state = self.state.borrow_mut();
+            state.configure(text, dpi);
+        }
+
+        // SAFETY: The HWND is positioned wholly inside the selected work area. TOPMOST and
+        // SHOWWINDOW display it; NOACTIVATE plus WS_EX_NOACTIVATE preserve the foreground window.
+        // Any synchronous WM_SIZE callback observes the already-updated RefCell state.
         unsafe {
             SetWindowPos(
                 self.hwnd,
@@ -137,7 +203,31 @@ impl PreviewWindow {
             )?;
         }
 
+        self.state.borrow_mut().prepare(self.hwnd)?;
+        self.redraw()?;
         Ok(placement)
+    }
+
+    fn redraw(&self) -> Result<()> {
+        // SAFETY: Invalidating and synchronously updating this live UI-thread HWND causes its
+        // WM_PAINT path to render retained state. No borrowed pointer is carried in a message.
+        if !unsafe {
+            RedrawWindow(
+                Some(self.hwnd),
+                None,
+                None,
+                RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW,
+            )
+        }
+        .as_bool()
+        {
+            return Err(Error::from_thread());
+        }
+
+        match self.state.borrow_mut().last_paint_error.take() {
+            Some(code) => Err(Error::from_hresult(code)),
+            None => Ok(()),
+        }
     }
 
     pub(crate) fn hide(&self) -> Result<()> {
@@ -158,7 +248,7 @@ impl PreviewWindow {
 
     #[cfg(test)]
     pub(crate) fn is_visible(&self) -> bool {
-        // SAFETY: The handle is owned and live for `self`.
+        // SAFETY: The handle is owned and live for self.
         unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(self.hwnd).as_bool() }
     }
 
@@ -169,8 +259,24 @@ impl PreviewWindow {
         result.0 == isize::try_from(MA_NOACTIVATEANDEAT).expect("the constant fits isize")
     }
 
-    pub(crate) fn handle(&self) -> HWND {
+    pub(crate) const fn handle(&self) -> HWND {
         self.hwnd
+    }
+
+    #[cfg(test)]
+    fn has_text_layouts(&self) -> bool {
+        self.state.borrow().layouts.is_some()
+    }
+
+    #[cfg(test)]
+    fn has_device_resources(&self) -> bool {
+        self.state.borrow().device.is_some()
+    }
+
+    #[cfg(test)]
+    fn force_device_loss_and_redraw(&self) -> Result<()> {
+        self.state.borrow_mut().force_recreate_target = true;
+        self.redraw()
     }
 }
 
@@ -178,35 +284,385 @@ impl Drop for PreviewWindow {
     fn drop(&mut self) {
         let _ = self.hide();
 
-        // SAFETY: The owner is !Send and drops on the creating UI thread. The HWND is destroyed
-        // before the registered class field is released.
+        // SAFETY: Clearing GWLP_USERDATA prevents teardown callbacks from reaching the boxed state
+        // through an alias to this exclusive Drop borrow. The !Send owner destroys its HWND on the
+        // creating UI thread before the state and registered class are released.
         unsafe {
+            SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
             let _ = DestroyWindow(self.hwnd);
         }
     }
 }
 
+struct PreviewWindowState {
+    d2d_factory: ID2D1Factory,
+    dwrite_factory: IDWriteFactory,
+    header_format: IDWriteTextFormat,
+    body_format: IDWriteTextFormat,
+    colors: PreviewColors,
+    content: Option<TextContent>,
+    layouts: Option<TextLayouts>,
+    device: Option<DeviceResources>,
+    pixel_size: D2D_SIZE_U,
+    dpi: u32,
+    last_paint_error: Option<HRESULT>,
+    #[cfg(test)]
+    force_recreate_target: bool,
+}
+
+impl PreviewWindowState {
+    fn new() -> Result<Self> {
+        // SAFETY: Both factory calls write a fresh COM interface. The Direct2D factory is used only
+        // on this UI thread; the recommended shared DirectWrite factory is retained with COM
+        // reference counting.
+        let d2d_factory: ID2D1Factory =
+            unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None) }?;
+        let dwrite_factory: IDWriteFactory =
+            unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }?;
+
+        // SAFETY: Static family and locale strings remain valid for each call. None selects the
+        // system font collection, and DirectWrite retains its own format state.
+        let header_format = unsafe {
+            dwrite_factory.CreateTextFormat(
+                w!("Segoe UI"),
+                None::<&IDWriteFontCollection>,
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                12.0,
+                w!("en-US"),
+            )?
+        };
+        let body_format = unsafe {
+            dwrite_factory.CreateTextFormat(
+                w!("Consolas"),
+                None::<&IDWriteFontCollection>,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                13.0,
+                w!("en-US"),
+            )?
+        };
+        // SAFETY: These calls mutate only newly created device-independent formats owned here.
+        unsafe {
+            header_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
+            header_format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR)?;
+            header_format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            body_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
+            body_format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR)?;
+            body_format.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP)?;
+        }
+
+        Ok(Self {
+            d2d_factory,
+            dwrite_factory,
+            header_format,
+            body_format,
+            colors: PreviewColors::system(),
+            content: None,
+            layouts: None,
+            device: None,
+            pixel_size: D2D_SIZE_U::default(),
+            dpi: 96,
+            last_paint_error: None,
+            #[cfg(test)]
+            force_recreate_target: false,
+        })
+    }
+
+    fn configure(&mut self, preview: Option<&TextPreview>, dpi: u32) {
+        if self.dpi != dpi {
+            self.dpi = dpi;
+            self.device = None;
+        }
+        self.content = preview.map(TextContent::from_preview);
+        self.layouts = None;
+        self.last_paint_error = None;
+    }
+
+    fn prepare(&mut self, hwnd: HWND) -> Result<()> {
+        let pixel_size = client_pixel_size(hwnd)?;
+        if self.pixel_size != pixel_size {
+            self.pixel_size = pixel_size;
+            if let Some(device) = self.device.as_ref() {
+                // SAFETY: The render target belongs to this HWND and UI thread. pixel_size was
+                // measured from the same live client area.
+                if let Err(error) = unsafe { device.target.Resize(&pixel_size) } {
+                    if error.code() == D2DERR_RECREATE_TARGET {
+                        self.device = None;
+                    } else {
+                        return Err(error);
+                    }
+                }
+            }
+            self.layouts = None;
+        }
+
+        if self.content.is_some()
+            && self.layouts.is_none()
+            && pixel_size.width != 0
+            && pixel_size.height != 0
+        {
+            self.layouts = Some(self.create_layouts()?);
+        }
+        Ok(())
+    }
+
+    fn create_layouts(&self) -> Result<TextLayouts> {
+        let content = self
+            .content
+            .as_ref()
+            .expect("text layouts are created only for retained text");
+        let width = pixels_to_dips(self.pixel_size.width, self.dpi);
+        let height = pixels_to_dips(self.pixel_size.height, self.dpi);
+        let layout_width = (width - CONTENT_MARGIN * 2.0).max(1.0);
+        let body_origin_y = CONTENT_MARGIN + HEADER_HEIGHT + HEADER_BODY_GAP;
+        let body_height = (height - body_origin_y - CONTENT_MARGIN).max(1.0);
+
+        // SAFETY: The bounded UTF-16 buffers remain alive in content for the complete calls.
+        // Formats and the factory are retained COM resources on this thread.
+        let header = unsafe {
+            self.dwrite_factory.CreateTextLayout(
+                &content.header,
+                &self.header_format,
+                layout_width,
+                HEADER_HEIGHT,
+            )?
+        };
+        let body = if content.body.is_empty() {
+            None
+        } else {
+            Some(unsafe {
+                self.dwrite_factory.CreateTextLayout(
+                    &content.body,
+                    &self.body_format,
+                    layout_width,
+                    body_height,
+                )?
+            })
+        };
+        Ok(TextLayouts {
+            header,
+            body,
+            body_origin_y,
+        })
+    }
+
+    fn render_with_recovery(&mut self, hwnd: HWND) -> Result<()> {
+        match self.render_once(hwnd) {
+            Err(error) if error.code() == D2DERR_RECREATE_TARGET => {
+                self.device = None;
+                self.render_once(hwnd)
+            }
+            result => result,
+        }
+    }
+
+    fn render_once(&mut self, hwnd: HWND) -> Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.force_recreate_target) {
+            return Err(Error::from_hresult(D2DERR_RECREATE_TARGET));
+        }
+
+        self.prepare(hwnd)?;
+        if self.pixel_size.width == 0 || self.pixel_size.height == 0 {
+            return Ok(());
+        }
+        if self.device.is_none() {
+            self.device = Some(self.create_device_resources(hwnd)?);
+        }
+
+        let device = self
+            .device
+            .as_ref()
+            .expect("device resources are created before drawing");
+        // SAFETY: BeginDraw and EndDraw are paired without an early return. Every retained layout,
+        // brush, and target is a live COM resource created for this UI-thread HWND.
+        unsafe {
+            device.target.BeginDraw();
+            device.target.Clear(Some(&self.colors.background));
+            if let Some(layouts) = self.layouts.as_ref() {
+                device.target.DrawTextLayout(
+                    Vector2 {
+                        X: CONTENT_MARGIN,
+                        Y: CONTENT_MARGIN,
+                    },
+                    &layouts.header,
+                    &device.metadata_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                );
+                if let Some(body) = layouts.body.as_ref() {
+                    device.target.DrawTextLayout(
+                        Vector2 {
+                            X: CONTENT_MARGIN,
+                            Y: layouts.body_origin_y,
+                        },
+                        body,
+                        &device.body_brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                    );
+                }
+            }
+            device.target.EndDraw(None, None)
+        }
+    }
+
+    fn create_device_resources(&self, hwnd: HWND) -> Result<DeviceResources> {
+        let target_properties = D2D1_RENDER_TARGET_PROPERTIES {
+            dpiX: self.dpi as f32,
+            dpiY: self.dpi as f32,
+            ..Default::default()
+        };
+        let hwnd_properties = D2D1_HWND_RENDER_TARGET_PROPERTIES {
+            hwnd,
+            pixelSize: self.pixel_size,
+            presentOptions: D2D1_PRESENT_OPTIONS_NONE,
+        };
+
+        // SAFETY: Both property structures are initialized for this live HWND and client size.
+        // The returned target and brushes are owned COM references retained together.
+        let target = unsafe {
+            self.d2d_factory
+                .CreateHwndRenderTarget(&target_properties, &hwnd_properties)?
+        };
+        let body_brush = unsafe { target.CreateSolidColorBrush(&self.colors.body, None) }?;
+        let metadata_brush = unsafe { target.CreateSolidColorBrush(&self.colors.metadata, None) }?;
+        Ok(DeviceResources {
+            target,
+            body_brush,
+            metadata_brush,
+        })
+    }
+}
+
+struct TextContent {
+    header: Vec<u16>,
+    body: Vec<u16>,
+}
+
+impl TextContent {
+    fn from_preview(preview: &TextPreview) -> Self {
+        Self {
+            header: preview_header(preview).encode_utf16().collect(),
+            body: preview.text.encode_utf16().collect(),
+        }
+    }
+}
+
+struct TextLayouts {
+    header: IDWriteTextLayout,
+    body: Option<IDWriteTextLayout>,
+    body_origin_y: f32,
+}
+
+struct DeviceResources {
+    target: ID2D1HwndRenderTarget,
+    body_brush: ID2D1SolidColorBrush,
+    metadata_brush: ID2D1SolidColorBrush,
+}
+
+#[derive(Clone, Copy)]
+struct PreviewColors {
+    background: D2D1_COLOR_F,
+    body: D2D1_COLOR_F,
+    metadata: D2D1_COLOR_F,
+}
+
+impl PreviewColors {
+    fn system() -> Self {
+        // SAFETY: GetSysColor returns process-independent COLORREF values and transfers no handle.
+        unsafe {
+            Self {
+                background: color_from_colorref(GetSysColor(COLOR_WINDOW)),
+                body: color_from_colorref(GetSysColor(COLOR_WINDOWTEXT)),
+                metadata: color_from_colorref(GetSysColor(COLOR_GRAYTEXT)),
+            }
+        }
+    }
+}
+
+fn preview_header(preview: &TextPreview) -> String {
+    let mut header = format!(
+        "{}  ·  {}",
+        preview.encoding,
+        format_file_size(preview.file_size)
+    );
+    if preview.encoding_was_guessed {
+        header.push_str("  ·  guessed");
+    }
+    if preview.truncated {
+        header.push_str("  ·  truncated");
+    }
+    if preview.linked_content {
+        header.push_str("  ·  linked");
+    }
+    header
+}
+
+fn format_file_size(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+    match bytes {
+        0..=1023 => format!("{bytes} B"),
+        1024..=1_048_575 => format!("{:.1} KiB", bytes as f64 / KIB),
+        1_048_576..=1_073_741_823 => format!("{:.1} MiB", bytes as f64 / MIB),
+        _ => format!("{:.1} GiB", bytes as f64 / GIB),
+    }
+}
+
+fn color_from_colorref(color: u32) -> D2D1_COLOR_F {
+    const CHANNEL_MAX: f32 = 255.0;
+    D2D1_COLOR_F {
+        r: (color & 0xff) as f32 / CHANNEL_MAX,
+        g: ((color >> 8) & 0xff) as f32 / CHANNEL_MAX,
+        b: ((color >> 16) & 0xff) as f32 / CHANNEL_MAX,
+        a: 1.0,
+    }
+}
+
+fn pixels_to_dips(pixels: u32, dpi: u32) -> f32 {
+    pixels as f32 * BASE_DPI / dpi as f32
+}
+
+fn client_pixel_size(hwnd: HWND) -> Result<D2D_SIZE_U> {
+    let mut client = RECT::default();
+    // SAFETY: client is valid writable storage and hwnd is the live preview window.
+    unsafe { GetClientRect(hwnd, &mut client)? };
+    let width = u32::try_from(client.right.saturating_sub(client.left))
+        .map_err(|_| Error::from_thread())?;
+    let height = u32::try_from(client.bottom.saturating_sub(client.top))
+        .map_err(|_| Error::from_thread())?;
+    Ok(D2D_SIZE_U { width, height })
+}
+
 struct RegisteredPreviewClass {
     instance: HINSTANCE,
+    name: Vec<u16>,
     _thread_affinity: PhantomData<Rc<()>>,
 }
 
 impl RegisteredPreviewClass {
     fn register() -> Result<Self> {
+        // SAFETY: The returned module handle is borrowed from the current process.
         let instance = HINSTANCE::from(unsafe { GetModuleHandleW(None)? });
-        // SAFETY: This returns a borrowed system-color brush. Windows owns it for the process
-        // lifetime; CursorPeek neither deletes nor transfers it.
-        let background = unsafe { GetSysColorBrush(COLOR_HIGHLIGHT) };
+        let class_id = NEXT_CLASS_ID.fetch_add(1, Ordering::Relaxed);
+        let name: Vec<u16> = format!("{CLASS_NAME_PREFIX}.{}.{class_id}", std::process::id())
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         let window_class = WNDCLASSW {
             lpfnWndProc: Some(preview_window_proc),
             hInstance: instance,
-            hbrBackground: background,
-            lpszClassName: CLASS_NAME,
+            lpszClassName: PCWSTR(name.as_ptr()),
             ..Default::default()
         };
 
-        // SAFETY: The class definition is initialized and every referenced callback/string remains
-        // valid until the class is unregistered on this same thread.
+        // SAFETY: The initialized callback and owned class string remain valid until the only
+        // preview HWND is destroyed and this class is unregistered on the same thread. The
+        // process-local suffix permits independent preview owners in concurrent tests.
         let atom = unsafe { RegisterClassW(&window_class) };
         if atom == 0 {
             return Err(Error::from_thread());
@@ -214,17 +670,47 @@ impl RegisteredPreviewClass {
 
         Ok(Self {
             instance,
+            name,
             _thread_affinity: PhantomData,
         })
+    }
+
+    fn name(&self) -> PCWSTR {
+        PCWSTR(self.name.as_ptr())
     }
 }
 
 impl Drop for RegisteredPreviewClass {
     fn drop(&mut self) {
-        // SAFETY: PreviewWindow destroys its only HWND before this field drops. The background is
-        // a borrowed system brush and must not be deleted by CursorPeek.
+        // SAFETY: PreviewWindow destroys its only HWND before this field drops.
         unsafe {
-            let _ = UnregisterClassW(CLASS_NAME, Some(self.instance));
+            let _ = UnregisterClassW(self.name(), Some(self.instance));
+        }
+    }
+}
+
+struct PaintSession {
+    hwnd: HWND,
+    paint: PAINTSTRUCT,
+}
+
+impl PaintSession {
+    fn begin(hwnd: HWND) -> Self {
+        let mut paint = PAINTSTRUCT::default();
+        // SAFETY: paint is valid writable storage and EndPaint is guaranteed by Drop.
+        unsafe {
+            let _ = BeginPaint(hwnd, &mut paint);
+        }
+        Self { hwnd, paint }
+    }
+}
+
+impl Drop for PaintSession {
+    fn drop(&mut self) {
+        // SAFETY: This exactly balances the successful BeginPaint call for the same HWND and
+        // PAINTSTRUCT, including while unwinding inside the callback containment boundary.
+        unsafe {
+            let _ = EndPaint(self.hwnd, &self.paint);
         }
     }
 }
@@ -236,21 +722,87 @@ unsafe extern "system" fn preview_window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     std::panic::catch_unwind(AssertUnwindSafe(|| {
-        if message == WM_MOUSEACTIVATE {
-            return LRESULT(isize::try_from(MA_NOACTIVATEANDEAT).expect("the constant fits isize"));
-        }
-
-        // SAFETY: These are the untouched parameters supplied by Windows to this WNDPROC.
-        unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+        dispatch_preview_message(hwnd, message, wparam, lparam)
     }))
     .unwrap_or(LRESULT(0))
 }
 
+fn dispatch_preview_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if message == WM_NCCREATE {
+        // SAFETY: WM_NCCREATE supplies a valid CREATESTRUCTW whose lpCreateParams is the stable
+        // RefCell pointer passed to CreateWindowExW.
+        let state = unsafe { &*(lparam.0 as *const CREATESTRUCTW) }.lpCreateParams;
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
+        }
+        return LRESULT(1);
+    }
+
+    if message == WM_NCDESTROY {
+        // SAFETY: Clearing the non-owning pointer prevents later callbacks from observing state.
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            return DefWindowProcW(hwnd, message, wparam, lparam);
+        }
+    }
+
+    if message == WM_MOUSEACTIVATE {
+        return LRESULT(isize::try_from(MA_NOACTIVATEANDEAT).expect("the constant fits isize"));
+    }
+
+    if message == WM_ERASEBKGND {
+        return LRESULT(1);
+    }
+
+    if message == WM_SIZE {
+        if let Some(state) = preview_state(hwnd) {
+            let mut state = state.borrow_mut();
+            let result = state.prepare(hwnd);
+            state.last_paint_error = result.err().map(|error| error.code());
+        }
+    } else if message == WM_PAINT {
+        let _paint = PaintSession::begin(hwnd);
+        if let Some(state) = preview_state(hwnd) {
+            let mut state = state.borrow_mut();
+            let result = state.render_with_recovery(hwnd);
+            state.last_paint_error = result.err().map(|error| error.code());
+        }
+        return LRESULT(0);
+    }
+
+    // SAFETY: These are the untouched parameters supplied by Windows to this WNDPROC.
+    unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+}
+
+fn preview_state(hwnd: HWND) -> Option<&'static RefCell<PreviewWindowState>> {
+    // SAFETY: PreviewWindow stores a stable Box pointer at WM_NCCREATE and clears it before either
+    // HWND or Box teardown. This helper is called only synchronously on the owning UI thread.
+    let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) };
+    (pointer != 0).then(|| unsafe { &*(pointer as *const RefCell<PreviewWindowState>) })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::PreviewWindow;
+    use super::{
+        D2D_SIZE_U, PreviewWindow, PreviewWindowState, color_from_colorref, format_file_size,
+        preview_header,
+    };
+    use crate::{hover::PhysicalScreenPoint, preview::PreviewSize, worker::TextPreview};
     use std::thread;
-    use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+    use windows::Win32::{
+        Graphics::DirectWrite::DWRITE_TEXT_METRICS, UI::WindowsAndMessaging::IsWindow,
+    };
+
+    fn text_preview() -> TextPreview {
+        TextPreview {
+            file_size: 12_800,
+            linked_content: true,
+            encoding_was_guessed: true,
+            truncated: true,
+            encoding: "windows-1252".to_owned(),
+            text: "Hello, 世界\nPlain text only.".to_owned(),
+        }
+    }
 
     #[test]
     fn preview_window_lifecycle_and_mouse_activation_policy_are_sound() {
@@ -260,7 +812,7 @@ mod tests {
                     PreviewWindow::create().expect("the preview window should be created");
                 let handle = preview.handle();
 
-                // SAFETY: `handle` belongs to the live preview on this test thread.
+                // SAFETY: handle belongs to the live preview on this test thread.
                 assert!(unsafe { IsWindow(Some(handle)).as_bool() });
                 assert!(!preview.is_visible());
                 assert!(preview.eats_mouse_activation());
@@ -272,5 +824,96 @@ mod tests {
         })
         .join()
         .expect("the preview-window test thread should not panic");
+    }
+
+    #[test]
+    fn text_layout_renders_and_recovers_device_resources() {
+        thread::spawn(|| {
+            let preview = PreviewWindow::create().expect("the preview window should be created");
+            preview
+                .show_text_at(
+                    PhysicalScreenPoint::new(200, 200),
+                    PreviewSize::new(640, 480),
+                    &text_preview(),
+                )
+                .expect("bounded text should render");
+            assert!(preview.is_visible());
+            assert!(preview.has_text_layouts());
+            assert!(preview.has_device_resources());
+
+            preview
+                .force_device_loss_and_redraw()
+                .expect("a lost target should be discarded and recreated once");
+            assert!(preview.has_device_resources());
+        })
+        .join()
+        .expect("the render test thread should not panic");
+    }
+
+    #[test]
+    fn multilingual_layout_keeps_logical_bounds_from_100_to_200_percent_dpi() {
+        thread::spawn(|| {
+            let preview = TextPreview {
+                file_size: 4_096,
+                linked_content: false,
+                encoding_was_guessed: false,
+                truncated: false,
+                encoding: "UTF-8".to_owned(),
+                text: concat!(
+                    "Latin café · Ελληνικά · Русский\n",
+                    "العربية · עברית · हिन्दी · ไทย\n",
+                    "中文 · 日本語 · 한국어 · 👩🏽‍💻 · e\u{301}"
+                )
+                .to_owned(),
+            };
+
+            for dpi in [96, 120, 144, 168, 192] {
+                let mut state =
+                    PreviewWindowState::new().expect("DirectWrite factories should initialize");
+                state.configure(Some(&preview), dpi);
+                state.pixel_size = D2D_SIZE_U {
+                    width: 640 * dpi / 96,
+                    height: 480 * dpi / 96,
+                };
+                let layouts = state
+                    .create_layouts()
+                    .expect("the multilingual text should produce layouts");
+                let body = layouts.body.expect("the corpus body is not empty");
+                let mut metrics = DWRITE_TEXT_METRICS::default();
+                // SAFETY: metrics is writable storage and body is a live retained layout.
+                unsafe {
+                    body.GetMetrics(&mut metrics)
+                        .expect("DirectWrite should return layout metrics");
+                }
+
+                assert!((metrics.layoutWidth - 616.0).abs() < f32::EPSILON);
+                assert!((metrics.layoutHeight - 430.0).abs() < f32::EPSILON);
+                assert!(metrics.lineCount >= 3);
+            }
+        })
+        .join()
+        .expect("the high-DPI layout test thread should not panic");
+    }
+
+    #[test]
+    fn metadata_header_and_size_labels_are_bounded_and_explicit() {
+        assert_eq!(
+            preview_header(&text_preview()),
+            "windows-1252  ·  12.5 KiB  ·  guessed  ·  truncated  ·  linked"
+        );
+        assert_eq!(format_file_size(0), "0 B");
+        assert_eq!(format_file_size(1023), "1023 B");
+        assert_eq!(format_file_size(1024), "1.0 KiB");
+        assert_eq!(format_file_size(1024 * 1024), "1.0 MiB");
+        assert_eq!(format_file_size(1024 * 1024 * 1024), "1.0 GiB");
+    }
+
+    #[test]
+    fn colorref_conversion_preserves_windows_channel_order() {
+        let color = color_from_colorref(0x00_33_22_11);
+        assert!((color.r - 0x11 as f32 / 255.0).abs() < f32::EPSILON);
+        assert!((color.g - 0x22 as f32 / 255.0).abs() < f32::EPSILON);
+        assert!((color.b - 0x33 as f32 / 255.0).abs() < f32::EPSILON);
+        assert_eq!(color.a, 1.0);
     }
 }

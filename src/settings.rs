@@ -11,6 +11,7 @@ use std::{
     time::Duration,
 };
 
+use encoding_rs::{Encoding, UTF_8, UTF_16BE, UTF_16LE, X_USER_DEFINED};
 use windows::{
     Win32::{
         Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW},
@@ -74,7 +75,7 @@ impl Theme {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum LegacyEncoding {
+pub(crate) enum LegacyEncoding {
     Auto,
     System,
     Off,
@@ -82,17 +83,17 @@ enum LegacyEncoding {
 }
 
 impl LegacyEncoding {
-    fn parse(value: &str) -> Option<Self> {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
             "auto" => Some(Self::Auto),
             "system" => Some(Self::System),
             "off" => Some(Self::Off),
-            _ if is_encoding_label(value) => Some(Self::Label(value.to_ascii_lowercase())),
-            _ => None,
+            _ => supported_legacy_encoding(value)
+                .map(|encoding| Self::Label(encoding.name().to_ascii_lowercase())),
         }
     }
 
-    fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         match self {
             Self::Auto => "auto",
             Self::System => "system",
@@ -128,6 +129,18 @@ impl Default for AppSettings {
 impl AppSettings {
     pub(crate) const fn dwell_delay(&self) -> Duration {
         Duration::from_millis(self.dwell_delay_ms)
+    }
+
+    pub(crate) const fn legacy_encoding(&self) -> &LegacyEncoding {
+        &self.legacy_encoding
+    }
+
+    pub(crate) const fn preview_width(&self) -> u16 {
+        self.preview_width
+    }
+
+    pub(crate) const fn preview_height(&self) -> u16 {
+        self.preview_height
     }
 
     fn validate(&self) -> Result<(), SettingsParseError> {
@@ -332,8 +345,7 @@ const INVALID_DWELL_DELAY: &str = "invalid `dwell_delay_ms` value: expected 150-
 const INVALID_PREVIEW_WIDTH: &str = "invalid `preview_width` value: expected 320-960";
 const INVALID_PREVIEW_HEIGHT: &str = "invalid `preview_height` value: expected 240-720";
 const INVALID_THEME: &str = "invalid `theme` value: expected `system`, `light`, or `dark`";
-const INVALID_LEGACY_ENCODING: &str =
-    "invalid `legacy_encoding` value: expected `auto`, `system`, `off`, or a bounded ASCII label";
+const INVALID_LEGACY_ENCODING: &str = "invalid `legacy_encoding` value: expected `auto`, `system`, `off`, or a supported legacy encoding label";
 const INVALID_START_WITH_WINDOWS: &str =
     "invalid `start_with_windows` value: expected `true` or `false`";
 
@@ -646,6 +658,22 @@ fn is_encoding_label(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
+fn supported_legacy_encoding(value: &str) -> Option<&'static Encoding> {
+    if !is_encoding_label(value) {
+        return None;
+    }
+    let encoding = Encoding::for_label_no_replacement(value.as_bytes())?;
+    if encoding == UTF_8
+        || encoding == UTF_16LE
+        || encoding == UTF_16BE
+        || encoding == X_USER_DEFINED
+    {
+        None
+    } else {
+        Some(encoding)
+    }
+}
+
 struct OwnedTaskPath(PWSTR);
 
 impl OwnedTaskPath {
@@ -890,6 +918,10 @@ mod tests {
             SettingsDocument::parse(encoded).expect("saved settings should parse"),
             document
         );
+        assert_eq!(
+            LegacyEncoding::parse("latin1"),
+            Some(LegacyEncoding::Label("windows-1252".to_owned()))
+        );
     }
 
     #[test]
@@ -900,7 +932,10 @@ mod tests {
             ("preview_width=961\n", "expected 320-960"),
             ("preview_height=239\n", "expected 240-720"),
             ("theme=automatic\n", "system"),
-            ("legacy_encoding=utf 8\n", "bounded ASCII label"),
+            ("legacy_encoding=utf 8\n", "supported legacy"),
+            ("legacy_encoding=utf-8\n", "supported legacy"),
+            ("legacy_encoding=x-user-defined\n", "supported legacy"),
+            ("legacy_encoding=not-a-codepage\n", "supported legacy"),
             ("start_with_windows=1\n", "true"),
             ("theme=dark\ntheme=light\n", "duplicate"),
             ("missing separator\n", "key=value"),

@@ -11,6 +11,7 @@ use crate::{
         PREVIEW_WINDOW_PRACTICE_DURATION, SingleInstance, activate_existing_instance,
         verify_per_monitor_v2,
     },
+    preview::PreviewSize,
     resolver::{ExplorerResolver, ResolverError},
     settings::{SettingsError, SettingsFile},
     worker::{self, WorkerManagerError, WorkerSessionError},
@@ -49,9 +50,16 @@ pub(crate) fn run(process_mode: ProcessMode) -> Result<(), AppError> {
         ProcessMode::Main => {
             let settings_file = SettingsFile::discover()?;
             let settings = settings_file.load_or_create()?;
-            let message_window =
-                MessageWindow::create_with_dwell_delay(settings.settings().dwell_delay())?;
-            let worker_manager = worker::WorkerManager::start()?;
+            let preview_size = PreviewSize::new(
+                u32::from(settings.settings().preview_width()),
+                u32::from(settings.settings().preview_height()),
+            );
+            let message_window = MessageWindow::create_for_application(
+                settings.settings().dwell_delay(),
+                preview_size,
+            )?;
+            let worker_manager =
+                worker::WorkerManager::start(settings.settings().legacy_encoding().clone())?;
             message_window.run_application(worker_manager)?;
         }
         ProcessMode::InputDiagnostics => {

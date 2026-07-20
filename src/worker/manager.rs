@@ -22,6 +22,7 @@ use windows::{
 use crate::{
     hover::{Generation, PhysicalScreenPoint},
     platform::{ContainedWorker, ProcessError, WorkerPipes},
+    settings::LegacyEncoding,
 };
 
 use super::{
@@ -38,6 +39,7 @@ pub(crate) fn run_launch_diagnostic() -> Result<WorkerDiagnosticReport, WorkerMa
     let started = Instant::now();
     let manager = WorkerManager::start_with_config(WorkerManagerConfig {
         idle_lifetime: DIAGNOSTIC_IDLE_LIFETIME,
+        ..WorkerManagerConfig::default()
     })?;
 
     let diagnostic_result = (|| {
@@ -143,15 +145,17 @@ fn ensure_unavailable(result: &PreviewResult) -> Result<(), WorkerManagerError> 
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct WorkerManagerConfig {
     idle_lifetime: Duration,
+    legacy_encoding: LegacyEncoding,
 }
 
 impl Default for WorkerManagerConfig {
     fn default() -> Self {
         Self {
             idle_lifetime: DEFAULT_WORKER_IDLE_LIFETIME,
+            legacy_encoding: LegacyEncoding::Auto,
         }
     }
 }
@@ -163,8 +167,11 @@ pub(crate) struct WorkerManager {
 }
 
 impl WorkerManager {
-    pub(crate) fn start() -> Result<Self, WorkerManagerError> {
-        Self::start_with_config(WorkerManagerConfig::default())
+    pub(crate) fn start(legacy_encoding: LegacyEncoding) -> Result<Self, WorkerManagerError> {
+        Self::start_with_config(WorkerManagerConfig {
+            legacy_encoding,
+            ..WorkerManagerConfig::default()
+        })
     }
 
     fn start_with_config(config: WorkerManagerConfig) -> Result<Self, WorkerManagerError> {
@@ -260,6 +267,10 @@ pub(crate) struct WorkerResolution {
 impl WorkerResolution {
     pub(crate) const fn generation(&self) -> Generation {
         self.generation
+    }
+
+    pub(crate) fn into_result(self) -> PreviewResult {
+        self.result
     }
 }
 
@@ -490,7 +501,7 @@ fn manager_loop(
                         );
                         continue;
                     };
-                    match WorkerSession::spawn(session_id) {
+                    match WorkerSession::spawn(session_id, config.legacy_encoding.clone()) {
                         Ok(started) => {
                             next_session_id = following_session_id;
                             session = Some(started);
@@ -583,7 +594,7 @@ struct WorkerSession {
 }
 
 impl WorkerSession {
-    fn spawn(id: u64) -> Result<Self, WorkerManagerError> {
+    fn spawn(id: u64, legacy_encoding: LegacyEncoding) -> Result<Self, WorkerManagerError> {
         let nonce = generate_nonce()?;
         let executable = env::current_exe().map_err(WorkerManagerError::CurrentExecutable)?;
         let mut worker = ContainedWorker::spawn(&executable)?;
@@ -605,7 +616,14 @@ impl WorkerSession {
         let protocol_thread = match thread::Builder::new()
             .name("cursorpeek-worker-protocol".into())
             .spawn(move || {
-                protocol_loop(stdin, stdout, nonce, command_receiver, ready_sender);
+                protocol_loop(
+                    stdin,
+                    stdout,
+                    nonce,
+                    legacy_encoding,
+                    command_receiver,
+                    ready_sender,
+                );
             }) {
             Ok(thread) => thread,
             Err(error) => {
@@ -725,11 +743,18 @@ fn protocol_loop(
     mut stdin: impl io::Write,
     mut stdout: impl Read,
     nonce: SessionNonce,
+    legacy_encoding: LegacyEncoding,
     command_receiver: Receiver<ProtocolCommand>,
     ready_sender: SyncSender<Result<(), WorkerManagerError>>,
 ) {
     let handshake = (|| {
-        protocol::write_message(&mut stdin, WorkerMessage::Hello { nonce })?;
+        protocol::write_message(
+            &mut stdin,
+            WorkerMessage::Hello {
+                nonce,
+                legacy_encoding,
+            },
+        )?;
         validate_ready(protocol::read_message(&mut stdout)?, nonce)
     })();
     if let Err(error) = handshake {
