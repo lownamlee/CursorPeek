@@ -576,6 +576,9 @@ const fn at_least(count: usize, total: usize, numerator: usize, denominator: usi
 }
 
 #[cfg(test)]
+mod corpus;
+
+#[cfg(test)]
 mod tests {
     use super::{
         TEXT_EXTENSIONS, TEXT_NAMES, TextByteKind, TextDecodeResult, classify_bytes,

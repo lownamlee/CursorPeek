@@ -1,0 +1,16 @@
+case_id	category	expected
+utf8-multiscript	Unicode	preview:UTF-8
+utf8-combining-emoji	Unicode	preview:UTF-8
+utf16le-mixed-endings	Unicode	preview:UTF-16-LE
+utf16be-multiscript	Unicode	preview:UTF-16-BE
+utf32le-supplementary	Unicode	preview:UTF-32-LE
+utf32be-rtl	Unicode	preview:UTF-32-BE
+windows1252-explicit	legacy	preview:windows-1252
+shiftjis-explicit	legacy	preview:Shift_JIS
+controls-bidi-sanitized	hostile	preview:sanitized
+line-limit	boundary	preview:truncated
+scalar-limit	boundary	preview:truncated
+malformed-utf8-bom	malformed	unsupported
+malformed-utf16-bom	malformed	unsupported
+png-masquerade	binary	unsupported
+control-heavy	binary	unsupported

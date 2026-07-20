@@ -783,10 +783,15 @@ fn preview_state(hwnd: HWND) -> Option<&'static RefCell<PreviewWindowState>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PreviewWindow, color_from_colorref, format_file_size, preview_header};
+    use super::{
+        D2D_SIZE_U, PreviewWindow, PreviewWindowState, color_from_colorref, format_file_size,
+        preview_header,
+    };
     use crate::{hover::PhysicalScreenPoint, preview::PreviewSize, worker::TextPreview};
     use std::thread;
-    use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+    use windows::Win32::{
+        Graphics::DirectWrite::DWRITE_TEXT_METRICS, UI::WindowsAndMessaging::IsWindow,
+    };
 
     fn text_preview() -> TextPreview {
         TextPreview {
@@ -843,6 +848,51 @@ mod tests {
         })
         .join()
         .expect("the render test thread should not panic");
+    }
+
+    #[test]
+    fn multilingual_layout_keeps_logical_bounds_from_100_to_200_percent_dpi() {
+        thread::spawn(|| {
+            let preview = TextPreview {
+                file_size: 4_096,
+                linked_content: false,
+                encoding_was_guessed: false,
+                truncated: false,
+                encoding: "UTF-8".to_owned(),
+                text: concat!(
+                    "Latin café · Ελληνικά · Русский\n",
+                    "العربية · עברית · हिन्दी · ไทย\n",
+                    "中文 · 日本語 · 한국어 · 👩🏽‍💻 · e\u{301}"
+                )
+                .to_owned(),
+            };
+
+            for dpi in [96, 120, 144, 168, 192] {
+                let mut state =
+                    PreviewWindowState::new().expect("DirectWrite factories should initialize");
+                state.configure(Some(&preview), dpi);
+                state.pixel_size = D2D_SIZE_U {
+                    width: 640 * dpi / 96,
+                    height: 480 * dpi / 96,
+                };
+                let layouts = state
+                    .create_layouts()
+                    .expect("the multilingual text should produce layouts");
+                let body = layouts.body.expect("the corpus body is not empty");
+                let mut metrics = DWRITE_TEXT_METRICS::default();
+                // SAFETY: metrics is writable storage and body is a live retained layout.
+                unsafe {
+                    body.GetMetrics(&mut metrics)
+                        .expect("DirectWrite should return layout metrics");
+                }
+
+                assert!((metrics.layoutWidth - 616.0).abs() < f32::EPSILON);
+                assert!((metrics.layoutHeight - 430.0).abs() < f32::EPSILON);
+                assert!(metrics.lineCount >= 3);
+            }
+        })
+        .join()
+        .expect("the high-DPI layout test thread should not panic");
     }
 
     #[test]
