@@ -372,7 +372,7 @@ fn decoder_limits() -> Limits {
     limits
 }
 
-fn is_eligible_path(path: &Path) -> bool {
+pub(super) fn is_eligible_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| {

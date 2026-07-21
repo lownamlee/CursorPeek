@@ -47,10 +47,18 @@ struct FileIdentity {
 struct FileSnapshot {
     identity: FileIdentity,
     file_size: u64,
+    creation_time: i64,
     last_write_time: i64,
+    change_time: i64,
     basic_attributes: u32,
     tag_attributes: u32,
     reparse_tag: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PreviewFileIdentity {
+    snapshot: FileSnapshot,
+    linked_content: bool,
 }
 
 pub(super) struct PreviewFile {
@@ -180,6 +188,13 @@ impl PreviewFile {
     pub(super) fn is_linked_content(&self) -> bool {
         self.opened_path != self.final_path
     }
+
+    pub(super) fn cache_identity(&self) -> PreviewFileIdentity {
+        PreviewFileIdentity {
+            snapshot: self.snapshot,
+            linked_content: self.is_linked_content(),
+        }
+    }
 }
 
 fn require_disk_file(file: &File) -> Result<(), PreviewFileError> {
@@ -249,7 +264,9 @@ fn query_snapshot(file: &File) -> Result<FileSnapshot, PreviewFileError> {
             file_id: id.FileId.Identifier,
         },
         file_size,
+        creation_time: basic.CreationTime,
         last_write_time: basic.LastWriteTime,
+        change_time: basic.ChangeTime,
         basic_attributes: basic.FileAttributes,
         tag_attributes: attribute_tag.FileAttributes,
         reparse_tag: attribute_tag.ReparseTag,
