@@ -998,7 +998,7 @@ mod tests {
     use crate::{
         hover::PhysicalScreenPoint,
         preview::PreviewSize,
-        worker::{ImageFormat, ImagePreview, TextPreview},
+        worker::{ImageFormat, ImagePreview, TextPreview, image_corpus_previews},
     };
     use std::thread;
     use windows::Win32::{
@@ -1100,6 +1100,38 @@ mod tests {
         })
         .join()
         .expect("the image-render test thread should not panic");
+    }
+
+    #[test]
+    fn generated_image_corpus_renders_and_recovers_device_resources() {
+        thread::spawn(|| {
+            let preview = PreviewWindow::create().expect("the preview window should be created");
+            for case in image_corpus_previews() {
+                preview
+                    .show_image_at(
+                        PhysicalScreenPoint::new(200, 200),
+                        PreviewSize::new(640, 480),
+                        case.preview,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("image corpus case `{}` should render: {error}", case.id)
+                    });
+                assert!(preview.has_content_layouts(), "corpus case `{}`", case.id);
+                assert!(preview.has_image_bitmap(), "corpus case `{}`", case.id);
+                preview
+                    .force_device_loss_and_redraw()
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "image corpus case `{}` should recover device loss: {error}",
+                            case.id
+                        )
+                    });
+                assert!(preview.has_image_bitmap(), "corpus case `{}`", case.id);
+                assert!(preview.has_device_resources(), "corpus case `{}`", case.id);
+            }
+        })
+        .join()
+        .expect("the image-corpus render thread should not panic");
     }
 
     #[test]

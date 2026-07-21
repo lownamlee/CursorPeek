@@ -21,6 +21,8 @@ use payload::ResolverStatus;
 use protocol::{ProtocolStreamError, WorkerMessage};
 use text::TextDecodeResult;
 
+#[cfg(test)]
+pub(crate) use image::corpus::renderable_previews as image_corpus_previews;
 pub(crate) use manager::{
     CompletionNotifier, PendingWorkerPoll, PendingWorkerResolution, WorkerManager,
     WorkerManagerError, run_launch_diagnostic, run_timeout_diagnostic,

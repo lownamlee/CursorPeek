@@ -1,5 +1,8 @@
 use std::{error::Error, fmt, io::BufReader, path::Path};
 
+#[cfg(test)]
+pub(super) mod corpus;
+
 use ::image::{
     DynamicImage, ImageDecoder, ImageError, ImageFormat as DecoderFormat, Limits,
     codecs::{
