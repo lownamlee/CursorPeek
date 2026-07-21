@@ -3,7 +3,7 @@ use std::{
     ffi::OsString,
     fmt,
     fs::File,
-    io,
+    io::{self, Seek, SeekFrom},
     mem::size_of,
     os::windows::{
         ffi::{OsStrExt, OsStringExt},
@@ -115,6 +115,23 @@ impl PreviewFile {
 
     pub(super) const fn file_size(&self) -> u64 {
         self.snapshot.file_size
+    }
+
+    pub(super) fn duplicate_reader(&self) -> Result<File, PreviewFileError> {
+        let mut reader = self
+            .file
+            .try_clone()
+            .map_err(|source| PreviewFileError::Io {
+                operation: "duplicate the validated preview file handle",
+                source,
+            })?;
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|source| PreviewFileError::Io {
+                operation: "rewind the duplicated preview file handle",
+                source,
+            })?;
+        Ok(reader)
     }
 
     pub(super) fn read_prefix(&self, max_bytes: usize) -> Result<Vec<u8>, PreviewFileError> {
@@ -528,7 +545,8 @@ mod tests {
         is_local_drive_path, null_terminated_path, require_content_available,
     };
     use std::{
-        env, fs, io,
+        env, fs,
+        io::{self, Read},
         os::windows::ffi::OsStringExt,
         path::{Path, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
@@ -582,6 +600,10 @@ mod tests {
 
         let file = PreviewFile::open(&path).unwrap();
         assert_eq!(file.read_prefix(64 * 1024).unwrap(), vec![b'x'; 64 * 1024]);
+        let mut duplicated = file.duplicate_reader().unwrap();
+        let mut duplicated_bytes = Vec::new();
+        duplicated.read_to_end(&mut duplicated_bytes).unwrap();
+        assert_eq!(duplicated_bytes, vec![b'x'; MAX_CONTENT_PREFIX_LEN + 1]);
         assert!(file.is_unchanged().unwrap());
         assert!(matches!(
             file.read_prefix(0),

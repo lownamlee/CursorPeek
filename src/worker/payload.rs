@@ -7,6 +7,7 @@ pub(super) const MAX_TEXT_SCALARS: usize = 32_000;
 pub(super) const MAX_TEXT_LINES: usize = 200;
 pub(super) const MAX_ENCODING_LABEL_LEN: usize = 40;
 pub(super) const MAX_SOURCE_IMAGE_AXIS: u32 = 20_000;
+pub(super) const MAX_SOURCE_IMAGE_PIXELS: u64 = 40_000_000;
 pub(super) const MAX_PREVIEW_IMAGE_WIDTH: u32 = 960;
 pub(super) const MAX_PREVIEW_IMAGE_HEIGHT: u32 = 720;
 
@@ -15,8 +16,8 @@ const RESULT_TEXT: u32 = 1;
 const RESULT_IMAGE: u32 = 2;
 const STATUS_PAYLOAD_LEN: usize = 8;
 const TEXT_FIXED_LEN: usize = 24;
-const IMAGE_FIXED_LEN: usize = 40;
-const BGRA_BYTES_PER_PIXEL: usize = 4;
+pub(super) const IMAGE_FIXED_LEN: usize = 40;
+pub(super) const BGRA_BYTES_PER_PIXEL: usize = 4;
 
 const FLAG_LINKED_CONTENT: u32 = 1 << 0;
 const FLAG_TEXT_ENCODING_GUESSED: u32 = 1 << 1;
@@ -348,6 +349,14 @@ fn validate_image(preview: &ImagePreview) -> Result<(), PayloadError> {
             height: preview.source_height,
         });
     }
+    let source_pixels = u64::from(preview.source_width)
+        .checked_mul(u64::from(preview.source_height))
+        .ok_or(PayloadError::LengthOverflow)?;
+    if source_pixels > MAX_SOURCE_IMAGE_PIXELS {
+        return Err(PayloadError::TooManySourceImagePixels {
+            actual: source_pixels,
+        });
+    }
     if preview.width == 0
         || preview.height == 0
         || preview.width > MAX_PREVIEW_IMAGE_WIDTH
@@ -491,6 +500,9 @@ pub(crate) enum PayloadError {
         width: u32,
         height: u32,
     },
+    TooManySourceImagePixels {
+        actual: u64,
+    },
     InvalidPreviewDimensions {
         width: u32,
         height: u32,
@@ -563,6 +575,10 @@ impl fmt::Display for PayloadError {
                 formatter,
                 "invalid source image dimensions {width}x{height}"
             ),
+            Self::TooManySourceImagePixels { actual } => write!(
+                formatter,
+                "source image has {actual} pixels; the limit is {MAX_SOURCE_IMAGE_PIXELS}"
+            ),
             Self::InvalidPreviewDimensions { width, height } => {
                 write!(
                     formatter,
@@ -591,8 +607,8 @@ mod tests {
     use super::{
         FLAG_IMAGE_FIRST_FRAME_ONLY, FLAG_TEXT_TRUNCATED, IMAGE_FIXED_LEN, ImageFormat,
         ImagePreview, MAX_ENCODING_LABEL_LEN, MAX_PREVIEW_IMAGE_WIDTH, MAX_SOURCE_IMAGE_AXIS,
-        MAX_TEXT_LINES, MAX_TEXT_SCALARS, MAX_TEXT_UTF8_LEN, PayloadError, PreviewResult,
-        ResolverStatus, TEXT_FIXED_LEN, TextPreview, decode_result, encode_result,
+        MAX_SOURCE_IMAGE_PIXELS, MAX_TEXT_LINES, MAX_TEXT_SCALARS, MAX_TEXT_UTF8_LEN, PayloadError,
+        PreviewResult, ResolverStatus, TEXT_FIXED_LEN, TextPreview, decode_result, encode_result,
     };
 
     fn text_preview() -> TextPreview {
@@ -714,6 +730,15 @@ mod tests {
         assert!(matches!(
             encode_result(&PreviewResult::Image(preview)),
             Err(PayloadError::InvalidSourceDimensions { .. })
+        ));
+
+        let mut preview = image_preview();
+        preview.source_width = MAX_SOURCE_IMAGE_AXIS;
+        preview.source_height =
+            u32::try_from(MAX_SOURCE_IMAGE_PIXELS / u64::from(MAX_SOURCE_IMAGE_AXIS) + 1).unwrap();
+        assert!(matches!(
+            encode_result(&PreviewResult::Image(preview)),
+            Err(PayloadError::TooManySourceImagePixels { .. })
         ));
 
         let mut preview = image_preview();

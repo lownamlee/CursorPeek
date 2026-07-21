@@ -1,4 +1,5 @@
 mod file;
+mod image;
 mod manager;
 mod payload;
 mod protocol;
@@ -13,6 +14,7 @@ use std::{
 use crate::resolver::{PointResolver, ResolveOutcome};
 use crate::settings::LegacyEncoding;
 use file::PreviewFile;
+use image::ImageValidationResult;
 use payload::ResolverStatus;
 use protocol::{ProtocolStreamError, WorkerMessage};
 use text::TextDecodeResult;
@@ -58,9 +60,18 @@ fn resolver_result(outcome: ResolveOutcome, legacy_encoding: &LegacyEncoding) ->
         ResolveOutcome::Resolved(target) => match PreviewFile::open(target.path()) {
             Ok(file) => match text::decode(&file, legacy_encoding) {
                 Ok(TextDecodeResult::Preview(preview)) => PreviewResult::Text(preview),
-                Ok(TextDecodeResult::Unsupported) => {
-                    PreviewResult::Status(ResolverStatus::Unsupported)
-                }
+                Ok(TextDecodeResult::Unsupported) => match image::validate(&file) {
+                    Ok(ImageValidationResult::Validated(_)) => {
+                        PreviewResult::Status(ResolverStatus::Unsupported)
+                    }
+                    Ok(ImageValidationResult::Unsupported) => {
+                        PreviewResult::Status(ResolverStatus::Unsupported)
+                    }
+                    Err(error) if error.is_unsupported() => {
+                        PreviewResult::Status(ResolverStatus::Unsupported)
+                    }
+                    Err(_) => PreviewResult::Status(ResolverStatus::Unavailable),
+                },
                 Err(_) => PreviewResult::Status(ResolverStatus::Unavailable),
             },
             Err(error) if error.is_unsupported() => {
@@ -181,6 +192,23 @@ mod tests {
             PreviewResult::Status(ResolverStatus::Unsupported)
         );
         fs::remove_file(binary_path).expect("the disguised binary fixture should be removed");
+
+        let malformed_image_path = env::temp_dir().join(format!(
+            "cursorpeek-resolved-target-{}-{}.png",
+            std::process::id(),
+            NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&malformed_image_path, b"\x89PNG\r\n\x1a\n")
+            .expect("the malformed image fixture should be written");
+        assert_eq!(
+            resolver_result(
+                ResolveOutcome::Resolved(ResolvedTarget::new(malformed_image_path.clone())),
+                &LegacyEncoding::Auto,
+            ),
+            PreviewResult::Status(ResolverStatus::Unavailable)
+        );
+        fs::remove_file(malformed_image_path)
+            .expect("the malformed image fixture should be removed");
 
         let legacy_path = env::temp_dir().join(format!(
             "cursorpeek-resolved-target-{}-{}.txt",
