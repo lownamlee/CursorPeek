@@ -18,6 +18,15 @@ resolver-corpus = []
 chardetng = { version = "=1.0.0", default-features = false }
 codepage = { version = "=0.1.2", default-features = false }
 encoding_rs = { version = "=0.8.35", default-features = false, features = ["alloc"] }
+image = { version = "=0.25.10", default-features = false, features = [
+    "bmp",
+    "gif",
+    "ico",
+    "jpeg",
+    "png",
+    "tiff",
+    "webp",
+] }
 windows = { version = "=0.62.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct2D",
