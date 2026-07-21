@@ -1,7 +1,7 @@
 use std::{error::Error, fmt, io::BufReader, path::Path};
 
 use ::image::{
-    ImageDecoder, ImageError, ImageFormat as DecoderFormat, Limits,
+    DynamicImage, ImageDecoder, ImageError, ImageFormat as DecoderFormat, Limits,
     codecs::{
         bmp::BmpDecoder, gif::GifDecoder, ico::IcoDecoder, jpeg::JpegDecoder, png::PngDecoder,
         tiff::TiffDecoder, webp::WebPDecoder,
@@ -34,15 +34,79 @@ pub(super) struct ValidatedImage {
     pub(super) decoded_bytes: u64,
 }
 
+#[derive(Debug)]
+pub(super) struct DecodedImage {
+    pub(super) metadata: ValidatedImage,
+    pub(super) pixels: DynamicImage,
+}
+
+impl DecodedImage {
+    pub(super) fn matches_metadata(&self) -> bool {
+        self.pixels.width() == self.metadata.source_width
+            && self.pixels.height() == self.metadata.source_height
+            && u64::try_from(self.pixels.as_bytes().len()) == Ok(self.metadata.decoded_bytes)
+    }
+}
+
+#[derive(Debug)]
+pub(super) enum ImageDecodeResult {
+    Decoded(DecodedImage),
+    Unsupported,
+}
+
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ImageValidationResult {
     Validated(ValidatedImage),
     Unsupported,
 }
 
+#[cfg(test)]
 pub(super) fn validate(file: &PreviewFile) -> Result<ImageValidationResult, ImageValidationError> {
-    if !is_eligible_path(file.final_path()) {
+    let Some((decoder_format, format)) = selected_format(file)? else {
         return Ok(ImageValidationResult::Unsupported);
+    };
+
+    let (source_width, source_height, decoded_bytes) = inspect_header(
+        BufReader::new(file.duplicate_reader()?),
+        decoder_format,
+        decoder_limits(),
+    )
+    .map_err(ImageValidationError::Decoder)?;
+
+    let metadata = validated_metadata(format, source_width, source_height, decoded_bytes)?;
+    if !file.is_unchanged()? {
+        return Err(ImageValidationError::File(
+            PreviewFileError::ChangedDuringRead,
+        ));
+    }
+
+    Ok(ImageValidationResult::Validated(metadata))
+}
+
+pub(super) fn decode(file: &PreviewFile) -> Result<ImageDecodeResult, ImageValidationError> {
+    let Some((decoder_format, format)) = selected_format(file)? else {
+        return Ok(ImageDecodeResult::Unsupported);
+    };
+    let decoded = decode_selected(
+        BufReader::new(file.duplicate_reader()?),
+        decoder_format,
+        format,
+        decoder_limits(),
+    )?;
+    if !file.is_unchanged()? {
+        return Err(ImageValidationError::File(
+            PreviewFileError::ChangedDuringRead,
+        ));
+    }
+    Ok(ImageDecodeResult::Decoded(decoded))
+}
+
+fn selected_format(
+    file: &PreviewFile,
+) -> Result<Option<(DecoderFormat, ImageFormat)>, ImageValidationError> {
+    if !is_eligible_path(file.final_path()) {
+        return Ok(None);
     }
     if file.file_size() > MAX_IMAGE_FILE_BYTES {
         return Err(ImageValidationError::FileTooLarge {
@@ -52,41 +116,18 @@ pub(super) fn validate(file: &PreviewFile) -> Result<ImageValidationResult, Imag
 
     let prefix = file.read_prefix(MAGIC_PREFIX_LEN)?;
     let Ok(decoder_format) = ::image::guess_format(&prefix) else {
-        return Ok(ImageValidationResult::Unsupported);
+        return Ok(None);
     };
     let Some(format) = supported_format(decoder_format) else {
-        return Ok(ImageValidationResult::Unsupported);
+        return Ok(None);
     };
     if !decoder_format.reading_enabled() {
-        return Ok(ImageValidationResult::Unsupported);
+        return Ok(None);
     }
-
-    let (source_width, source_height, decoded_bytes) = inspect_header(
-        BufReader::new(file.duplicate_reader()?),
-        decoder_format,
-        decoder_limits(),
-    )
-    .map_err(ImageValidationError::Decoder)?;
-
-    validate_source_layout(source_width, source_height, decoded_bytes)?;
-    checked_bgra_layout(
-        source_width.min(MAX_PREVIEW_IMAGE_WIDTH),
-        source_height.min(MAX_PREVIEW_IMAGE_HEIGHT),
-    )?;
-    if !file.is_unchanged()? {
-        return Err(ImageValidationError::File(
-            PreviewFileError::ChangedDuringRead,
-        ));
-    }
-
-    Ok(ImageValidationResult::Validated(ValidatedImage {
-        format,
-        source_width,
-        source_height,
-        decoded_bytes,
-    }))
+    Ok(Some((decoder_format, format)))
 }
 
+#[cfg(test)]
 fn inspect_header<R>(
     reader: R,
     format: DecoderFormat,
@@ -109,6 +150,7 @@ where
     }
 }
 
+#[cfg(test)]
 fn inspect_decoder(
     mut decoder: impl ImageDecoder,
     limits: Limits,
@@ -116,6 +158,79 @@ fn inspect_decoder(
     decoder.set_limits(limits)?;
     let (width, height) = decoder.dimensions();
     Ok((width, height, decoder.total_bytes()))
+}
+
+fn decode_selected<R>(
+    reader: R,
+    decoder_format: DecoderFormat,
+    format: ImageFormat,
+    limits: Limits,
+) -> Result<DecodedImage, ImageValidationError>
+where
+    R: std::io::BufRead + std::io::Seek,
+{
+    match decoder_format {
+        DecoderFormat::Jpeg => decode_with_decoder(JpegDecoder::new(reader)?, format, limits),
+        DecoderFormat::Png => decode_with_decoder(
+            PngDecoder::with_limits(reader, limits.clone())?,
+            format,
+            limits,
+        ),
+        DecoderFormat::Gif => decode_with_decoder(GifDecoder::new(reader)?, format, limits),
+        DecoderFormat::WebP => decode_with_decoder(WebPDecoder::new(reader)?, format, limits),
+        DecoderFormat::Bmp => decode_with_decoder(BmpDecoder::new(reader)?, format, limits),
+        DecoderFormat::Ico => decode_with_decoder(IcoDecoder::new(reader)?, format, limits),
+        DecoderFormat::Tiff => decode_with_decoder(TiffDecoder::new(reader)?, format, limits),
+        _ => unreachable!("unsupported formats are rejected before decoder construction"),
+    }
+}
+
+fn decode_with_decoder(
+    mut decoder: impl ImageDecoder,
+    format: ImageFormat,
+    limits: Limits,
+) -> Result<DecodedImage, ImageValidationError> {
+    decoder.set_limits(limits)?;
+    let (source_width, source_height) = decoder.dimensions();
+    let decoded_bytes = decoder.total_bytes();
+    let metadata = validated_metadata(format, source_width, source_height, decoded_bytes)?;
+    let pixels = DynamicImage::from_decoder(decoder)?;
+    let actual_width = pixels.width();
+    let actual_height = pixels.height();
+    let actual_bytes = pixels.as_bytes().len();
+    if actual_width != source_width
+        || actual_height != source_height
+        || u64::try_from(actual_bytes) != Ok(decoded_bytes)
+    {
+        return Err(ImageValidationError::DecodedLayoutMismatch {
+            expected_width: source_width,
+            expected_height: source_height,
+            expected_bytes: decoded_bytes,
+            actual_width,
+            actual_height,
+            actual_bytes,
+        });
+    }
+    Ok(DecodedImage { metadata, pixels })
+}
+
+fn validated_metadata(
+    format: ImageFormat,
+    source_width: u32,
+    source_height: u32,
+    decoded_bytes: u64,
+) -> Result<ValidatedImage, ImageValidationError> {
+    validate_source_layout(source_width, source_height, decoded_bytes)?;
+    checked_bgra_layout(
+        source_width.min(MAX_PREVIEW_IMAGE_WIDTH),
+        source_height.min(MAX_PREVIEW_IMAGE_HEIGHT),
+    )?;
+    Ok(ValidatedImage {
+        format,
+        source_width,
+        source_height,
+        decoded_bytes,
+    })
 }
 
 fn decoder_limits() -> Limits {
@@ -206,12 +321,34 @@ pub(super) fn checked_bgra_layout(
 pub(super) enum ImageValidationError {
     File(PreviewFileError),
     Decoder(ImageError),
-    FileTooLarge { actual: u64 },
-    InvalidDimensions { width: u32, height: u32 },
-    TooManyPixels { actual: u64 },
-    DecodedImageTooLarge { actual: u64 },
-    InvalidPreviewDimensions { width: u32, height: u32 },
-    PreviewPayloadTooLarge { actual: usize },
+    FileTooLarge {
+        actual: u64,
+    },
+    InvalidDimensions {
+        width: u32,
+        height: u32,
+    },
+    TooManyPixels {
+        actual: u64,
+    },
+    DecodedImageTooLarge {
+        actual: u64,
+    },
+    DecodedLayoutMismatch {
+        expected_width: u32,
+        expected_height: u32,
+        expected_bytes: u64,
+        actual_width: u32,
+        actual_height: u32,
+        actual_bytes: usize,
+    },
+    InvalidPreviewDimensions {
+        width: u32,
+        height: u32,
+    },
+    PreviewPayloadTooLarge {
+        actual: usize,
+    },
     ArithmeticOverflow,
 }
 
@@ -235,7 +372,7 @@ impl fmt::Display for ImageValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::File(error) => write!(formatter, "{error}"),
-            Self::Decoder(error) => write!(formatter, "image header validation failed: {error}"),
+            Self::Decoder(error) => write!(formatter, "image decoding failed: {error}"),
             Self::FileTooLarge { actual } => write!(
                 formatter,
                 "image file is {actual} bytes; the limit is {MAX_IMAGE_FILE_BYTES}"
@@ -251,6 +388,19 @@ impl fmt::Display for ImageValidationError {
             Self::DecodedImageTooLarge { actual } => write!(
                 formatter,
                 "decoded image requires {actual} bytes; the limit is {MAX_DECODED_IMAGE_BYTES}"
+            ),
+            Self::DecodedLayoutMismatch {
+                expected_width,
+                expected_height,
+                expected_bytes,
+                actual_width,
+                actual_height,
+                actual_bytes,
+            } => write!(
+                formatter,
+                "decoded image layout mismatch: expected {expected_width}x{expected_height} \
+                 and {expected_bytes} bytes, received {actual_width}x{actual_height} and \
+                 {actual_bytes} bytes"
             ),
             Self::InvalidPreviewDimensions { width, height } => {
                 write!(formatter, "preview dimensions {width}x{height} are invalid")
@@ -280,12 +430,19 @@ impl From<PreviewFileError> for ImageValidationError {
     }
 }
 
+impl From<ImageError> for ImageValidationError {
+    fn from(error: ImageError) -> Self {
+        Self::Decoder(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        IMAGE_EXTENSIONS, ImageValidationError, ImageValidationResult, MAX_DECODED_IMAGE_BYTES,
-        MAX_DECODER_ALLOC_BYTES, MAX_IMAGE_FILE_BYTES, checked_bgra_layout, decoder_limits,
-        is_eligible_path, validate, validate_source_layout,
+        IMAGE_EXTENSIONS, ImageDecodeResult, ImageValidationError, ImageValidationResult,
+        MAX_DECODED_IMAGE_BYTES, MAX_DECODER_ALLOC_BYTES, MAX_IMAGE_FILE_BYTES,
+        checked_bgra_layout, decode, decoder_limits, is_eligible_path, validate,
+        validate_source_layout,
     };
     use crate::worker::{
         file::PreviewFile,
@@ -294,7 +451,7 @@ mod tests {
             MAX_SOURCE_IMAGE_PIXELS,
         },
     };
-    use image::{DynamicImage, ImageFormat as DecoderFormat};
+    use image::{DynamicImage, ImageFormat as DecoderFormat, Rgba, RgbaImage};
     use std::{
         fs,
         io::Cursor,
@@ -331,7 +488,14 @@ mod tests {
     }
 
     fn encoded(format: DecoderFormat) -> Vec<u8> {
-        let image = DynamicImage::new_rgba8(3, 2);
+        let image = DynamicImage::ImageRgba8(RgbaImage::from_fn(3, 2, |x, y| {
+            Rgba([
+                10 + u8::try_from(x).unwrap(),
+                20 + u8::try_from(y).unwrap(),
+                30,
+                40 + u8::try_from(x + y).unwrap(),
+            ])
+        }));
         let mut output = Cursor::new(Vec::new());
         image
             .write_to(&mut output, format)
@@ -359,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn every_selected_magic_format_produces_bounded_header_metadata() {
+    fn every_selected_format_validates_and_decodes_bounded_pixels() {
         let root = TestDirectory::new("formats");
         let cases = [
             (DecoderFormat::Jpeg, ImageFormat::Jpeg, "jpg"),
@@ -385,6 +549,21 @@ mod tests {
             assert_eq!((validated.source_width, validated.source_height), (3, 2));
             assert!(validated.decoded_bytes > 0);
             assert!(validated.decoded_bytes <= MAX_DECODED_IMAGE_BYTES);
+
+            let ImageDecodeResult::Decoded(decoded) =
+                decode(&file).expect("the generated pixels should decode")
+            else {
+                panic!("the selected image format should decode");
+            };
+            assert_eq!(decoded.metadata, validated);
+            assert!(decoded.matches_metadata());
+            assert_eq!((decoded.pixels.width(), decoded.pixels.height()), (3, 2));
+            if expected_format == ImageFormat::Png {
+                assert_eq!(
+                    decoded.pixels.to_rgba8().get_pixel(0, 0).0,
+                    [10, 20, 30, 40]
+                );
+            }
         }
     }
 
@@ -398,16 +577,28 @@ mod tests {
             panic!("a selected magic format should validate");
         };
         assert_eq!(validated.format, ImageFormat::Png);
+        let ImageDecodeResult::Decoded(decoded) = decode(&file).unwrap() else {
+            panic!("the selected magic format should decode");
+        };
+        assert_eq!(decoded.metadata.format, ImageFormat::Png);
 
         let unsupported_extension = root.path().join("sample.bin");
         fs::write(&unsupported_extension, encoded(DecoderFormat::Png)).unwrap();
         let file = PreviewFile::open(&unsupported_extension).unwrap();
         assert_eq!(validate(&file).unwrap(), ImageValidationResult::Unsupported);
+        assert!(matches!(
+            decode(&file).unwrap(),
+            ImageDecodeResult::Unsupported
+        ));
 
         let unsupported_magic = root.path().join("sample.png");
         fs::write(&unsupported_magic, b"qoif\0\0\0\x01\0\0\0\x01\x04\0").unwrap();
         let file = PreviewFile::open(&unsupported_magic).unwrap();
         assert_eq!(validate(&file).unwrap(), ImageValidationResult::Unsupported);
+        assert!(matches!(
+            decode(&file).unwrap(),
+            ImageDecodeResult::Unsupported
+        ));
     }
 
     #[test]
@@ -418,6 +609,10 @@ mod tests {
         let file = PreviewFile::open(&malformed).unwrap();
         assert!(matches!(
             validate(&file),
+            Err(ImageValidationError::Decoder(_))
+        ));
+        assert!(matches!(
+            decode(&file),
             Err(ImageValidationError::Decoder(_))
         ));
 

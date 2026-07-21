@@ -14,7 +14,7 @@ use std::{
 use crate::resolver::{PointResolver, ResolveOutcome};
 use crate::settings::LegacyEncoding;
 use file::PreviewFile;
-use image::ImageValidationResult;
+use image::ImageDecodeResult;
 use payload::ResolverStatus;
 use protocol::{ProtocolStreamError, WorkerMessage};
 use text::TextDecodeResult;
@@ -60,11 +60,12 @@ fn resolver_result(outcome: ResolveOutcome, legacy_encoding: &LegacyEncoding) ->
         ResolveOutcome::Resolved(target) => match PreviewFile::open(target.path()) {
             Ok(file) => match text::decode(&file, legacy_encoding) {
                 Ok(TextDecodeResult::Preview(preview)) => PreviewResult::Text(preview),
-                Ok(TextDecodeResult::Unsupported) => match image::validate(&file) {
-                    Ok(ImageValidationResult::Validated(_)) => {
+                Ok(TextDecodeResult::Unsupported) => match image::decode(&file) {
+                    Ok(ImageDecodeResult::Decoded(decoded)) => {
+                        debug_assert!(decoded.matches_metadata());
                         PreviewResult::Status(ResolverStatus::Unsupported)
                     }
-                    Ok(ImageValidationResult::Unsupported) => {
+                    Ok(ImageDecodeResult::Unsupported) => {
                         PreviewResult::Status(ResolverStatus::Unsupported)
                     }
                     Err(error) if error.is_unsupported() => {
