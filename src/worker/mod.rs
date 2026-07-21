@@ -61,10 +61,13 @@ fn resolver_result(outcome: ResolveOutcome, legacy_encoding: &LegacyEncoding) ->
             Ok(file) => match text::decode(&file, legacy_encoding) {
                 Ok(TextDecodeResult::Preview(preview)) => PreviewResult::Text(preview),
                 Ok(TextDecodeResult::Unsupported) => match image::decode(&file) {
-                    Ok(ImageDecodeResult::Decoded(decoded)) => {
-                        debug_assert!(decoded.matches_metadata());
-                        PreviewResult::Status(ResolverStatus::Unsupported)
-                    }
+                    Ok(ImageDecodeResult::Decoded(decoded)) => match decoded.into_preview(&file) {
+                        Ok(preview) => PreviewResult::Image(preview),
+                        Err(error) if error.is_unsupported() => {
+                            PreviewResult::Status(ResolverStatus::Unsupported)
+                        }
+                        Err(_) => PreviewResult::Status(ResolverStatus::Unavailable),
+                    },
                     Ok(ImageDecodeResult::Unsupported) => {
                         PreviewResult::Status(ResolverStatus::Unsupported)
                     }
@@ -129,6 +132,7 @@ mod tests {
     use crate::resolver::{PointResolver, ResolveOutcome, ResolvedTarget};
     use crate::settings::LegacyEncoding;
     use crate::worker::payload::{PreviewResult, ResolverStatus};
+    use ::image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
     use protocol::{SessionNonce, WorkerMessage};
     use std::{
         env, fs,
@@ -210,6 +214,32 @@ mod tests {
         );
         fs::remove_file(malformed_image_path)
             .expect("the malformed image fixture should be removed");
+
+        let image_path = env::temp_dir().join(format!(
+            "cursorpeek-resolved-target-{}-{}.png",
+            std::process::id(),
+            NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let image = DynamicImage::ImageRgba8(RgbaImage::from_pixel(2, 1, Rgba([120, 80, 40, 128])));
+        let mut encoded = Cursor::new(Vec::new());
+        image
+            .write_to(&mut encoded, ImageFormat::Png)
+            .expect("the valid image fixture should encode");
+        fs::write(&image_path, encoded.into_inner())
+            .expect("the valid image fixture should be written");
+        let PreviewResult::Image(preview) = resolver_result(
+            ResolveOutcome::Resolved(ResolvedTarget::new(image_path.clone())),
+            &LegacyEncoding::Auto,
+        ) else {
+            panic!("the valid PNG should produce an image preview");
+        };
+        assert_eq!((preview.source_width, preview.source_height), (2, 1));
+        assert_eq!((preview.width, preview.height), (2, 1));
+        assert_eq!(
+            preview.premultiplied_bgra,
+            [20, 40, 60, 128, 20, 40, 60, 128]
+        );
+        fs::remove_file(image_path).expect("the valid image fixture should be removed");
 
         let legacy_path = env::temp_dir().join(format!(
             "cursorpeek-resolved-target-{}-{}.txt",

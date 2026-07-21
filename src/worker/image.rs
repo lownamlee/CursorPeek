@@ -6,15 +6,16 @@ use ::image::{
         bmp::BmpDecoder, gif::GifDecoder, ico::IcoDecoder, jpeg::JpegDecoder, png::PngDecoder,
         tiff::TiffDecoder, webp::WebPDecoder,
     },
+    imageops::{self, FilterType},
     metadata::Orientation,
 };
 
 use super::{
     file::{PreviewFile, PreviewFileError},
     payload::{
-        BGRA_BYTES_PER_PIXEL, IMAGE_FIXED_LEN, ImageFormat, MAX_PREVIEW_IMAGE_HEIGHT,
+        BGRA_BYTES_PER_PIXEL, IMAGE_FIXED_LEN, ImageFormat, ImagePreview, MAX_PREVIEW_IMAGE_HEIGHT,
         MAX_PREVIEW_IMAGE_WIDTH, MAX_PREVIEW_PAYLOAD_LEN, MAX_SOURCE_IMAGE_AXIS,
-        MAX_SOURCE_IMAGE_PIXELS,
+        MAX_SOURCE_IMAGE_PIXELS, fitted_preview_dimensions,
     },
 };
 
@@ -63,6 +64,83 @@ impl DecodedImage {
         self.pixels.width() == expected_width
             && self.pixels.height() == expected_height
             && u64::try_from(self.pixels.as_bytes().len()) == Ok(self.metadata.decoded_bytes)
+    }
+
+    pub(super) fn into_preview(
+        self,
+        file: &PreviewFile,
+    ) -> Result<ImagePreview, ImageValidationError> {
+        if !self.matches_metadata() {
+            let (expected_width, expected_height) = self.metadata.display_dimensions();
+            return Err(ImageValidationError::DecodedLayoutMismatch {
+                expected_width,
+                expected_height,
+                expected_bytes: self.metadata.decoded_bytes,
+                actual_width: self.pixels.width(),
+                actual_height: self.pixels.height(),
+                actual_bytes: self.pixels.as_bytes().len(),
+            });
+        }
+
+        let metadata = self.metadata;
+        let (source_width, source_height) = metadata.display_dimensions();
+        let (width, height) = fitted_preview_dimensions(source_width, source_height)
+            .ok_or(ImageValidationError::ArithmeticOverflow)?;
+        let (_, expected_bytes) = checked_bgra_layout(width, height)?;
+
+        let mut rgba = self.pixels.into_rgba8();
+        premultiply_rgba(&mut rgba);
+        let pixels = if (width, height) == (source_width, source_height) {
+            rgba
+        } else {
+            imageops::resize(&rgba, width, height, FilterType::Triangle)
+        };
+        let mut premultiplied_bgra = pixels.into_raw();
+        for pixel in premultiplied_bgra.chunks_exact_mut(BGRA_BYTES_PER_PIXEL) {
+            pixel.swap(0, 2);
+        }
+        if premultiplied_bgra.len() != expected_bytes {
+            return Err(ImageValidationError::PreviewLayoutMismatch {
+                expected_bytes,
+                actual_bytes: premultiplied_bgra.len(),
+            });
+        }
+        if !file.is_unchanged()? {
+            return Err(ImageValidationError::File(
+                PreviewFileError::ChangedDuringRead,
+            ));
+        }
+
+        Ok(ImagePreview {
+            file_size: file.file_size(),
+            linked_content: file.is_linked_content(),
+            first_frame_only: matches!(
+                metadata.format,
+                ImageFormat::Png | ImageFormat::Gif | ImageFormat::WebP
+            ),
+            format: metadata.format,
+            source_width,
+            source_height,
+            width,
+            height,
+            premultiplied_bgra,
+        })
+    }
+}
+
+fn premultiply_rgba(pixels: &mut ::image::RgbaImage) {
+    for pixel in pixels.pixels_mut() {
+        let [red, green, blue, alpha] = pixel.0;
+        let premultiply = |channel: u8| {
+            let product = u16::from(channel) * u16::from(alpha);
+            u8::try_from((product + 127) / 255).expect("premultiplication stays within one byte")
+        };
+        pixel.0 = [
+            premultiply(red),
+            premultiply(green),
+            premultiply(blue),
+            alpha,
+        ];
     }
 }
 
@@ -395,6 +473,10 @@ pub(super) enum ImageValidationError {
         actual_height: u32,
         actual_bytes: usize,
     },
+    PreviewLayoutMismatch {
+        expected_bytes: usize,
+        actual_bytes: usize,
+    },
     InvalidPreviewDimensions {
         width: u32,
         height: u32,
@@ -455,6 +537,14 @@ impl fmt::Display for ImageValidationError {
                  and {expected_bytes} bytes, received {actual_width}x{actual_height} and \
                  {actual_bytes} bytes"
             ),
+            Self::PreviewLayoutMismatch {
+                expected_bytes,
+                actual_bytes,
+            } => write!(
+                formatter,
+                "preview image layout mismatch: expected {expected_bytes} BGRA bytes, \
+                 received {actual_bytes}"
+            ),
             Self::InvalidPreviewDimensions { width, height } => {
                 write!(formatter, "preview dimensions {width}x{height} are invalid")
             }
@@ -494,8 +584,8 @@ mod tests {
     use super::{
         IMAGE_EXTENSIONS, ImageDecodeResult, ImageValidationError, ImageValidationResult,
         MAX_DECODED_IMAGE_BYTES, MAX_DECODER_ALLOC_BYTES, MAX_IMAGE_FILE_BYTES,
-        checked_bgra_layout, decode, decoder_limits, is_eligible_path, validate,
-        validate_source_layout,
+        checked_bgra_layout, decode, decoder_limits, fitted_preview_dimensions, is_eligible_path,
+        validate, validate_source_layout,
     };
     use crate::worker::{
         file::PreviewFile,
@@ -545,20 +635,27 @@ mod tests {
         }
     }
 
-    fn encoded(format: DecoderFormat) -> Vec<u8> {
-        let image = DynamicImage::ImageRgba8(RgbaImage::from_fn(3, 2, |x, y| {
-            Rgba([
-                10 + u8::try_from(x).unwrap(),
-                20 + u8::try_from(y).unwrap(),
-                30,
-                40 + u8::try_from(x + y).unwrap(),
-            ])
-        }));
+    fn encode_rgba(image: RgbaImage, format: DecoderFormat) -> Vec<u8> {
+        let image = DynamicImage::ImageRgba8(image);
         let mut output = Cursor::new(Vec::new());
         image
             .write_to(&mut output, format)
             .expect("the generated image should encode");
         output.into_inner()
+    }
+
+    fn encoded(format: DecoderFormat) -> Vec<u8> {
+        encode_rgba(
+            RgbaImage::from_fn(3, 2, |x, y| {
+                Rgba([
+                    10 + u8::try_from(x).unwrap(),
+                    20 + u8::try_from(y).unwrap(),
+                    30,
+                    40 + u8::try_from(x + y).unwrap(),
+                ])
+            }),
+            format,
+        )
     }
 
     fn exif_orientation(value: u8) -> Vec<u8> {
@@ -797,6 +894,61 @@ mod tests {
                 pixels.pixels().map(|pixel| pixel.0[0]).collect::<Vec<_>>(),
                 expected_red
             );
+        }
+    }
+
+    #[test]
+    fn preview_fit_is_aspect_preserving_bounded_and_never_upscales() {
+        assert_eq!(fitted_preview_dimensions(100, 50), Some((100, 50)));
+        assert_eq!(fitted_preview_dimensions(1920, 1080), Some((960, 540)));
+        assert_eq!(fitted_preview_dimensions(800, 1200), Some((480, 720)));
+        assert_eq!(fitted_preview_dimensions(1000, 1), Some((960, 1)));
+        assert_eq!(fitted_preview_dimensions(1, 1000), Some((1, 720)));
+        assert_eq!(fitted_preview_dimensions(8000, 5000), Some((960, 600)));
+        assert_eq!(fitted_preview_dimensions(0, 1), None);
+        assert_eq!(fitted_preview_dimensions(1, 0), None);
+    }
+
+    #[test]
+    fn decoded_pixels_become_checked_premultiplied_bgra_previews() {
+        let root = TestDirectory::new("bgra");
+        let exact_path = root.path().join("exact.png");
+        fs::write(&exact_path, encoded(DecoderFormat::Png)).unwrap();
+        let file = PreviewFile::open(&exact_path).unwrap();
+        let ImageDecodeResult::Decoded(decoded) = decode(&file).unwrap() else {
+            panic!("the exact-size PNG should decode");
+        };
+        let preview = decoded.into_preview(&file).unwrap();
+        assert_eq!((preview.source_width, preview.source_height), (3, 2));
+        assert_eq!((preview.width, preview.height), (3, 2));
+        assert_eq!(preview.file_size, file.file_size());
+        assert!(!preview.linked_content);
+        assert!(preview.first_frame_only);
+        assert_eq!(preview.format, ImageFormat::Png);
+        assert_eq!(&preview.premultiplied_bgra[..4], &[5, 3, 2, 40]);
+        assert_eq!(preview.premultiplied_bgra.len(), 3 * 2 * 4);
+
+        let scaled_path = root.path().join("scaled.png");
+        let wide = RgbaImage::from_fn(1000, 2, |x, _| {
+            if x < 500 {
+                Rgba([200, 100, 50, 128])
+            } else {
+                Rgba([255, 255, 255, 0])
+            }
+        });
+        fs::write(&scaled_path, encode_rgba(wide, DecoderFormat::Png)).unwrap();
+        let file = PreviewFile::open(&scaled_path).unwrap();
+        let ImageDecodeResult::Decoded(decoded) = decode(&file).unwrap() else {
+            panic!("the wide PNG should decode");
+        };
+        let preview = decoded.into_preview(&file).unwrap();
+        assert_eq!((preview.source_width, preview.source_height), (1000, 2));
+        assert_eq!((preview.width, preview.height), (960, 2));
+        assert_eq!(preview.premultiplied_bgra.len(), 960 * 2 * 4);
+        for pixel in preview.premultiplied_bgra.chunks_exact(4) {
+            assert!(pixel[0] <= pixel[3]);
+            assert!(pixel[1] <= pixel[3]);
+            assert!(pixel[2] <= pixel[3]);
         }
     }
 

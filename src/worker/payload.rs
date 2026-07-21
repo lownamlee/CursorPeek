@@ -338,6 +338,42 @@ pub(super) const fn is_unsafe_text_control(scalar: char) -> bool {
     )
 }
 
+pub(super) fn fitted_preview_dimensions(
+    source_width: u32,
+    source_height: u32,
+) -> Option<(u32, u32)> {
+    if source_width == 0 || source_height == 0 {
+        return None;
+    }
+
+    let width_bound = source_width.min(MAX_PREVIEW_IMAGE_WIDTH);
+    let height_bound = source_height.min(MAX_PREVIEW_IMAGE_HEIGHT);
+    if (width_bound, height_bound) == (source_width, source_height) {
+        return Some((source_width, source_height));
+    }
+
+    let round_ratio = |value: u32, numerator: u32, denominator: u32| {
+        u64::from(value)
+            .checked_mul(u64::from(numerator))?
+            .checked_add(u64::from(denominator) / 2)?
+            .checked_div(u64::from(denominator))
+            .and_then(|result| u32::try_from(result.max(1)).ok())
+    };
+    if u64::from(width_bound) * u64::from(source_height)
+        <= u64::from(height_bound) * u64::from(source_width)
+    {
+        Some((
+            width_bound,
+            round_ratio(source_height, width_bound, source_width)?.min(height_bound),
+        ))
+    } else {
+        Some((
+            round_ratio(source_width, height_bound, source_height)?.min(width_bound),
+            height_bound,
+        ))
+    }
+}
+
 fn validate_image(preview: &ImagePreview) -> Result<(), PayloadError> {
     if preview.source_width == 0
         || preview.source_height == 0
@@ -370,6 +406,17 @@ fn validate_image(preview: &ImagePreview) -> Result<(), PayloadError> {
     if preview.width > preview.source_width || preview.height > preview.source_height {
         return Err(PayloadError::PreviewUpscalesSource);
     }
+    let expected_dimensions =
+        fitted_preview_dimensions(preview.source_width, preview.source_height)
+            .ok_or(PayloadError::LengthOverflow)?;
+    if (preview.width, preview.height) != expected_dimensions {
+        return Err(PayloadError::NonFittingPreviewDimensions {
+            expected_width: expected_dimensions.0,
+            expected_height: expected_dimensions.1,
+            actual_width: preview.width,
+            actual_height: preview.height,
+        });
+    }
 
     let expected = usize::try_from(preview.width)
         .ok()
@@ -385,6 +432,14 @@ fn validate_image(preview: &ImagePreview) -> Result<(), PayloadError> {
             expected,
             actual: preview.premultiplied_bgra.len(),
         });
+    }
+    if let Some((index, _)) = preview
+        .premultiplied_bgra
+        .chunks_exact(BGRA_BYTES_PER_PIXEL)
+        .enumerate()
+        .find(|(_, pixel)| pixel[0] > pixel[3] || pixel[1] > pixel[3] || pixel[2] > pixel[3])
+    {
+        return Err(PayloadError::NonPremultipliedPixel { index });
     }
     ensure_payload_cap(
         IMAGE_FIXED_LEN
@@ -508,9 +563,18 @@ pub(crate) enum PayloadError {
         height: u32,
     },
     PreviewUpscalesSource,
+    NonFittingPreviewDimensions {
+        expected_width: u32,
+        expected_height: u32,
+        actual_width: u32,
+        actual_height: u32,
+    },
     InvalidPixelLength {
         expected: usize,
         actual: usize,
+    },
+    NonPremultipliedPixel {
+        index: usize,
     },
     PayloadTooLarge {
         actual: usize,
@@ -588,9 +652,23 @@ impl fmt::Display for PayloadError {
             Self::PreviewUpscalesSource => {
                 write!(formatter, "preview image dimensions upscale the source")
             }
+            Self::NonFittingPreviewDimensions {
+                expected_width,
+                expected_height,
+                actual_width,
+                actual_height,
+            } => write!(
+                formatter,
+                "preview image dimensions must be the bounded aspect fit \
+                 {expected_width}x{expected_height}, received {actual_width}x{actual_height}"
+            ),
             Self::InvalidPixelLength { expected, actual } => write!(
                 formatter,
                 "invalid premultiplied BGRA length: expected {expected}, received {actual}"
+            ),
+            Self::NonPremultipliedPixel { index } => write!(
+                formatter,
+                "BGRA pixel {index} has a color channel greater than alpha"
             ),
             Self::PayloadTooLarge { actual } => write!(
                 formatter,
@@ -630,9 +708,9 @@ mod tests {
             format: ImageFormat::Png,
             source_width: 3,
             source_height: 2,
-            width: 2,
+            width: 3,
             height: 2,
-            premultiplied_bgra: vec![0x7f; 16],
+            premultiplied_bgra: vec![0x7f; 24],
         }
     }
 
@@ -756,13 +834,33 @@ mod tests {
         );
 
         let mut preview = image_preview();
+        preview.width = 2;
+        preview.premultiplied_bgra = vec![0x7f; 16];
+        assert_eq!(
+            encode_result(&PreviewResult::Image(preview)),
+            Err(PayloadError::NonFittingPreviewDimensions {
+                expected_width: 3,
+                expected_height: 2,
+                actual_width: 2,
+                actual_height: 2,
+            })
+        );
+
+        let mut preview = image_preview();
         preview.premultiplied_bgra.pop();
         assert_eq!(
             encode_result(&PreviewResult::Image(preview)),
             Err(PayloadError::InvalidPixelLength {
-                expected: 16,
-                actual: 15
+                expected: 24,
+                actual: 23
             })
+        );
+
+        let mut preview = image_preview();
+        preview.premultiplied_bgra[..4].copy_from_slice(&[128, 127, 126, 127]);
+        assert_eq!(
+            encode_result(&PreviewResult::Image(preview)),
+            Err(PayloadError::NonPremultipliedPixel { index: 0 })
         );
     }
 
@@ -803,13 +901,13 @@ mod tests {
         ));
 
         let mut image = encode_result(&PreviewResult::Image(image_preview())).unwrap();
-        image[36..40].copy_from_slice(&15_u32.to_le_bytes());
+        image[36..40].copy_from_slice(&23_u32.to_le_bytes());
         assert_eq!(
             decode_result(&image),
             Err(PayloadError::PayloadLengthMismatch {
                 kind: "image",
-                expected: IMAGE_FIXED_LEN + 15,
-                actual: IMAGE_FIXED_LEN + 16
+                expected: IMAGE_FIXED_LEN + 23,
+                actual: IMAGE_FIXED_LEN + 24
             })
         );
     }
