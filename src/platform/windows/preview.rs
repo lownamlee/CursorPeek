@@ -11,18 +11,24 @@ use std::{
 use crate::{
     hover::PhysicalScreenPoint,
     preview::{PreviewPlacement, PreviewSize, ScreenRect, place_preview},
-    worker::TextPreview,
+    worker::{ImageFormat, ImagePreview, TextPreview},
 };
 
 use windows::{
     Win32::{
-        Foundation::{D2DERR_RECREATE_TARGET, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Foundation::{
+            D2DERR_RECREATE_TARGET, E_INVALIDARG, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+        },
         Graphics::{
             Direct2D::{
-                Common::{D2D_SIZE_U, D2D1_COLOR_F},
+                Common::{
+                    D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F,
+                    D2D1_PIXEL_FORMAT,
+                },
+                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
                 D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_FACTORY_TYPE_SINGLE_THREADED,
                 D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE,
-                D2D1_RENDER_TARGET_PROPERTIES, D2D1CreateFactory, ID2D1Factory,
+                D2D1_RENDER_TARGET_PROPERTIES, D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory,
                 ID2D1HwndRenderTarget, ID2D1SolidColorBrush,
             },
             DirectWrite::{
@@ -32,6 +38,7 @@ use windows::{
                 DWRITE_WORD_WRAPPING_NO_WRAP, DWRITE_WORD_WRAPPING_WRAP, DWriteCreateFactory,
                 IDWriteFactory, IDWriteFontCollection, IDWriteTextFormat, IDWriteTextLayout,
             },
+            Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
             Gdi::{
                 BeginPaint, COLOR_GRAYTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, EndPaint,
                 GetMonitorInfoW, GetSysColor, MONITOR_DEFAULTTONEAREST, MONITORINFO,
@@ -117,14 +124,31 @@ impl PreviewWindow {
         size: PreviewSize,
         preview: &TextPreview,
     ) -> Result<PreviewPlacement> {
-        self.show(anchor, size, Some(preview))
+        self.show(
+            anchor,
+            size,
+            Some(RetainedContent::Text(TextContent::from_preview(preview))),
+        )
+    }
+
+    pub(crate) fn show_image_at(
+        &self,
+        anchor: PhysicalScreenPoint,
+        size: PreviewSize,
+        preview: ImagePreview,
+    ) -> Result<PreviewPlacement> {
+        self.show(
+            anchor,
+            size,
+            Some(RetainedContent::Image(ImageContent::from_preview(preview))),
+        )
     }
 
     fn show(
         &self,
         anchor: PhysicalScreenPoint,
         size: PreviewSize,
-        text: Option<&TextPreview>,
+        content: Option<RetainedContent>,
     ) -> Result<PreviewPlacement> {
         // SAFETY: The hidden top-level HWND is owned by this UI thread. Moving the one-pixel setup
         // window first associates it with the anchor monitor without activating or showing it.
@@ -185,7 +209,7 @@ impl PreviewWindow {
 
         {
             let mut state = self.state.borrow_mut();
-            state.configure(text, dpi);
+            state.configure(content, dpi);
         }
 
         // SAFETY: The HWND is positioned wholly inside the selected work area. TOPMOST and
@@ -264,8 +288,13 @@ impl PreviewWindow {
     }
 
     #[cfg(test)]
-    fn has_text_layouts(&self) -> bool {
+    fn has_content_layouts(&self) -> bool {
         self.state.borrow().layouts.is_some()
+    }
+
+    #[cfg(test)]
+    fn has_image_bitmap(&self) -> bool {
+        self.state.borrow().image_bitmap.is_some()
     }
 
     #[cfg(test)]
@@ -300,9 +329,10 @@ struct PreviewWindowState {
     header_format: IDWriteTextFormat,
     body_format: IDWriteTextFormat,
     colors: PreviewColors,
-    content: Option<TextContent>,
-    layouts: Option<TextLayouts>,
+    content: Option<RetainedContent>,
+    layouts: Option<ContentLayouts>,
     device: Option<DeviceResources>,
+    image_bitmap: Option<ID2D1Bitmap>,
     pixel_size: D2D_SIZE_U,
     dpi: u32,
     last_paint_error: Option<HRESULT>,
@@ -363,6 +393,7 @@ impl PreviewWindowState {
             content: None,
             layouts: None,
             device: None,
+            image_bitmap: None,
             pixel_size: D2D_SIZE_U::default(),
             dpi: 96,
             last_paint_error: None,
@@ -371,14 +402,20 @@ impl PreviewWindowState {
         })
     }
 
-    fn configure(&mut self, preview: Option<&TextPreview>, dpi: u32) {
+    fn configure(&mut self, content: Option<RetainedContent>, dpi: u32) {
         if self.dpi != dpi {
             self.dpi = dpi;
-            self.device = None;
+            self.discard_device_resources();
         }
-        self.content = preview.map(TextContent::from_preview);
+        self.content = content;
         self.layouts = None;
+        self.image_bitmap = None;
         self.last_paint_error = None;
+    }
+
+    fn discard_device_resources(&mut self) {
+        self.image_bitmap = None;
+        self.device = None;
     }
 
     fn prepare(&mut self, hwnd: HWND) -> Result<()> {
@@ -390,7 +427,7 @@ impl PreviewWindowState {
                 // measured from the same live client area.
                 if let Err(error) = unsafe { device.target.Resize(&pixel_size) } {
                     if error.code() == D2DERR_RECREATE_TARGET {
-                        self.device = None;
+                        self.discard_device_resources();
                     } else {
                         return Err(error);
                     }
@@ -409,11 +446,11 @@ impl PreviewWindowState {
         Ok(())
     }
 
-    fn create_layouts(&self) -> Result<TextLayouts> {
+    fn create_layouts(&self) -> Result<ContentLayouts> {
         let content = self
             .content
             .as_ref()
-            .expect("text layouts are created only for retained text");
+            .expect("layouts are created only for retained content");
         let width = pixels_to_dips(self.pixel_size.width, self.dpi);
         let height = pixels_to_dips(self.pixel_size.height, self.dpi);
         let layout_width = (width - CONTENT_MARGIN * 2.0).max(1.0);
@@ -424,25 +461,24 @@ impl PreviewWindowState {
         // Formats and the factory are retained COM resources on this thread.
         let header = unsafe {
             self.dwrite_factory.CreateTextLayout(
-                &content.header,
+                content.header(),
                 &self.header_format,
                 layout_width,
                 HEADER_HEIGHT,
             )?
         };
-        let body = if content.body.is_empty() {
-            None
-        } else {
-            Some(unsafe {
+        let body = match content {
+            RetainedContent::Text(content) if !content.body.is_empty() => Some(unsafe {
                 self.dwrite_factory.CreateTextLayout(
                     &content.body,
                     &self.body_format,
                     layout_width,
                     body_height,
                 )?
-            })
+            }),
+            RetainedContent::Text(_) | RetainedContent::Image(_) => None,
         };
-        Ok(TextLayouts {
+        Ok(ContentLayouts {
             header,
             body,
             body_origin_y,
@@ -452,7 +488,7 @@ impl PreviewWindowState {
     fn render_with_recovery(&mut self, hwnd: HWND) -> Result<()> {
         match self.render_once(hwnd) {
             Err(error) if error.code() == D2DERR_RECREATE_TARGET => {
-                self.device = None;
+                self.discard_device_resources();
                 self.render_once(hwnd)
             }
             result => result,
@@ -471,6 +507,9 @@ impl PreviewWindowState {
         }
         if self.device.is_none() {
             self.device = Some(self.create_device_resources(hwnd)?);
+        }
+        if matches!(self.content, Some(RetainedContent::Image(_))) && self.image_bitmap.is_none() {
+            self.image_bitmap = Some(self.create_image_bitmap()?);
         }
 
         let device = self
@@ -504,7 +543,57 @@ impl PreviewWindowState {
                     );
                 }
             }
+            if let (Some(bitmap), Some(RetainedContent::Image(content))) =
+                (self.image_bitmap.as_ref(), self.content.as_ref())
+                && let Some(destination) =
+                    image_destination_rect(&content.preview, self.pixel_size, self.dpi)
+            {
+                device.target.DrawBitmap(
+                    bitmap,
+                    Some(&destination),
+                    1.0,
+                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                    None,
+                );
+            }
             device.target.EndDraw(None, None)
+        }
+    }
+
+    fn create_image_bitmap(&self) -> Result<ID2D1Bitmap> {
+        let device = self
+            .device
+            .as_ref()
+            .expect("an image bitmap is created only after the render target");
+        let RetainedContent::Image(content) = self
+            .content
+            .as_ref()
+            .expect("an image bitmap is created only for retained content")
+        else {
+            return Err(Error::from_hresult(E_INVALIDARG));
+        };
+        let (pitch, _) = checked_image_layout(&content.preview)
+            .ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
+        let properties = D2D1_BITMAP_PROPERTIES {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: self.dpi as f32,
+            dpiY: self.dpi as f32,
+        };
+        // SAFETY: checked_image_layout proves exact pitch/length and premultiplied BGRA pixels.
+        // Direct2D copies the borrowed buffer into a new target-owned bitmap during this call.
+        unsafe {
+            device.target.CreateBitmap(
+                D2D_SIZE_U {
+                    width: content.preview.width,
+                    height: content.preview.height,
+                },
+                Some(content.preview.premultiplied_bgra.as_ptr().cast()),
+                pitch,
+                &properties,
+            )
         }
     }
 
@@ -550,7 +639,35 @@ impl TextContent {
     }
 }
 
-struct TextLayouts {
+enum RetainedContent {
+    Text(TextContent),
+    Image(ImageContent),
+}
+
+impl RetainedContent {
+    fn header(&self) -> &[u16] {
+        match self {
+            Self::Text(content) => &content.header,
+            Self::Image(content) => &content.header,
+        }
+    }
+}
+
+struct ImageContent {
+    header: Vec<u16>,
+    preview: ImagePreview,
+}
+
+impl ImageContent {
+    fn from_preview(preview: ImagePreview) -> Self {
+        Self {
+            header: image_preview_header(&preview).encode_utf16().collect(),
+            preview,
+        }
+    }
+}
+
+struct ContentLayouts {
     header: IDWriteTextLayout,
     body: Option<IDWriteTextLayout>,
     body_origin_y: f32,
@@ -584,20 +701,110 @@ impl PreviewColors {
 
 fn preview_header(preview: &TextPreview) -> String {
     let mut header = format!(
-        "{}  ·  {}",
+        "{}  \u{b7}  {}",
         preview.encoding,
         format_file_size(preview.file_size)
     );
     if preview.encoding_was_guessed {
-        header.push_str("  ·  guessed");
+        header.push_str("  \u{b7}  guessed");
     }
     if preview.truncated {
-        header.push_str("  ·  truncated");
+        header.push_str("  \u{b7}  truncated");
     }
     if preview.linked_content {
-        header.push_str("  ·  linked");
+        header.push_str("  \u{b7}  linked");
     }
     header
+}
+
+fn image_preview_header(preview: &ImagePreview) -> String {
+    let mut header = format!(
+        "{}  \u{b7}  {} \u{d7} {}  \u{b7}  {}",
+        image_format_label(preview.format),
+        preview.source_width,
+        preview.source_height,
+        format_file_size(preview.file_size)
+    );
+    if preview.first_frame_only {
+        header.push_str("  \u{b7}  first frame");
+    }
+    if preview.linked_content {
+        header.push_str("  \u{b7}  linked");
+    }
+    header
+}
+
+const fn image_format_label(format: ImageFormat) -> &'static str {
+    match format {
+        ImageFormat::Jpeg => "JPEG",
+        ImageFormat::Png => "PNG",
+        ImageFormat::Gif => "GIF",
+        ImageFormat::WebP => "WebP",
+        ImageFormat::Bmp => "BMP",
+        ImageFormat::Ico => "ICO",
+        ImageFormat::Tiff => "TIFF",
+    }
+}
+
+fn checked_image_layout(preview: &ImagePreview) -> Option<(u32, usize)> {
+    if preview.width == 0
+        || preview.height == 0
+        || preview.source_width == 0
+        || preview.source_height == 0
+    {
+        return None;
+    }
+
+    let pitch = preview.width.checked_mul(4)?;
+    let length = usize::try_from(pitch)
+        .ok()?
+        .checked_mul(usize::try_from(preview.height).ok()?)?;
+    if preview.premultiplied_bgra.len() != length
+        || !preview
+            .premultiplied_bgra
+            .chunks_exact(4)
+            .all(|pixel| pixel[0] <= pixel[3] && pixel[1] <= pixel[3] && pixel[2] <= pixel[3])
+    {
+        return None;
+    }
+
+    Some((pitch, length))
+}
+
+fn image_destination_rect(
+    preview: &ImagePreview,
+    pixel_size: D2D_SIZE_U,
+    dpi: u32,
+) -> Option<D2D_RECT_F> {
+    if dpi == 0 || checked_image_layout(preview).is_none() {
+        return None;
+    }
+
+    let client_width = pixels_to_dips(pixel_size.width, dpi);
+    let client_height = pixels_to_dips(pixel_size.height, dpi);
+    let body_origin_y = CONTENT_MARGIN + HEADER_HEIGHT + HEADER_BODY_GAP;
+    let available_width = client_width - CONTENT_MARGIN * 2.0;
+    let available_height = client_height - body_origin_y - CONTENT_MARGIN;
+    if available_width <= 0.0 || available_height <= 0.0 {
+        return None;
+    }
+
+    let image_width = pixels_to_dips(preview.width, dpi);
+    let image_height = pixels_to_dips(preview.height, dpi);
+    let scale = (available_width / image_width)
+        .min(available_height / image_height)
+        .min(1.0);
+    let rendered_width = image_width * scale;
+    let rendered_height = image_height * scale;
+    let left = CONTENT_MARGIN + (available_width - rendered_width) / 2.0;
+    let top = body_origin_y + (available_height - rendered_height) / 2.0;
+
+    Some(D2D_RECT_F {
+        left,
+        top,
+        right: left + rendered_width,
+        bottom: top + rendered_height,
+    })
 }
 
 fn format_file_size(bytes: u64) -> String {
@@ -784,10 +991,15 @@ fn preview_state(hwnd: HWND) -> Option<&'static RefCell<PreviewWindowState>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        D2D_SIZE_U, PreviewWindow, PreviewWindowState, color_from_colorref, format_file_size,
-        preview_header,
+        D2D_SIZE_U, PreviewWindow, PreviewWindowState, RetainedContent, TextContent,
+        checked_image_layout, color_from_colorref, format_file_size, image_destination_rect,
+        image_preview_header, preview_header,
     };
-    use crate::{hover::PhysicalScreenPoint, preview::PreviewSize, worker::TextPreview};
+    use crate::{
+        hover::PhysicalScreenPoint,
+        preview::PreviewSize,
+        worker::{ImageFormat, ImagePreview, TextPreview, image_corpus_previews},
+    };
     use std::thread;
     use windows::Win32::{
         Graphics::DirectWrite::DWRITE_TEXT_METRICS, UI::WindowsAndMessaging::IsWindow,
@@ -801,6 +1013,20 @@ mod tests {
             truncated: true,
             encoding: "windows-1252".to_owned(),
             text: "Hello, 世界\nPlain text only.".to_owned(),
+        }
+    }
+
+    fn image_preview() -> ImagePreview {
+        ImagePreview {
+            file_size: 12_800,
+            linked_content: true,
+            first_frame_only: true,
+            format: ImageFormat::Png,
+            source_width: 2,
+            source_height: 1,
+            width: 2,
+            height: 1,
+            premultiplied_bgra: vec![10, 20, 30, 40, 0, 0, 0, 0],
         }
     }
 
@@ -838,7 +1064,7 @@ mod tests {
                 )
                 .expect("bounded text should render");
             assert!(preview.is_visible());
-            assert!(preview.has_text_layouts());
+            assert!(preview.has_content_layouts());
             assert!(preview.has_device_resources());
 
             preview
@@ -848,6 +1074,64 @@ mod tests {
         })
         .join()
         .expect("the render test thread should not panic");
+    }
+
+    #[test]
+    fn image_bitmap_renders_and_recovers_device_resources() {
+        thread::spawn(|| {
+            let preview = PreviewWindow::create().expect("the preview window should be created");
+            preview
+                .show_image_at(
+                    PhysicalScreenPoint::new(200, 200),
+                    PreviewSize::new(640, 480),
+                    image_preview(),
+                )
+                .expect("bounded image pixels should render");
+            assert!(preview.is_visible());
+            assert!(preview.has_content_layouts());
+            assert!(preview.has_image_bitmap());
+            assert!(preview.has_device_resources());
+
+            preview
+                .force_device_loss_and_redraw()
+                .expect("a lost target and bitmap should be recreated once");
+            assert!(preview.has_image_bitmap());
+            assert!(preview.has_device_resources());
+        })
+        .join()
+        .expect("the image-render test thread should not panic");
+    }
+
+    #[test]
+    fn generated_image_corpus_renders_and_recovers_device_resources() {
+        thread::spawn(|| {
+            let preview = PreviewWindow::create().expect("the preview window should be created");
+            for case in image_corpus_previews() {
+                preview
+                    .show_image_at(
+                        PhysicalScreenPoint::new(200, 200),
+                        PreviewSize::new(640, 480),
+                        case.preview,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("image corpus case `{}` should render: {error}", case.id)
+                    });
+                assert!(preview.has_content_layouts(), "corpus case `{}`", case.id);
+                assert!(preview.has_image_bitmap(), "corpus case `{}`", case.id);
+                preview
+                    .force_device_loss_and_redraw()
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "image corpus case `{}` should recover device loss: {error}",
+                            case.id
+                        )
+                    });
+                assert!(preview.has_image_bitmap(), "corpus case `{}`", case.id);
+                assert!(preview.has_device_resources(), "corpus case `{}`", case.id);
+            }
+        })
+        .join()
+        .expect("the image-corpus render thread should not panic");
     }
 
     #[test]
@@ -870,7 +1154,10 @@ mod tests {
             for dpi in [96, 120, 144, 168, 192] {
                 let mut state =
                     PreviewWindowState::new().expect("DirectWrite factories should initialize");
-                state.configure(Some(&preview), dpi);
+                state.configure(
+                    Some(RetainedContent::Text(TextContent::from_preview(&preview))),
+                    dpi,
+                );
                 state.pixel_size = D2D_SIZE_U {
                     width: 640 * dpi / 96,
                     height: 480 * dpi / 96,
@@ -906,6 +1193,67 @@ mod tests {
         assert_eq!(format_file_size(1024), "1.0 KiB");
         assert_eq!(format_file_size(1024 * 1024), "1.0 MiB");
         assert_eq!(format_file_size(1024 * 1024 * 1024), "1.0 GiB");
+    }
+
+    #[test]
+    fn image_metadata_and_renderer_boundary_are_explicit() {
+        let preview = image_preview();
+        assert_eq!(
+            image_preview_header(&preview),
+            "PNG  ·  2 × 1  ·  12.5 KiB  ·  first frame  ·  linked"
+        );
+        assert_eq!(checked_image_layout(&preview), Some((8, 8)));
+
+        let mut wrong_length = preview.clone();
+        wrong_length.premultiplied_bgra.pop();
+        assert_eq!(checked_image_layout(&wrong_length), None);
+
+        let mut straight_alpha = preview;
+        straight_alpha.premultiplied_bgra[2] = 41;
+        assert_eq!(checked_image_layout(&straight_alpha), None);
+    }
+
+    #[test]
+    fn image_destination_preserves_aspect_ratio_without_upscaling() {
+        let preview = ImagePreview {
+            file_size: 1,
+            linked_content: false,
+            first_frame_only: false,
+            format: ImageFormat::Jpeg,
+            source_width: 960,
+            source_height: 540,
+            width: 960,
+            height: 540,
+            premultiplied_bgra: vec![0; 960 * 540 * 4],
+        };
+
+        let at_100 = image_destination_rect(
+            &preview,
+            D2D_SIZE_U {
+                width: 640,
+                height: 480,
+            },
+            96,
+        )
+        .expect("the image should fit at 100 percent");
+        assert!((at_100.left - 12.0).abs() < 0.01);
+        assert!((at_100.top - 79.75).abs() < 0.01);
+        assert!((at_100.right - 628.0).abs() < 0.01);
+        assert!((at_100.bottom - 426.25).abs() < 0.01);
+
+        let at_200 = image_destination_rect(
+            &preview,
+            D2D_SIZE_U {
+                width: 1_280,
+                height: 960,
+            },
+            192,
+        )
+        .expect("the image should fit at 200 percent");
+        assert!((at_200.left - 80.0).abs() < 0.01);
+        assert!((at_200.top - 118.0).abs() < 0.01);
+        assert!((at_200.right - 560.0).abs() < 0.01);
+        assert!((at_200.bottom - 388.0).abs() < 0.01);
     }
 
     #[test]

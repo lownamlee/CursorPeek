@@ -1,0 +1,335 @@
+use std::{collections::VecDeque, mem::size_of, path::Path};
+
+use crate::settings::LegacyEncoding;
+
+use super::{
+    file::{PreviewFile, PreviewFileIdentity},
+    image,
+    payload::PreviewResult,
+    text,
+};
+
+// The cache exists only for one contained worker session. The count cap bounds metadata-heavy
+// text entries; the byte cap bounds retained pixel/text buffers independently.
+const MAX_CACHE_ENTRIES: usize = 16;
+const MAX_CACHE_BYTES: usize = 8 * 1024 * 1024;
+// These versions make provider output semantics an explicit part of the key. Increment the
+// relevant value if a future long-lived worker can switch implementation rules in-process.
+const TEXT_PROVIDER_VERSION: u32 = 1;
+const IMAGE_PROVIDER_VERSION: u32 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PreviewProvider {
+    Text,
+    Image,
+}
+
+impl PreviewProvider {
+    pub(super) fn for_path(path: &Path) -> Option<Self> {
+        if text::is_eligible_path(path) {
+            Some(Self::Text)
+        } else if image::is_eligible_path(path) {
+            Some(Self::Image)
+        } else {
+            None
+        }
+    }
+
+    fn cache_key(self, legacy_encoding: &LegacyEncoding) -> PreviewProviderKey {
+        match self {
+            Self::Text => PreviewProviderKey::Text {
+                version: TEXT_PROVIDER_VERSION,
+                legacy_encoding: legacy_encoding.clone(),
+            },
+            Self::Image => PreviewProviderKey::Image {
+                version: IMAGE_PROVIDER_VERSION,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PreviewProviderKey {
+    Text {
+        version: u32,
+        legacy_encoding: LegacyEncoding,
+    },
+    Image {
+        version: u32,
+    },
+}
+
+impl PreviewProviderKey {
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Text {
+                legacy_encoding: LegacyEncoding::Label(label),
+                ..
+            } => label.capacity(),
+            Self::Text { .. } | Self::Image { .. } => 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PreviewCacheKey {
+    file: PreviewFileIdentity,
+    provider: PreviewProviderKey,
+}
+
+impl PreviewCacheKey {
+    pub(super) fn new(
+        file: &PreviewFile,
+        provider: PreviewProvider,
+        legacy_encoding: &LegacyEncoding,
+    ) -> Self {
+        Self {
+            file: file.cache_identity(),
+            provider: provider.cache_key(legacy_encoding),
+        }
+    }
+}
+
+struct CacheEntry {
+    key: PreviewCacheKey,
+    result: PreviewResult,
+    retained_bytes: usize,
+}
+
+impl CacheEntry {
+    fn new(key: PreviewCacheKey, result: PreviewResult) -> Option<Self> {
+        let retained_bytes = size_of::<Self>()
+            .checked_add(key.provider.heap_bytes())?
+            .checked_add(result_heap_bytes(&result)?)?;
+        Some(Self {
+            key,
+            result,
+            retained_bytes,
+        })
+    }
+}
+
+fn result_heap_bytes(result: &PreviewResult) -> Option<usize> {
+    match result {
+        PreviewResult::Status(_) => None,
+        PreviewResult::Text(preview) => preview
+            .encoding
+            .capacity()
+            .checked_add(preview.text.capacity()),
+        PreviewResult::Image(preview) => Some(preview.premultiplied_bgra.capacity()),
+    }
+}
+
+pub(super) struct PreviewCache {
+    entries: VecDeque<CacheEntry>,
+    retained_bytes: usize,
+    max_entries: usize,
+    max_bytes: usize,
+    #[cfg(test)]
+    hit_count: usize,
+}
+
+impl Default for PreviewCache {
+    fn default() -> Self {
+        Self::with_limits(MAX_CACHE_ENTRIES, MAX_CACHE_BYTES)
+    }
+}
+
+impl PreviewCache {
+    fn with_limits(max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            retained_bytes: 0,
+            max_entries,
+            max_bytes,
+            #[cfg(test)]
+            hit_count: 0,
+        }
+    }
+
+    pub(super) fn get(&mut self, key: &PreviewCacheKey) -> Option<PreviewResult> {
+        let index = self.entries.iter().position(|entry| entry.key == *key)?;
+        let entry = self
+            .entries
+            .remove(index)
+            .expect("the located cache entry remains present");
+        let result = entry.result.clone();
+        self.entries.push_back(entry);
+        #[cfg(test)]
+        {
+            self.hit_count += 1;
+        }
+        Some(result)
+    }
+
+    pub(super) fn insert(&mut self, key: PreviewCacheKey, result: PreviewResult) -> bool {
+        let Some(entry) = CacheEntry::new(key, result) else {
+            return false;
+        };
+        if self.max_entries == 0 || entry.retained_bytes > self.max_bytes {
+            return false;
+        }
+
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|existing| existing.key == entry.key)
+        {
+            let replaced = self
+                .entries
+                .remove(index)
+                .expect("the located cache entry remains present");
+            self.retained_bytes -= replaced.retained_bytes;
+        }
+
+        while self.entries.len() >= self.max_entries
+            || self
+                .retained_bytes
+                .checked_add(entry.retained_bytes)
+                .is_none_or(|bytes| bytes > self.max_bytes)
+        {
+            let evicted = self
+                .entries
+                .pop_front()
+                .expect("an individually bounded entry can fit an empty cache");
+            self.retained_bytes -= evicted.retained_bytes;
+        }
+
+        self.retained_bytes += entry.retained_bytes;
+        self.entries.push_back(entry);
+        true
+    }
+
+    #[cfg(test)]
+    pub(super) const fn hit_count(&self) -> usize {
+        self.hit_count
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CacheEntry, PreviewCache, PreviewCacheKey, PreviewProvider, PreviewProviderKey};
+    use crate::{
+        settings::LegacyEncoding,
+        worker::{
+            file::PreviewFile,
+            payload::{PreviewResult, ResolverStatus, TextPreview},
+        },
+    };
+    use std::{
+        env, fs,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    static NEXT_TEST_FILE: AtomicU64 = AtomicU64::new(1);
+
+    struct TestFile(PathBuf);
+
+    impl Drop for TestFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    fn key(
+        label: &str,
+        provider: PreviewProvider,
+        legacy_encoding: &LegacyEncoding,
+    ) -> (TestFile, PreviewCacheKey) {
+        let path = env::temp_dir().join(format!(
+            "cursorpeek-cache-{}-{}-{label}.txt",
+            std::process::id(),
+            NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&path, label.as_bytes()).expect("the cache fixture should be written");
+        let file = PreviewFile::open(&path).expect("the cache fixture should open");
+        let key = PreviewCacheKey::new(&file, provider, legacy_encoding);
+        (TestFile(path), key)
+    }
+
+    fn text_result(text: &str) -> PreviewResult {
+        PreviewResult::Text(TextPreview {
+            file_size: u64::try_from(text.len()).expect("the fixture length fits u64"),
+            linked_content: false,
+            encoding_was_guessed: false,
+            truncated: false,
+            encoding: "UTF-8".to_owned(),
+            text: text.to_owned(),
+        })
+    }
+
+    #[test]
+    fn key_separates_provider_policy_version_and_file_snapshot() {
+        let (_first_file, automatic) = key("same", PreviewProvider::Text, &LegacyEncoding::Auto);
+        let (_second_file, different_file) =
+            key("same", PreviewProvider::Text, &LegacyEncoding::Auto);
+        assert_ne!(automatic, different_file);
+
+        let mut policy = automatic.clone();
+        policy.provider = PreviewProviderKey::Text {
+            version: 1,
+            legacy_encoding: LegacyEncoding::Off,
+        };
+        assert_ne!(automatic, policy);
+
+        let mut version = automatic.clone();
+        version.provider = PreviewProviderKey::Text {
+            version: 2,
+            legacy_encoding: LegacyEncoding::Auto,
+        };
+        assert_ne!(automatic, version);
+
+        let mut image = automatic.clone();
+        image.provider = PreviewProviderKey::Image { version: 1 };
+        assert_ne!(automatic, image);
+    }
+
+    #[test]
+    fn entry_cap_uses_least_recently_used_order() {
+        let (_a_file, a) = key("a", PreviewProvider::Text, &LegacyEncoding::Auto);
+        let (_b_file, b) = key("b", PreviewProvider::Text, &LegacyEncoding::Auto);
+        let (_c_file, c) = key("c", PreviewProvider::Text, &LegacyEncoding::Auto);
+        let mut cache = PreviewCache::with_limits(2, usize::MAX);
+
+        assert!(cache.insert(a.clone(), text_result("a")));
+        assert!(cache.insert(b.clone(), text_result("b")));
+        assert_eq!(cache.get(&a), Some(text_result("a")));
+        assert!(cache.insert(c.clone(), text_result("c")));
+
+        assert_eq!(cache.get(&b), None);
+        assert_eq!(cache.get(&a), Some(text_result("a")));
+        assert_eq!(cache.get(&c), Some(text_result("c")));
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn byte_cap_evicts_and_rejects_oversized_or_status_entries() {
+        let (_a_file, a) = key("a", PreviewProvider::Text, &LegacyEncoding::Auto);
+        let (_b_file, b) = key("b", PreviewProvider::Text, &LegacyEncoding::Auto);
+        let a_result = text_result("first");
+        let b_result = text_result("second");
+        let a_bytes = CacheEntry::new(a.clone(), a_result.clone())
+            .expect("a text result is cacheable")
+            .retained_bytes;
+        let b_bytes = CacheEntry::new(b.clone(), b_result.clone())
+            .expect("a text result is cacheable")
+            .retained_bytes;
+        let mut cache = PreviewCache::with_limits(4, a_bytes.max(b_bytes));
+
+        assert!(cache.insert(a.clone(), a_result));
+        assert!(cache.insert(b.clone(), b_result.clone()));
+        assert_eq!(cache.get(&a), None);
+        assert_eq!(cache.get(&b), Some(b_result));
+
+        let mut too_small = PreviewCache::with_limits(4, a_bytes - 1);
+        assert!(!too_small.insert(a.clone(), text_result("first")));
+        assert!(!too_small.insert(a, PreviewResult::Status(ResolverStatus::Unsupported)));
+        assert_eq!(too_small.len(), 0);
+    }
+}

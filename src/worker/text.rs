@@ -134,7 +134,7 @@ pub(super) fn decode(
     }))
 }
 
-fn is_eligible_path(path: &Path) -> bool {
+pub(super) fn is_eligible_path(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };

@@ -3,7 +3,7 @@ use std::{
     ffi::OsString,
     fmt,
     fs::File,
-    io,
+    io::{self, Seek, SeekFrom},
     mem::size_of,
     os::windows::{
         ffi::{OsStrExt, OsStringExt},
@@ -47,10 +47,18 @@ struct FileIdentity {
 struct FileSnapshot {
     identity: FileIdentity,
     file_size: u64,
+    creation_time: i64,
     last_write_time: i64,
+    change_time: i64,
     basic_attributes: u32,
     tag_attributes: u32,
     reparse_tag: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PreviewFileIdentity {
+    snapshot: FileSnapshot,
+    linked_content: bool,
 }
 
 pub(super) struct PreviewFile {
@@ -117,6 +125,23 @@ impl PreviewFile {
         self.snapshot.file_size
     }
 
+    pub(super) fn duplicate_reader(&self) -> Result<File, PreviewFileError> {
+        let mut reader = self
+            .file
+            .try_clone()
+            .map_err(|source| PreviewFileError::Io {
+                operation: "duplicate the validated preview file handle",
+                source,
+            })?;
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|source| PreviewFileError::Io {
+                operation: "rewind the duplicated preview file handle",
+                source,
+            })?;
+        Ok(reader)
+    }
+
     pub(super) fn read_prefix(&self, max_bytes: usize) -> Result<Vec<u8>, PreviewFileError> {
         if !(1..=MAX_CONTENT_PREFIX_LEN).contains(&max_bytes) {
             return Err(PreviewFileError::ReadLimitOutOfRange(max_bytes));
@@ -162,6 +187,13 @@ impl PreviewFile {
 
     pub(super) fn is_linked_content(&self) -> bool {
         self.opened_path != self.final_path
+    }
+
+    pub(super) fn cache_identity(&self) -> PreviewFileIdentity {
+        PreviewFileIdentity {
+            snapshot: self.snapshot,
+            linked_content: self.is_linked_content(),
+        }
     }
 }
 
@@ -232,7 +264,9 @@ fn query_snapshot(file: &File) -> Result<FileSnapshot, PreviewFileError> {
             file_id: id.FileId.Identifier,
         },
         file_size,
+        creation_time: basic.CreationTime,
         last_write_time: basic.LastWriteTime,
+        change_time: basic.ChangeTime,
         basic_attributes: basic.FileAttributes,
         tag_attributes: attribute_tag.FileAttributes,
         reparse_tag: attribute_tag.ReparseTag,
@@ -528,7 +562,8 @@ mod tests {
         is_local_drive_path, null_terminated_path, require_content_available,
     };
     use std::{
-        env, fs, io,
+        env, fs,
+        io::{self, Read},
         os::windows::ffi::OsStringExt,
         path::{Path, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
@@ -582,6 +617,10 @@ mod tests {
 
         let file = PreviewFile::open(&path).unwrap();
         assert_eq!(file.read_prefix(64 * 1024).unwrap(), vec![b'x'; 64 * 1024]);
+        let mut duplicated = file.duplicate_reader().unwrap();
+        let mut duplicated_bytes = Vec::new();
+        duplicated.read_to_end(&mut duplicated_bytes).unwrap();
+        assert_eq!(duplicated_bytes, vec![b'x'; MAX_CONTENT_PREFIX_LEN + 1]);
         assert!(file.is_unchanged().unwrap());
         assert!(matches!(
             file.read_prefix(0),
