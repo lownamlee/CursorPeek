@@ -6,6 +6,7 @@ use ::image::{
         bmp::BmpDecoder, gif::GifDecoder, ico::IcoDecoder, jpeg::JpegDecoder, png::PngDecoder,
         tiff::TiffDecoder, webp::WebPDecoder,
     },
+    metadata::Orientation,
 };
 
 use super::{
@@ -32,6 +33,22 @@ pub(super) struct ValidatedImage {
     pub(super) source_width: u32,
     pub(super) source_height: u32,
     pub(super) decoded_bytes: u64,
+    pub(super) orientation: Orientation,
+}
+
+impl ValidatedImage {
+    fn display_dimensions(self) -> (u32, u32) {
+        match self.orientation {
+            Orientation::Rotate90
+            | Orientation::Rotate270
+            | Orientation::Rotate90FlipH
+            | Orientation::Rotate270FlipH => (self.source_height, self.source_width),
+            Orientation::NoTransforms
+            | Orientation::Rotate180
+            | Orientation::FlipHorizontal
+            | Orientation::FlipVertical => (self.source_width, self.source_height),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -42,8 +59,9 @@ pub(super) struct DecodedImage {
 
 impl DecodedImage {
     pub(super) fn matches_metadata(&self) -> bool {
-        self.pixels.width() == self.metadata.source_width
-            && self.pixels.height() == self.metadata.source_height
+        let (expected_width, expected_height) = self.metadata.display_dimensions();
+        self.pixels.width() == expected_width
+            && self.pixels.height() == expected_height
             && u64::try_from(self.pixels.as_bytes().len()) == Ok(self.metadata.decoded_bytes)
     }
 }
@@ -67,14 +85,20 @@ pub(super) fn validate(file: &PreviewFile) -> Result<ImageValidationResult, Imag
         return Ok(ImageValidationResult::Unsupported);
     };
 
-    let (source_width, source_height, decoded_bytes) = inspect_header(
+    let (source_width, source_height, decoded_bytes, orientation) = inspect_header(
         BufReader::new(file.duplicate_reader()?),
         decoder_format,
         decoder_limits(),
     )
     .map_err(ImageValidationError::Decoder)?;
 
-    let metadata = validated_metadata(format, source_width, source_height, decoded_bytes)?;
+    let metadata = validated_metadata(
+        format,
+        source_width,
+        source_height,
+        decoded_bytes,
+        orientation,
+    )?;
     if !file.is_unchanged()? {
         return Err(ImageValidationError::File(
             PreviewFileError::ChangedDuringRead,
@@ -132,7 +156,7 @@ fn inspect_header<R>(
     reader: R,
     format: DecoderFormat,
     limits: Limits,
-) -> Result<(u32, u32, u64), ImageError>
+) -> Result<(u32, u32, u64, Orientation), ImageError>
 where
     R: std::io::BufRead + std::io::Seek,
 {
@@ -154,10 +178,12 @@ where
 fn inspect_decoder(
     mut decoder: impl ImageDecoder,
     limits: Limits,
-) -> Result<(u32, u32, u64), ImageError> {
+) -> Result<(u32, u32, u64, Orientation), ImageError> {
     decoder.set_limits(limits)?;
     let (width, height) = decoder.dimensions();
-    Ok((width, height, decoder.total_bytes()))
+    let decoded_bytes = decoder.total_bytes();
+    let orientation = decoder.orientation()?;
+    Ok((width, height, decoded_bytes, orientation))
 }
 
 fn decode_selected<R>(
@@ -171,15 +197,20 @@ where
 {
     match decoder_format {
         DecoderFormat::Jpeg => decode_with_decoder(JpegDecoder::new(reader)?, format, limits),
+        // ImageDecoder reads the PNG default image rather than iterating APNG frames.
         DecoderFormat::Png => decode_with_decoder(
             PngDecoder::with_limits(reader, limits.clone())?,
             format,
             limits,
         ),
+        // The still-image decoder produces the first GIF composited on its logical canvas.
         DecoderFormat::Gif => decode_with_decoder(GifDecoder::new(reader)?, format, limits),
+        // The image-webp still-image contract returns the first animation frame.
         DecoderFormat::WebP => decode_with_decoder(WebPDecoder::new(reader)?, format, limits),
         DecoderFormat::Bmp => decode_with_decoder(BmpDecoder::new(reader)?, format, limits),
+        // IcoDecoder selects the entry with the highest (color depth, pixel area).
         DecoderFormat::Ico => decode_with_decoder(IcoDecoder::new(reader)?, format, limits),
+        // TiffDecoder starts at the first image file directory and never advances pages here.
         DecoderFormat::Tiff => decode_with_decoder(TiffDecoder::new(reader)?, format, limits),
         _ => unreachable!("unsupported formats are rejected before decoder construction"),
     }
@@ -193,8 +224,15 @@ fn decode_with_decoder(
     decoder.set_limits(limits)?;
     let (source_width, source_height) = decoder.dimensions();
     let decoded_bytes = decoder.total_bytes();
-    let metadata = validated_metadata(format, source_width, source_height, decoded_bytes)?;
-    let pixels = DynamicImage::from_decoder(decoder)?;
+    let orientation = decoder.orientation()?;
+    let metadata = validated_metadata(
+        format,
+        source_width,
+        source_height,
+        decoded_bytes,
+        orientation,
+    )?;
+    let mut pixels = DynamicImage::from_decoder(decoder)?;
     let actual_width = pixels.width();
     let actual_height = pixels.height();
     let actual_bytes = pixels.as_bytes().len();
@@ -211,7 +249,20 @@ fn decode_with_decoder(
             actual_bytes,
         });
     }
-    Ok(DecodedImage { metadata, pixels })
+    pixels.apply_orientation(orientation);
+    let decoded = DecodedImage { metadata, pixels };
+    if !decoded.matches_metadata() {
+        let (expected_width, expected_height) = metadata.display_dimensions();
+        return Err(ImageValidationError::DecodedLayoutMismatch {
+            expected_width,
+            expected_height,
+            expected_bytes: decoded_bytes,
+            actual_width: decoded.pixels.width(),
+            actual_height: decoded.pixels.height(),
+            actual_bytes: decoded.pixels.as_bytes().len(),
+        });
+    }
+    Ok(decoded)
 }
 
 fn validated_metadata(
@@ -219,6 +270,7 @@ fn validated_metadata(
     source_width: u32,
     source_height: u32,
     decoded_bytes: u64,
+    orientation: Orientation,
 ) -> Result<ValidatedImage, ImageValidationError> {
     validate_source_layout(source_width, source_height, decoded_bytes)?;
     checked_bgra_layout(
@@ -230,6 +282,7 @@ fn validated_metadata(
         source_width,
         source_height,
         decoded_bytes,
+        orientation,
     })
 }
 
@@ -451,7 +504,12 @@ mod tests {
             MAX_SOURCE_IMAGE_PIXELS,
         },
     };
-    use image::{DynamicImage, ImageFormat as DecoderFormat, Rgba, RgbaImage};
+    use image::{
+        DynamicImage, ExtendedColorType, Frame, ImageEncoder, ImageFormat as DecoderFormat, Rgba,
+        RgbaImage,
+        codecs::{gif::GifEncoder, png::PngEncoder},
+        metadata::Orientation,
+    };
     use std::{
         fs,
         io::Cursor,
@@ -503,6 +561,135 @@ mod tests {
         output.into_inner()
     }
 
+    fn exif_orientation(value: u8) -> Vec<u8> {
+        vec![
+            b'I', b'I', 42, 0, 8, 0, 0, 0, 1, 0, 0x12, 0x01, 3, 0, 1, 0, 0, 0, value, 0, 0, 0, 0,
+            0, 0, 0,
+        ]
+    }
+
+    fn oriented_png(orientation: u8) -> Vec<u8> {
+        let image = RgbaImage::from_fn(2, 3, |x, y| {
+            let red = u8::try_from(y * 2 + x + 1).unwrap();
+            Rgba([red, 0, 0, 255])
+        });
+        let mut output = Vec::new();
+        let mut encoder = PngEncoder::new(&mut output);
+        encoder
+            .set_exif_metadata(exif_orientation(orientation))
+            .expect("PNG should accept Exif orientation");
+        encoder
+            .write_image(image.as_raw(), 2, 3, ExtendedColorType::Rgba8)
+            .expect("the oriented PNG should encode");
+        output
+    }
+
+    fn two_frame_gif() -> Vec<u8> {
+        let first = Frame::new(RgbaImage::from_pixel(2, 1, Rgba([210, 10, 20, 255])));
+        let second = Frame::new(RgbaImage::from_pixel(2, 1, Rgba([20, 210, 10, 255])));
+        let mut output = Vec::new();
+        {
+            let mut encoder = GifEncoder::new(&mut output);
+            encoder
+                .encode_frames([first, second])
+                .expect("the animated GIF should encode");
+        }
+        output
+    }
+
+    fn push_u16(output: &mut Vec<u8>, value: u16) {
+        output.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_u32(output: &mut Vec<u8>, value: u32) {
+        output.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_tiff_entry(output: &mut Vec<u8>, tag: u16, field_type: u16, value: u32) {
+        push_u16(output, tag);
+        push_u16(output, field_type);
+        push_u32(output, 1);
+        push_u32(output, value);
+    }
+
+    fn push_tiff_ifd(output: &mut Vec<u8>, strip_offset: u32, next_ifd: u32) {
+        push_u16(output, 9);
+        push_tiff_entry(output, 256, 4, 1); // ImageWidth
+        push_tiff_entry(output, 257, 4, 1); // ImageLength
+        push_tiff_entry(output, 258, 3, 8); // BitsPerSample
+        push_tiff_entry(output, 259, 3, 1); // Compression: none
+        push_tiff_entry(output, 262, 3, 1); // PhotometricInterpretation: BlackIsZero
+        push_tiff_entry(output, 273, 4, strip_offset); // StripOffsets
+        push_tiff_entry(output, 277, 3, 1); // SamplesPerPixel
+        push_tiff_entry(output, 278, 4, 1); // RowsPerStrip
+        push_tiff_entry(output, 279, 4, 1); // StripByteCounts
+        push_u32(output, next_ifd);
+    }
+
+    fn two_page_tiff() -> Vec<u8> {
+        const FIRST_IFD: u32 = 8;
+        const IFD_BYTES: u32 = 2 + 9 * 12 + 4;
+        const SECOND_IFD: u32 = FIRST_IFD + IFD_BYTES;
+        const FIRST_PIXEL: u32 = SECOND_IFD + IFD_BYTES;
+        const SECOND_PIXEL: u32 = FIRST_PIXEL + 1;
+
+        let mut output = Vec::new();
+        output.extend_from_slice(b"II");
+        push_u16(&mut output, 42);
+        push_u32(&mut output, FIRST_IFD);
+        push_tiff_ifd(&mut output, FIRST_PIXEL, SECOND_IFD);
+        push_tiff_ifd(&mut output, SECOND_PIXEL, 0);
+        assert_eq!(output.len(), usize::try_from(FIRST_PIXEL).unwrap());
+        output.extend_from_slice(&[17, 221]);
+        output
+    }
+
+    fn png_entry(width: u32, height: u32, color: Rgba<u8>) -> Vec<u8> {
+        let image = DynamicImage::ImageRgba8(RgbaImage::from_pixel(width, height, color));
+        let mut output = Cursor::new(Vec::new());
+        image
+            .write_to(&mut output, DecoderFormat::Png)
+            .expect("the ICO PNG entry should encode");
+        output.into_inner()
+    }
+
+    fn push_ico_entry(
+        output: &mut Vec<u8>,
+        width: u8,
+        height: u8,
+        bits_per_pixel: u16,
+        length: usize,
+        offset: usize,
+    ) {
+        output.extend_from_slice(&[width, height, 0, 0]);
+        push_u16(output, 1);
+        push_u16(output, bits_per_pixel);
+        push_u32(output, u32::try_from(length).unwrap());
+        push_u32(output, u32::try_from(offset).unwrap());
+    }
+
+    fn multi_entry_ico() -> Vec<u8> {
+        let deeper = png_entry(1, 1, Rgba([190, 30, 20, 255]));
+        let larger = png_entry(2, 2, Rgba([20, 190, 30, 255]));
+        let directory_end = 6 + 2 * 16;
+        let mut output = Vec::new();
+        push_u16(&mut output, 0);
+        push_u16(&mut output, 1);
+        push_u16(&mut output, 2);
+        push_ico_entry(&mut output, 1, 1, 32, deeper.len(), directory_end);
+        push_ico_entry(
+            &mut output,
+            2,
+            2,
+            24,
+            larger.len(),
+            directory_end + deeper.len(),
+        );
+        output.extend_from_slice(&deeper);
+        output.extend_from_slice(&larger);
+        output
+    }
+
     #[test]
     fn eligibility_is_case_insensitive_and_limited_to_the_product_formats() {
         for extension in IMAGE_EXTENSIONS {
@@ -547,6 +734,7 @@ mod tests {
             };
             assert_eq!(validated.format, expected_format);
             assert_eq!((validated.source_width, validated.source_height), (3, 2));
+            assert_eq!(validated.orientation, Orientation::NoTransforms);
             assert!(validated.decoded_bytes > 0);
             assert!(validated.decoded_bytes <= MAX_DECODED_IMAGE_BYTES);
 
@@ -565,6 +753,95 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn every_exif_orientation_is_applied_to_decoded_pixels() {
+        let root = TestDirectory::new("orientation");
+        let cases: [(u8, (u32, u32), &[u8]); 8] = [
+            (1, (2, 3), &[1, 2, 3, 4, 5, 6]),
+            (2, (2, 3), &[2, 1, 4, 3, 6, 5]),
+            (3, (2, 3), &[6, 5, 4, 3, 2, 1]),
+            (4, (2, 3), &[5, 6, 3, 4, 1, 2]),
+            (5, (3, 2), &[1, 3, 5, 2, 4, 6]),
+            (6, (3, 2), &[5, 3, 1, 6, 4, 2]),
+            (7, (3, 2), &[6, 4, 2, 5, 3, 1]),
+            (8, (3, 2), &[2, 4, 6, 1, 3, 5]),
+        ];
+
+        for (exif_value, expected_dimensions, expected_red) in cases {
+            let path = root.path().join(format!("oriented-{exif_value}.png"));
+            fs::write(&path, oriented_png(exif_value)).unwrap();
+            let file = PreviewFile::open(&path).unwrap();
+
+            let ImageValidationResult::Validated(validated) = validate(&file).unwrap() else {
+                panic!("the oriented PNG should validate");
+            };
+            assert_eq!(
+                validated.orientation,
+                Orientation::from_exif(exif_value).unwrap()
+            );
+            assert_eq!((validated.source_width, validated.source_height), (2, 3));
+            assert_eq!(validated.display_dimensions(), expected_dimensions);
+
+            let ImageDecodeResult::Decoded(decoded) = decode(&file).unwrap() else {
+                panic!("the oriented PNG should decode");
+            };
+            assert!(decoded.matches_metadata());
+            assert_eq!(
+                (decoded.pixels.width(), decoded.pixels.height()),
+                expected_dimensions
+            );
+            let pixels = decoded.pixels.to_rgba8();
+            assert_eq!(
+                pixels.pixels().map(|pixel| pixel.0[0]).collect::<Vec<_>>(),
+                expected_red
+            );
+        }
+    }
+
+    #[test]
+    fn animated_gif_uses_only_the_first_composited_frame() {
+        let root = TestDirectory::new("gif-first-frame");
+        let path = root.path().join("animated.gif");
+        fs::write(&path, two_frame_gif()).unwrap();
+        let file = PreviewFile::open(&path).unwrap();
+
+        let ImageDecodeResult::Decoded(decoded) = decode(&file).unwrap() else {
+            panic!("the animated GIF should decode");
+        };
+        assert_eq!((decoded.pixels.width(), decoded.pixels.height()), (2, 1));
+        for pixel in decoded.pixels.to_rgba8().pixels() {
+            assert!(pixel.0[0] > 180);
+            assert!(pixel.0[1] < 40);
+            assert!(pixel.0[2] < 50);
+        }
+    }
+
+    #[test]
+    fn tiff_and_ico_use_deterministic_first_image_policies() {
+        let root = TestDirectory::new("multi-image-policy");
+
+        let tiff_path = root.path().join("pages.tiff");
+        fs::write(&tiff_path, two_page_tiff()).unwrap();
+        let file = PreviewFile::open(&tiff_path).unwrap();
+        let ImageDecodeResult::Decoded(decoded) = decode(&file).unwrap() else {
+            panic!("the multipage TIFF should decode");
+        };
+        assert_eq!((decoded.pixels.width(), decoded.pixels.height()), (1, 1));
+        assert_eq!(decoded.pixels.to_luma8().get_pixel(0, 0).0, [17]);
+
+        let ico_path = root.path().join("entries.ico");
+        fs::write(&ico_path, multi_entry_ico()).unwrap();
+        let file = PreviewFile::open(&ico_path).unwrap();
+        let ImageDecodeResult::Decoded(decoded) = decode(&file).unwrap() else {
+            panic!("the multi-entry ICO should decode");
+        };
+        assert_eq!((decoded.pixels.width(), decoded.pixels.height()), (1, 1));
+        assert_eq!(
+            decoded.pixels.to_rgba8().get_pixel(0, 0).0,
+            [190, 30, 20, 255]
+        );
     }
 
     #[test]
