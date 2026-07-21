@@ -23,7 +23,7 @@ pub(crate) use manager::{
     CompletionNotifier, PendingWorkerPoll, PendingWorkerResolution, WorkerManager,
     WorkerManagerError, run_launch_diagnostic, run_timeout_diagnostic,
 };
-pub(crate) use payload::{PreviewResult, TextPreview};
+pub(crate) use payload::{ImageFormat, ImagePreview, PreviewResult, TextPreview};
 
 pub(crate) fn run_session<R, W>(
     reader: &mut R,

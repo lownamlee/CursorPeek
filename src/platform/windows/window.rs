@@ -602,10 +602,10 @@ impl MessageWindow {
     }
 
     fn show_worker_result(&mut self, anchor: PhysicalScreenPoint, result: PreviewResult) {
-        let PreviewResult::Text(text) = result else {
+        if matches!(result, PreviewResult::Status(_)) {
             self.hide_product_preview();
             return;
-        };
+        }
 
         if self.preview_diagnostics.is_some() {
             return;
@@ -618,11 +618,15 @@ impl MessageWindow {
             self.preview_window = Some(preview);
         }
 
-        let shown = self
+        let preview = self
             .preview_window
             .as_ref()
-            .expect("the preview window was created above")
-            .show_text_at(anchor, self.preview_size, &text);
+            .expect("the preview window was created above");
+        let shown = match result {
+            PreviewResult::Text(text) => preview.show_text_at(anchor, self.preview_size, &text),
+            PreviewResult::Image(image) => preview.show_image_at(anchor, self.preview_size, image),
+            PreviewResult::Status(_) => unreachable!("statuses returned before window creation"),
+        };
         if shown.is_err() {
             drop(self.preview_window.take());
         }
