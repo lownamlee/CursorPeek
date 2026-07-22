@@ -223,6 +223,75 @@ mod tests {
     }
 
     #[test]
+    fn stays_inside_work_areas_for_every_taskbar_edge() {
+        let cases = [
+            (
+                PhysicalScreenPoint::new(500, 45),
+                ScreenRect {
+                    left: 0,
+                    top: 40,
+                    right: 1920,
+                    bottom: 1080,
+                },
+            ),
+            (
+                PhysicalScreenPoint::new(500, 1035),
+                ScreenRect {
+                    left: 0,
+                    top: 0,
+                    right: 1920,
+                    bottom: 1040,
+                },
+            ),
+            (
+                PhysicalScreenPoint::new(45, 500),
+                ScreenRect {
+                    left: 40,
+                    top: 0,
+                    right: 1920,
+                    bottom: 1080,
+                },
+            ),
+            (
+                PhysicalScreenPoint::new(1875, 500),
+                ScreenRect {
+                    left: 0,
+                    top: 0,
+                    right: 1880,
+                    bottom: 1080,
+                },
+            ),
+        ];
+
+        for (anchor, work_area) in cases {
+            let placement = place_preview(anchor, work_area, 96, PreviewSize::diagnostic())
+                .expect("the taskbar-shaped work area should admit a preview");
+            assert_inside(placement, work_area);
+        }
+    }
+
+    #[test]
+    fn handles_a_scaled_monitor_above_the_primary() {
+        let work_area = ScreenRect {
+            left: 0,
+            top: -1400,
+            right: 2560,
+            bottom: -40,
+        };
+        let placement = place_preview(
+            PhysicalScreenPoint::new(2300, -100),
+            work_area,
+            192,
+            PreviewSize::diagnostic(),
+        )
+        .expect("the negative vertical work area is valid");
+
+        assert_eq!(placement.width, 640);
+        assert_eq!(placement.height, 480);
+        assert_inside(placement, work_area);
+    }
+
+    #[test]
     fn caps_the_preview_to_a_small_work_area_and_rejects_invalid_input() {
         assert_eq!(
             place_preview(
@@ -308,5 +377,12 @@ mod tests {
                 height: 600,
             })
         );
+    }
+
+    fn assert_inside(placement: PreviewPlacement, work_area: ScreenRect) {
+        assert!(placement.x >= work_area.left);
+        assert!(placement.y >= work_area.top);
+        assert!(placement.x + placement.width <= work_area.right);
+        assert!(placement.y + placement.height <= work_area.bottom);
     }
 }

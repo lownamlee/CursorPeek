@@ -17,7 +17,7 @@ use windows::{
             Input::{
                 GetRawInputData, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT, RAWINPUTDEVICE,
                 RAWINPUTDEVICE_FLAGS, RAWINPUTHEADER, RAWMOUSE, RID_INPUT, RIDEV_INPUTSINK,
-                RIDEV_REMOVE, RIM_TYPEMOUSE, RegisterRawInputDevices,
+                RIDEV_REMOVE, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE, RegisterRawInputDevices,
             },
             WindowsAndMessaging::{
                 GetPhysicalCursorPos, SPI_GETMOUSEHOVERHEIGHT, SPI_GETMOUSEHOVERWIDTH,
@@ -34,9 +34,16 @@ use windows::Win32::UI::Input::GetRegisteredRawInputDevices;
 
 const GENERIC_DESKTOP_USAGE_PAGE: u16 = 0x01;
 const MOUSE_USAGE: u16 = 0x02;
+const KEYBOARD_USAGE: u16 = 0x06;
 const RAW_INPUT_DEVICE_SIZE: u32 = size_of::<RAWINPUTDEVICE>() as u32;
 const RAW_INPUT_SIZE: u32 = size_of::<RAWINPUT>() as u32;
 const RAW_INPUT_HEADER_SIZE: u32 = size_of::<RAWINPUTHEADER>() as u32;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RawInputActivity {
+    Mouse(RawMouseActivity),
+    Keyboard,
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct RawMouseActivity {
@@ -148,7 +155,7 @@ fn hover_dimensions_at_96_dpi() -> Result<(u32, u32)> {
     Ok((width, height))
 }
 
-pub(super) fn read_raw_mouse_activity(lparam: LPARAM) -> Result<Option<RawMouseActivity>> {
+pub(super) fn read_raw_input_activity(lparam: LPARAM) -> Result<Option<RawInputActivity>> {
     let handle = HRAWINPUT(lparam.0 as _);
     let mut raw_input = MaybeUninit::<RAWINPUT>::uninit();
     let mut buffer_size = RAW_INPUT_SIZE;
@@ -177,13 +184,21 @@ pub(super) fn read_raw_mouse_activity(lparam: LPARAM) -> Result<Option<RawMouseA
     // SAFETY: GetRawInputData reported that it initialized every byte of the fixed RAWINPUT
     // destination. Short writes were rejected above.
     let raw_input = unsafe { raw_input.assume_init() };
-    if raw_input.header.dwSize != RAW_INPUT_SIZE || raw_input.header.dwType != RIM_TYPEMOUSE.0 {
+    if raw_input.header.dwSize != RAW_INPUT_SIZE {
         return Ok(None);
     }
 
-    // SAFETY: The validated RAWINPUT header identifies the active union member as RAWMOUSE.
-    let mouse = unsafe { raw_input.data.mouse };
-    Ok(Some(RawMouseActivity::from_mouse(mouse)))
+    if raw_input.header.dwType == RIM_TYPEMOUSE.0 {
+        // SAFETY: The validated RAWINPUT header identifies the active union member as RAWMOUSE.
+        let mouse = unsafe { raw_input.data.mouse };
+        Ok(Some(RawInputActivity::Mouse(RawMouseActivity::from_mouse(
+            mouse,
+        ))))
+    } else if raw_input.header.dwType == RIM_TYPEKEYBOARD.0 {
+        Ok(Some(RawInputActivity::Keyboard))
+    } else {
+        Ok(None)
+    }
 }
 
 struct ThreadDpiContext {
@@ -235,19 +250,20 @@ impl Drop for ThreadDpiContext {
     }
 }
 
-pub(super) struct RawMouseInputRegistration {
+pub(super) struct RawInputRegistration {
     _thread_affinity: PhantomData<Rc<()>>,
 }
 
-impl RawMouseInputRegistration {
+impl RawInputRegistration {
     pub(super) fn register(target: HWND) -> Result<Self> {
-        let device = raw_mouse_device(RIDEV_INPUTSINK, target);
+        let devices = raw_input_devices(RIDEV_INPUTSINK, target);
 
-        // SAFETY: The one-element slice is correctly aligned and uses the exact generated
+        // SAFETY: The mouse/keyboard slice is correctly aligned and uses the exact generated
         // structure size. `target` is a live window owned by the calling UI thread, and
-        // RIDEV_INPUTSINK is valid only because that non-null target is supplied.
+        // RIDEV_INPUTSINK is valid only because that non-null target is supplied. Legacy input
+        // remains enabled; this registration observes rather than captures either device class.
         unsafe {
-            RegisterRawInputDevices(&[device], RAW_INPUT_DEVICE_SIZE)?;
+            RegisterRawInputDevices(&devices, RAW_INPUT_DEVICE_SIZE)?;
         }
 
         Ok(Self {
@@ -256,30 +272,31 @@ impl RawMouseInputRegistration {
     }
 }
 
-impl Drop for RawMouseInputRegistration {
+impl Drop for RawInputRegistration {
     fn drop(&mut self) {
-        let removal = raw_mouse_device(RIDEV_REMOVE, HWND::default());
+        let removals = raw_input_devices(RIDEV_REMOVE, HWND::default());
 
-        // SAFETY: The slice is aligned and sized as required. Microsoft requires a null target
-        // when RIDEV_REMOVE is used. This !Send token is explicitly dropped by MessageWindow on
-        // the owning UI thread before that registration's target HWND is destroyed.
+        // SAFETY: The mouse/keyboard slice is aligned and sized as required. Microsoft requires a
+        // null target when RIDEV_REMOVE is used. This !Send token is explicitly dropped by
+        // MessageWindow on the owning UI thread before that registration's target HWND is
+        // destroyed.
         unsafe {
-            let _ = RegisterRawInputDevices(&[removal], RAW_INPUT_DEVICE_SIZE);
+            let _ = RegisterRawInputDevices(&removals, RAW_INPUT_DEVICE_SIZE);
         }
     }
 }
 
-fn raw_mouse_device(flags: RAWINPUTDEVICE_FLAGS, target: HWND) -> RAWINPUTDEVICE {
-    RAWINPUTDEVICE {
+fn raw_input_devices(flags: RAWINPUTDEVICE_FLAGS, target: HWND) -> [RAWINPUTDEVICE; 2] {
+    [MOUSE_USAGE, KEYBOARD_USAGE].map(|usage| RAWINPUTDEVICE {
         usUsagePage: GENERIC_DESKTOP_USAGE_PAGE,
-        usUsage: MOUSE_USAGE,
+        usUsage: usage,
         dwFlags: flags,
         hwndTarget: target,
-    }
+    })
 }
 
 #[cfg(test)]
-pub(super) fn registered_raw_mouse() -> Result<Option<RAWINPUTDEVICE>> {
+pub(super) fn registered_raw_devices() -> Result<Vec<RAWINPUTDEVICE>> {
     let mut capacity = 4_u32;
 
     loop {
@@ -299,9 +316,12 @@ pub(super) fn registered_raw_mouse() -> Result<Option<RAWINPUTDEVICE>> {
 
         if written != u32::MAX {
             devices.truncate(written as usize);
-            return Ok(devices.into_iter().find(|device| {
-                device.usUsagePage == GENERIC_DESKTOP_USAGE_PAGE && device.usUsage == MOUSE_USAGE
-            }));
+            devices.retain(|device| {
+                device.usUsagePage == GENERIC_DESKTOP_USAGE_PAGE
+                    && matches!(device.usUsage, MOUSE_USAGE | KEYBOARD_USAGE)
+            });
+            devices.sort_by_key(|device| device.usUsage);
+            return Ok(devices);
         }
 
         let error = Error::from_thread();

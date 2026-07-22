@@ -44,6 +44,17 @@ pub(super) fn is_explorer_window(window: HWND) -> bool {
     root_window(window).is_some_and(is_explorer_root)
 }
 
+pub(super) fn belongs_to_explorer_window_at(window: HWND, point: PhysicalScreenPoint) -> bool {
+    let Some(event_root) = root_window(window) else {
+        return false;
+    };
+    let Some(point_root) = root_window(window_at(point)) else {
+        return false;
+    };
+
+    event_root == point_root && is_explorer_root(point_root)
+}
+
 fn window_at(point: PhysicalScreenPoint) -> HWND {
     // SAFETY: `point` contains physical screen coordinates sampled by GetPhysicalCursorPos.
     // The returned HWND is borrowed and used only for synchronous queries.

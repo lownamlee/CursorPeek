@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     error::Error as StdError,
     fmt,
     marker::PhantomData,
@@ -7,11 +8,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::explorer::{is_explorer_window_at, is_foreground_explorer_window_at};
+use super::explorer::{
+    belongs_to_explorer_window_at, is_explorer_window_at, is_foreground_explorer_window_at,
+};
 #[cfg(test)]
-use super::input::registered_raw_mouse;
+use super::input::registered_raw_devices;
 use super::input::{
-    RawMouseActivity, RawMouseInputRegistration, physical_cursor_position, read_raw_mouse_activity,
+    RawInputActivity, RawInputRegistration, physical_cursor_position, read_raw_input_activity,
     system_hover_rectangle,
 };
 
@@ -31,11 +34,16 @@ use windows::{
     Win32::{
         Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
         System::LibraryLoader::GetModuleHandleW,
-        UI::WindowsAndMessaging::{
-            CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow,
-            GetMessageW, HWND_MESSAGE, KillTimer, MSG, PostMessageW, RegisterClassW, SetTimer,
-            TranslateMessage, USER_TIMER_MAXIMUM, USER_TIMER_MINIMUM, UnregisterClassW,
-            WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_INPUT, WM_TIMER, WNDCLASSW,
+        UI::{
+            Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
+            WindowsAndMessaging::{
+                CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+                EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND,
+                GetForegroundWindow, GetMessageW, HWND_MESSAGE, KillTimer, MSG, PostMessageW,
+                RegisterClassW, SetTimer, TranslateMessage, USER_TIMER_MAXIMUM, USER_TIMER_MINIMUM,
+                UnregisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE, WINEVENT_OUTOFCONTEXT,
+                WINEVENT_SKIPOWNPROCESS, WM_APP, WM_INPUT, WM_TIMER, WNDCLASSW,
+            },
         },
     },
     core::{Error, PCWSTR, Result, w},
@@ -49,10 +57,13 @@ const SHUTDOWN_MESSAGE: u32 = WM_APP + 1;
 const WORKER_RESULT_MESSAGE: u32 = WM_APP + 2;
 const TRAY_CALLBACK_MESSAGE: u32 = WM_APP + 3;
 pub(super) const ACTIVATE_MESSAGE: u32 = WM_APP + 4;
+const PREVIEW_CONTEXT_INVALIDATED_MESSAGE: u32 = WM_APP + 6;
 const DWELL_TIMER_ID: usize = 1;
 const INPUT_SAMPLE_TIMER_ID: usize = 2;
 const INPUT_DIAGNOSTIC_DEADLINE_TIMER_ID: usize = 3;
 const PREVIEW_DIAGNOSTIC_DEADLINE_TIMER_ID: usize = 4;
+const PREVIEW_GUARD_TIMER_ID: usize = 5;
+const PREVIEW_GUARD_INTERVAL: Duration = Duration::from_millis(125);
 
 pub(crate) const PREVIEW_WINDOW_DIAGNOSTIC_DURATION: Duration = Duration::from_millis(1_500);
 pub(crate) const PREVIEW_WINDOW_PRACTICE_DURATION: Duration = Duration::from_secs(5);
@@ -63,6 +74,7 @@ const TEST_PANIC_MESSAGE: u32 = WM_APP + 5;
 pub(crate) struct MessageWindow {
     hwnd: HWND,
     dwell_timer: Option<WindowTimer>,
+    preview_guard_timer: WindowTimer,
     hover_state: HoverState,
     preview_size: PreviewSize,
     input_diagnostics: Option<InputDiagnostics>,
@@ -74,7 +86,9 @@ pub(crate) struct MessageWindow {
     pending_worker_resolution: Option<PendingWorkerResolution>,
     pending_worker_anchor: Option<(Generation, PhysicalScreenPoint)>,
     latest_worker_completion: Option<Generation>,
-    raw_mouse_input: Option<RawMouseInputRegistration>,
+    active_preview: Option<ActivePreview>,
+    preview_event_hooks: Option<PreviewEventHooks>,
+    raw_input: Option<RawInputRegistration>,
     _class: RegisteredWindowClass,
     _thread_affinity: PhantomData<Rc<()>>,
 }
@@ -121,6 +135,7 @@ impl MessageWindow {
         let mut window = Self {
             hwnd,
             dwell_timer: Some(WindowTimer::new(hwnd, DWELL_TIMER_ID)),
+            preview_guard_timer: WindowTimer::new(hwnd, PREVIEW_GUARD_TIMER_ID),
             hover_state: HoverState::new(dwell_delay),
             preview_size,
             input_diagnostics: None,
@@ -132,11 +147,13 @@ impl MessageWindow {
             pending_worker_resolution: None,
             pending_worker_anchor: None,
             latest_worker_completion: None,
-            raw_mouse_input: None,
+            active_preview: None,
+            preview_event_hooks: Some(PreviewEventHooks::register()?),
+            raw_input: None,
             _class: class,
             _thread_affinity: PhantomData,
         };
-        window.raw_mouse_input = Some(RawMouseInputRegistration::register(hwnd)?);
+        window.raw_input = Some(RawInputRegistration::register(hwnd)?);
 
         Ok(window)
     }
@@ -323,6 +340,15 @@ impl MessageWindow {
                 continue;
             }
 
+            if message.hwnd == self.hwnd
+                && message.message == WM_TIMER
+                && message.wParam.0 == PREVIEW_GUARD_TIMER_ID
+            {
+                self.guard_product_preview();
+                self.record_preview_ui_task(ui_task_started.elapsed());
+                continue;
+            }
+
             if message.hwnd == self.hwnd && message.message == WORKER_RESULT_MESSAGE {
                 self.handle_worker_result();
                 self.record_preview_ui_task(ui_task_started.elapsed());
@@ -345,8 +371,14 @@ impl MessageWindow {
                 continue;
             }
 
-            let raw_mouse = if message.hwnd == self.hwnd && message.message == WM_INPUT {
-                Some(read_raw_mouse_activity(message.lParam))
+            if message.hwnd == self.hwnd && message.message == PREVIEW_CONTEXT_INVALIDATED_MESSAGE {
+                self.handle_preview_context_invalidation(message.wParam.0);
+                self.record_preview_ui_task(ui_task_started.elapsed());
+                continue;
+            }
+
+            let raw_input = if message.hwnd == self.hwnd && message.message == WM_INPUT {
+                Some(read_raw_input_activity(message.lParam))
             } else {
                 None
             };
@@ -358,8 +390,8 @@ impl MessageWindow {
                 DispatchMessageW(&message);
             }
 
-            if let Some(raw_mouse) = raw_mouse {
-                if preview_input_requires_dismissal(&raw_mouse)
+            if let Some(raw_input) = raw_input {
+                if preview_input_requires_dismissal(&raw_input)
                     && self.preview_diagnostics.is_some()
                 {
                     self.record_preview_ui_task(ui_task_started.elapsed());
@@ -367,7 +399,7 @@ impl MessageWindow {
                         self.finish_preview_diagnostics(PreviewWindowDismissal::Input),
                     ));
                 }
-                self.handle_raw_mouse(raw_mouse);
+                self.handle_raw_input(raw_input);
             }
             self.record_preview_ui_task(ui_task_started.elapsed());
         }
@@ -408,31 +440,37 @@ impl MessageWindow {
         }
     }
 
-    fn handle_raw_mouse(&mut self, raw_mouse: Result<Option<RawMouseActivity>>) {
+    fn handle_raw_input(&mut self, raw_input: Result<Option<RawInputActivity>>) {
         if self.input_diagnostics.is_some() {
-            self.handle_input_diagnostic_raw(raw_mouse);
+            self.handle_input_diagnostic_raw(raw_input);
             return;
         }
         if self.paused {
             return;
         }
 
-        match raw_mouse {
-            Ok(Some(activity)) if activity.is_relevant() => match physical_cursor_position() {
-                Ok(point) => {
-                    self.restart_dwell(PhysicalScreenPoint::new(point.x, point.y), Instant::now())
+        match raw_input {
+            Ok(Some(RawInputActivity::Mouse(activity))) if activity.is_relevant() => {
+                match physical_cursor_position() {
+                    Ok(point) => self
+                        .restart_dwell(PhysicalScreenPoint::new(point.x, point.y), Instant::now()),
+                    Err(_) => self.cancel_dwell(),
                 }
-                Err(_) => self.cancel_dwell(),
-            },
-            Ok(Some(_)) => {}
+            }
+            Ok(Some(RawInputActivity::Mouse(_))) => {}
+            Ok(Some(RawInputActivity::Keyboard)) => self.cancel_dwell(),
             Ok(None) | Err(_) => self.cancel_dwell(),
         }
     }
 
-    fn handle_input_diagnostic_raw(&mut self, raw_mouse: Result<Option<RawMouseActivity>>) {
-        let Ok(Some(activity)) = raw_mouse else {
-            self.suspend_input_diagnostics();
-            return;
+    fn handle_input_diagnostic_raw(&mut self, raw_input: Result<Option<RawInputActivity>>) {
+        let activity = match raw_input {
+            Ok(Some(RawInputActivity::Mouse(activity))) => activity,
+            Ok(Some(RawInputActivity::Keyboard)) => return,
+            Ok(None) | Err(_) => {
+                self.suspend_input_diagnostics();
+                return;
+            }
         };
         if !activity.is_relevant() {
             return;
@@ -627,17 +665,69 @@ impl MessageWindow {
             PreviewResult::Image(image) => preview.show_image_at(anchor, self.preview_size, image),
             PreviewResult::Status(_) => unreachable!("statuses returned before window creation"),
         };
-        if shown.is_err() {
-            drop(self.preview_window.take());
+        match shown {
+            Ok(_) => {
+                let Some(generation) = self.latest_worker_completion else {
+                    self.hide_product_preview();
+                    return;
+                };
+                let active = ActivePreview { generation, anchor };
+                self.active_preview = Some(active);
+                PreviewEventHooks::set_target(Some(PreviewEventTarget {
+                    message_window: self.hwnd,
+                    active,
+                }));
+                if self
+                    .preview_guard_timer
+                    .arm(PREVIEW_GUARD_INTERVAL)
+                    .is_err()
+                {
+                    self.hide_product_preview();
+                }
+            }
+            Err(_) => {
+                self.clear_product_preview_state();
+                drop(self.preview_window.take());
+            }
         }
     }
 
-    fn hide_product_preview(&self) {
+    fn guard_product_preview(&mut self) {
+        let Some(active) = self.active_preview else {
+            let _ = self.preview_guard_timer.stop();
+            return;
+        };
+        let current = physical_cursor_position()
+            .ok()
+            .map(|point| PhysicalScreenPoint::new(point.x, point.y));
+        if !preview_context_is_current(
+            active.anchor,
+            current,
+            is_foreground_explorer_window_at(active.anchor),
+        ) {
+            self.cancel_dwell();
+        }
+    }
+
+    fn handle_preview_context_invalidation(&mut self, generation: usize) {
+        if preview_context_generation_matches(self.active_preview, generation) {
+            self.cancel_dwell();
+        }
+    }
+
+    fn hide_product_preview(&mut self) {
+        self.clear_product_preview_state();
         if self.preview_diagnostics.is_none()
             && let Some(preview) = self.preview_window.as_ref()
         {
             let _ = preview.hide();
         }
+    }
+
+    fn clear_product_preview_state(&mut self) {
+        self.active_preview = None;
+        PreviewEventHooks::set_target(None);
+        let _ = self.preview_guard_timer.stop();
     }
 
     fn handle_tray_callback(&mut self, wparam: WPARAM, lparam: LPARAM) -> Result<bool> {
@@ -758,11 +848,145 @@ fn accept_worker_completion(
     completed.filter(|generation| *generation == current)
 }
 
-fn preview_input_requires_dismissal(raw_mouse: &Result<Option<RawMouseActivity>>) -> bool {
-    match raw_mouse {
-        Ok(Some(activity)) => activity.is_relevant(),
+fn preview_context_is_current(
+    anchor: PhysicalScreenPoint,
+    current: Option<PhysicalScreenPoint>,
+    foreground_explorer: bool,
+) -> bool {
+    current == Some(anchor) && foreground_explorer
+}
+
+fn preview_context_generation_matches(active: Option<ActivePreview>, generation: usize) -> bool {
+    active.is_some_and(|active| usize::try_from(active.generation.get()) == Ok(generation))
+}
+
+fn preview_input_requires_dismissal(raw_input: &Result<Option<RawInputActivity>>) -> bool {
+    match raw_input {
+        Ok(Some(RawInputActivity::Mouse(activity))) => activity.is_relevant(),
+        Ok(Some(RawInputActivity::Keyboard)) => true,
         Ok(None) | Err(_) => true,
     }
+}
+
+#[derive(Clone, Copy)]
+struct ActivePreview {
+    generation: Generation,
+    anchor: PhysicalScreenPoint,
+}
+
+#[derive(Clone, Copy)]
+struct PreviewEventTarget {
+    message_window: HWND,
+    active: ActivePreview,
+}
+
+thread_local! {
+    static PREVIEW_EVENT_TARGET: Cell<Option<PreviewEventTarget>> = const { Cell::new(None) };
+}
+
+struct PreviewEventHooks {
+    hooks: [HWINEVENTHOOK; 2],
+    _thread_affinity: PhantomData<Rc<()>>,
+}
+
+impl PreviewEventHooks {
+    fn register() -> Result<Self> {
+        let foreground =
+            register_preview_event_hook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND)?;
+        let object =
+            match register_preview_event_hook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE) {
+                Ok(hook) => hook,
+                Err(error) => {
+                    // SAFETY: `foreground` is the live hook returned above and has not been unhooked.
+                    unsafe {
+                        let _ = UnhookWinEvent(foreground);
+                    }
+                    return Err(error);
+                }
+            };
+
+        Ok(Self {
+            hooks: [foreground, object],
+            _thread_affinity: PhantomData,
+        })
+    }
+
+    fn set_target(target: Option<PreviewEventTarget>) {
+        PREVIEW_EVENT_TARGET.set(target);
+    }
+}
+
+impl Drop for PreviewEventHooks {
+    fn drop(&mut self) {
+        Self::set_target(None);
+        for hook in self.hooks {
+            // SAFETY: Each handle was returned by SetWinEventHook and is unhooked exactly once on
+            // the registering UI thread before the message-window target is destroyed.
+            unsafe {
+                let _ = UnhookWinEvent(hook);
+            }
+        }
+    }
+}
+
+fn register_preview_event_hook(event_min: u32, event_max: u32) -> Result<HWINEVENTHOOK> {
+    // SAFETY: The callback is a static system-ABI function. Out-of-context delivery returns to
+    // this registering thread's message loop, skips events from CursorPeek itself, and supplies no
+    // module handle because the callback is not injected into another process.
+    let hook = unsafe {
+        SetWinEventHook(
+            event_min,
+            event_max,
+            None,
+            Some(preview_event_callback),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        )
+    };
+    if hook.is_invalid() {
+        Err(Error::from_thread())
+    } else {
+        Ok(hook)
+    }
+}
+
+unsafe extern "system" fn preview_event_callback(
+    _hook: HWINEVENTHOOK,
+    event: u32,
+    event_window: HWND,
+    _object_id: i32,
+    _child_id: i32,
+    _event_thread: u32,
+    _event_time: u32,
+) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        PREVIEW_EVENT_TARGET.with(|target| {
+            let Some(target) = target.get() else {
+                return;
+            };
+            if event != EVENT_SYSTEM_FOREGROUND
+                && !belongs_to_explorer_window_at(event_window, target.active.anchor)
+            {
+                return;
+            }
+            let Ok(generation) = usize::try_from(target.active.generation.get()) else {
+                return;
+            };
+
+            // SAFETY: The target is the live message-only HWND owned by the registering thread.
+            // The private message carries only a generation scalar, never a callback pointer or
+            // borrowed event data.
+            unsafe {
+                let _ = PostMessageW(
+                    Some(target.message_window),
+                    PREVIEW_CONTEXT_INVALIDATED_MESSAGE,
+                    WPARAM(generation),
+                    LPARAM(0),
+                );
+            }
+        });
+    }));
 }
 
 impl Drop for MessageWindow {
@@ -772,9 +996,11 @@ impl Drop for MessageWindow {
         drop(self.preview_window.take());
         drop(self.input_diagnostics.take());
         drop(self.dwell_timer.take());
+        let _ = self.preview_guard_timer.stop();
         drop(self.pending_worker_resolution.take());
         drop(self.worker_manager.take());
-        drop(self.raw_mouse_input.take());
+        drop(self.preview_event_hooks.take());
+        drop(self.raw_input.take());
 
         // SAFETY: The owner is !Send and therefore drops on the creating thread. All timers have
         // been stopped and Raw Input unregistered. The HWND returned by CreateWindowExW is
@@ -1006,14 +1232,15 @@ fn dispatch_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        DWELL_TIMER_ID, IsWindow, LPARAM, MessageWindow, PREVIEW_WINDOW_DIAGNOSTIC_DURATION,
-        PREVIEW_WINDOW_PRACTICE_DURATION, PostMessageW, TEST_PANIC_MESSAGE, WM_TIMER, WPARAM,
-        accept_worker_completion, post_worker_result, preview_input_requires_dismissal,
-        registered_raw_mouse, timer_interval_ms,
+        ActivePreview, DWELL_TIMER_ID, IsWindow, LPARAM, MessageWindow,
+        PREVIEW_WINDOW_DIAGNOSTIC_DURATION, PREVIEW_WINDOW_PRACTICE_DURATION, PostMessageW,
+        TEST_PANIC_MESSAGE, WM_TIMER, WPARAM, accept_worker_completion, post_worker_result,
+        preview_context_generation_matches, preview_context_is_current,
+        preview_input_requires_dismissal, registered_raw_devices, timer_interval_ms,
     };
     use crate::hover::{Generation, PhysicalScreenPoint};
     use crate::platform::windows::explorer::is_explorer_window;
-    use crate::platform::windows::input::RawMouseActivity;
+    use crate::platform::windows::input::{RawInputActivity, RawMouseActivity};
     use crate::worker::WorkerManager;
     use std::{
         thread,
@@ -1060,11 +1287,7 @@ mod tests {
                 !is_explorer_window(first_handle),
                 "the private message window must fail the Explorer candidate gate"
             );
-            let first_registration = registered_raw_mouse()
-                .expect("the process registration should be queryable")
-                .expect("the raw mouse should be registered");
-            assert_eq!(first_registration.hwndTarget, first_handle);
-            assert_eq!(first_registration.dwFlags, RIDEV_INPUTSINK);
+            assert_raw_input_registrations(first_handle);
 
             first.restart_dwell(PhysicalScreenPoint::new(-10, 20), Instant::now());
             assert!(first.dwell_timer_is_armed());
@@ -1103,10 +1326,10 @@ mod tests {
             // SAFETY: Checking a stale HWND with IsWindow is the documented validity probe.
             assert!(!unsafe { IsWindow(Some(first_handle)).as_bool() });
             assert!(
-                registered_raw_mouse()
+                registered_raw_devices()
                     .expect("the process registration should be queryable")
-                    .is_none(),
-                "raw mouse input should be unregistered before window teardown"
+                    .is_empty(),
+                "raw input should be unregistered before window teardown"
             );
 
             let application = MessageWindow::create_with_dwell_delay(Duration::from_millis(650))
@@ -1136,9 +1359,9 @@ mod tests {
             // SAFETY: The consuming diagnostic loop has dropped its owned HWND.
             assert!(!unsafe { IsWindow(Some(diagnostic_handle)).as_bool() });
             assert!(
-                registered_raw_mouse()
+                registered_raw_devices()
                     .expect("the process registration should be queryable")
-                    .is_none(),
+                    .is_empty(),
                 "diagnostic timers and Raw Input should stop before window teardown"
             );
 
@@ -1149,20 +1372,16 @@ mod tests {
 
                 // SAFETY: `handle` belongs to the live window on this test thread.
                 assert!(unsafe { IsWindow(Some(handle)).as_bool() });
-                let registration = registered_raw_mouse()
-                    .expect("the process registration should be queryable")
-                    .expect("the raw mouse should be registered");
-                assert_eq!(registration.hwndTarget, handle);
-                assert_eq!(registration.dwFlags, RIDEV_INPUTSINK);
+                assert_raw_input_registrations(handle);
                 drop(window);
 
                 // SAFETY: Checking a stale HWND with IsWindow is the documented validity probe.
                 assert!(!unsafe { IsWindow(Some(handle)).as_bool() });
                 assert!(
-                    registered_raw_mouse()
+                    registered_raw_devices()
                         .expect("the process registration should be queryable")
-                        .is_none(),
-                    "raw mouse input should be removed on every lifecycle"
+                        .is_empty(),
+                    "raw input should be removed on every lifecycle"
                 );
             }
         })
@@ -1190,15 +1409,64 @@ mod tests {
     #[test]
     fn preview_dismisses_on_relevant_or_unreadable_raw_input() {
         assert!(!preview_input_requires_dismissal(&Ok(Some(
-            RawMouseActivity::for_test(false, false)
+            RawInputActivity::Mouse(RawMouseActivity::for_test(false, false))
         ))));
         assert!(preview_input_requires_dismissal(&Ok(Some(
-            RawMouseActivity::for_test(true, false)
+            RawInputActivity::Mouse(RawMouseActivity::for_test(true, false))
         ))));
         assert!(preview_input_requires_dismissal(&Ok(Some(
-            RawMouseActivity::for_test(false, true)
+            RawInputActivity::Mouse(RawMouseActivity::for_test(false, true))
+        ))));
+        assert!(preview_input_requires_dismissal(&Ok(Some(
+            RawInputActivity::Keyboard
         ))));
         assert!(preview_input_requires_dismissal(&Ok(None)));
         assert!(preview_input_requires_dismissal(&Err(Error::empty())));
+    }
+
+    #[test]
+    fn preview_guard_requires_the_exact_anchor_and_foreground_explorer() {
+        let anchor = PhysicalScreenPoint::new(-400, 250);
+        assert!(preview_context_is_current(anchor, Some(anchor), true));
+        assert!(!preview_context_is_current(
+            anchor,
+            Some(PhysicalScreenPoint::new(-399, 250)),
+            true
+        ));
+        assert!(!preview_context_is_current(anchor, Some(anchor), false));
+        assert!(!preview_context_is_current(anchor, None, true));
+    }
+
+    #[test]
+    fn stale_context_events_cannot_dismiss_a_newer_preview() {
+        let generation = Generation::from_raw(25);
+        let active = Some(ActivePreview {
+            generation,
+            anchor: PhysicalScreenPoint::new(300, 200),
+        });
+
+        assert!(!preview_context_generation_matches(active, 24));
+        assert!(preview_context_generation_matches(active, 25));
+        assert!(!preview_context_generation_matches(None, 25));
+    }
+
+    fn assert_raw_input_registrations(target: windows::Win32::Foundation::HWND) {
+        let registrations =
+            registered_raw_devices().expect("the process registrations should be queryable");
+        assert_eq!(registrations.len(), 2);
+        assert_eq!(
+            registrations
+                .iter()
+                .map(|registration| registration.usUsage)
+                .collect::<Vec<_>>(),
+            vec![0x02, 0x06],
+            "mouse and keyboard generic-desktop devices should be observed"
+        );
+        assert!(
+            registrations.iter().all(|registration| {
+                registration.hwndTarget == target && registration.dwFlags == RIDEV_INPUTSINK
+            }),
+            "both Raw Input classes should target the message window without capture flags"
+        );
     }
 }
