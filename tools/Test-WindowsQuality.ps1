@@ -67,6 +67,7 @@ if ($imports.Count -eq 0) {
 }
 
 $approvedSystemImports = @(
+    'ADVAPI32.DLL'
     'API-MS-WIN-CORE-SYNCH-L1-2-0.DLL'
     'BCRYPT.DLL'
     'BCRYPTPRIMITIVES.DLL'

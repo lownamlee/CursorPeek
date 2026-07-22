@@ -131,6 +131,10 @@ impl AppSettings {
         Duration::from_millis(self.dwell_delay_ms)
     }
 
+    pub(crate) const fn dwell_delay_ms(&self) -> u64 {
+        self.dwell_delay_ms
+    }
+
     pub(crate) const fn legacy_encoding(&self) -> &LegacyEncoding {
         &self.legacy_encoding
     }
@@ -141,6 +145,10 @@ impl AppSettings {
 
     pub(crate) const fn preview_height(&self) -> u16 {
         self.preview_height
+    }
+
+    pub(crate) const fn start_with_windows(&self) -> bool {
+        self.start_with_windows
     }
 
     fn validate(&self) -> Result<(), SettingsParseError> {
@@ -172,6 +180,38 @@ pub(crate) struct SettingsDocument {
 impl SettingsDocument {
     pub(crate) const fn settings(&self) -> &AppSettings {
         &self.settings
+    }
+
+    pub(crate) fn set_dwell_delay_ms(
+        &mut self,
+        dwell_delay_ms: u64,
+    ) -> Result<(), SettingsParseError> {
+        let previous = self.settings.dwell_delay_ms;
+        self.settings.dwell_delay_ms = dwell_delay_ms;
+        if let Err(error) = self.settings.validate() {
+            self.settings.dwell_delay_ms = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_preview_size(
+        &mut self,
+        preview_width: u16,
+        preview_height: u16,
+    ) -> Result<(), SettingsParseError> {
+        let previous = (self.settings.preview_width, self.settings.preview_height);
+        self.settings.preview_width = preview_width;
+        self.settings.preview_height = preview_height;
+        if let Err(error) = self.settings.validate() {
+            (self.settings.preview_width, self.settings.preview_height) = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_start_with_windows(&mut self, start_with_windows: bool) {
+        self.settings.start_with_windows = start_with_windows;
     }
 
     fn parse(text: &str) -> Result<Self, SettingsParseError> {
@@ -445,7 +485,7 @@ impl SettingsFile {
         })
     }
 
-    fn save(&self, document: &SettingsDocument) -> Result<(), SettingsError> {
+    pub(crate) fn save(&self, document: &SettingsDocument) -> Result<(), SettingsError> {
         let bytes = document
             .encode()
             .map_err(|source| SettingsError::InvalidConfiguration {
@@ -922,6 +962,41 @@ mod tests {
             LegacyEncoding::parse("latin1"),
             Some(LegacyEncoding::Label("windows-1252".to_owned()))
         );
+    }
+
+    #[test]
+    fn tray_mutations_validate_known_values_and_preserve_unknown_settings() {
+        let mut document = SettingsDocument::parse(
+            "dwell_delay_ms=400\npreview_width=640\npreview_height=480\nfuture=keep\n",
+        )
+        .expect("the starting document should parse");
+
+        document
+            .set_dwell_delay_ms(700)
+            .expect("the tray dwell preset should be valid");
+        document
+            .set_preview_size(800, 600)
+            .expect("the tray size preset should be valid");
+        document.set_start_with_windows(true);
+        assert_eq!(document.settings().dwell_delay_ms(), 700);
+        assert_eq!(
+            (
+                document.settings().preview_width(),
+                document.settings().preview_height()
+            ),
+            (800, 600)
+        );
+        assert!(document.settings().start_with_windows());
+        assert!(
+            std::str::from_utf8(&document.encode().unwrap())
+                .unwrap()
+                .contains("future=keep")
+        );
+
+        assert!(document.set_dwell_delay_ms(149).is_err());
+        assert!(document.set_preview_size(319, 240).is_err());
+        assert_eq!(document.settings().dwell_delay_ms(), 700);
+        assert_eq!(document.settings().preview_width(), 800);
     }
 
     #[test]

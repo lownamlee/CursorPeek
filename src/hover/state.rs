@@ -136,6 +136,11 @@ impl HoverState {
         self.pending = None;
     }
 
+    pub(crate) fn set_delay(&mut self, delay: Duration) {
+        debug_assert!(!delay.is_zero());
+        self.delay = delay;
+    }
+
     #[cfg(test)]
     pub(crate) const fn delay(&self) -> Duration {
         self.delay
@@ -240,6 +245,29 @@ mod tests {
             state.on_timer(start + Duration::from_millis(700)),
             DwellTimerEvent::Candidate(DwellCandidate {
                 generation: Generation(2),
+                anchor: SECOND_POINT,
+            })
+        );
+    }
+
+    #[test]
+    fn changing_delay_invalidates_pending_work_and_applies_to_the_next_dwell() {
+        let start = Instant::now();
+        let mut state = HoverState::new(DEFAULT_DWELL_DELAY);
+        state.restart(FIRST_POINT, start);
+
+        let replacement = Duration::from_millis(700);
+        state.cancel();
+        state.set_delay(replacement);
+        assert_eq!(
+            state.on_timer(start + DEFAULT_DWELL_DELAY),
+            DwellTimerEvent::Inactive
+        );
+        assert_eq!(state.restart(SECOND_POINT, start), replacement);
+        assert_eq!(
+            state.on_timer(start + replacement),
+            DwellTimerEvent::Candidate(DwellCandidate {
+                generation: Generation(3),
                 anchor: SECOND_POINT,
             })
         );

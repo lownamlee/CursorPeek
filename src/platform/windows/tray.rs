@@ -11,10 +11,10 @@ use windows::{
             },
             WindowsAndMessaging::{
                 AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
-                GetCursorPos, HMENU, IDI_APPLICATION, LoadIconW, MB_ICONINFORMATION, MB_OK,
-                MF_SEPARATOR, MF_STRING, MessageBoxW, PostMessageW, SetForegroundWindow,
-                TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_CONTEXTMENU,
-                WM_NULL, WS_EX_TOOLWINDOW, WS_POPUP,
+                GetCursorPos, HMENU, IDI_APPLICATION, LoadIconW, MB_ICONERROR, MB_ICONINFORMATION,
+                MB_OK, MENU_ITEM_FLAGS, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MessageBoxW,
+                PostMessageW, SetForegroundWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+                TrackPopupMenu, WM_CONTEXTMENU, WM_NULL, WS_EX_TOOLWINDOW, WS_POPUP,
             },
         },
     },
@@ -25,7 +25,23 @@ const ICON_ID: u32 = 1;
 const TOGGLE_PAUSE_COMMAND: usize = 1;
 const ABOUT_COMMAND: usize = 2;
 const EXIT_COMMAND: usize = 3;
+const DWELL_FAST_COMMAND: usize = 10;
+const DWELL_STANDARD_COMMAND: usize = 11;
+const DWELL_RELAXED_COMMAND: usize = 12;
+const PREVIEW_COMPACT_COMMAND: usize = 20;
+const PREVIEW_STANDARD_COMMAND: usize = 21;
+const PREVIEW_LARGE_COMMAND: usize = 22;
+const TOGGLE_STARTUP_COMMAND: usize = 30;
 const NIN_KEYSELECT: u32 = NIN_SELECT + 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TrayMenuState {
+    pub(crate) paused: bool,
+    pub(crate) dwell_delay_ms: u64,
+    pub(crate) preview_width: u16,
+    pub(crate) preview_height: u16,
+    pub(crate) start_with_windows: bool,
+}
 
 pub(crate) struct TrayIcon {
     data: NOTIFYICONDATAW,
@@ -98,21 +114,21 @@ impl TrayIcon {
         &self,
         wparam: WPARAM,
         lparam: LPARAM,
-        paused: bool,
+        state: TrayMenuState,
     ) -> Result<Option<TrayCommand>> {
         let Some(anchor) = callback_anchor(wparam, lparam) else {
             return Ok(None);
         };
 
-        self.menu_owner.show_menu(anchor, paused)
+        self.menu_owner.show_menu(anchor, state)
     }
 
-    pub(crate) fn command_at_cursor(&self, paused: bool) -> Result<Option<TrayCommand>> {
+    pub(crate) fn command_at_cursor(&self, state: TrayMenuState) -> Result<Option<TrayCommand>> {
         let mut anchor = POINT::default();
         // SAFETY: The output points to a valid initialized POINT and the process is Per-Monitor V2
         // aware, so the screen coordinate is suitable for the native popup-menu API.
         unsafe { GetCursorPos(&mut anchor)? };
-        self.menu_owner.show_menu(anchor, paused)
+        self.menu_owner.show_menu(anchor, state)
     }
 
     pub(crate) fn show_about(&self) {
@@ -136,6 +152,20 @@ impl TrayIcon {
             );
         }
     }
+
+    pub(crate) fn show_error(&self, message: &str) {
+        let text = terminated_utf16(message);
+        // SAFETY: The tray owner lives for the synchronous modal call and both strings are
+        // terminated UTF-16. A settings failure is reported without ending the application.
+        unsafe {
+            MessageBoxW(
+                Some(self.menu_owner.hwnd),
+                PCWSTR(text.as_ptr()),
+                w!("CursorPeek settings"),
+                MB_OK | MB_ICONERROR,
+            );
+        }
+    }
 }
 
 impl Drop for TrayIcon {
@@ -152,6 +182,9 @@ impl Drop for TrayIcon {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TrayCommand {
     TogglePaused,
+    SetDwellDelay(u64),
+    SetPreviewSize(u16, u16),
+    ToggleStartWithWindows,
     About,
     Exit,
 }
@@ -183,8 +216,8 @@ impl TrayMenuOwner {
         Ok(Self { hwnd })
     }
 
-    fn show_menu(&self, anchor: POINT, paused: bool) -> Result<Option<TrayCommand>> {
-        let menu = PopupMenu::create(paused)?;
+    fn show_menu(&self, anchor: POINT, state: TrayMenuState) -> Result<Option<TrayCommand>> {
+        let menu = PopupMenu::create(state)?;
 
         // The notification-area contract grants foreground activation in response to the user's
         // icon action. Fail closed instead of showing a menu that cannot dismiss on outside click.
@@ -229,32 +262,103 @@ struct PopupMenu {
 }
 
 impl PopupMenu {
-    fn create(paused: bool) -> Result<Self> {
+    fn new() -> Result<Self> {
         // SAFETY: CreatePopupMenu has no preconditions and transfers ownership on success.
-        let menu = Self {
+        Ok(Self {
             handle: unsafe { CreatePopupMenu()? },
-        };
+        })
+    }
 
-        // SAFETY: `menu.handle` remains live; every label is static terminated UTF-16 and command
-        // identifiers are unique within this menu.
-        unsafe {
-            AppendMenuW(
-                menu.handle,
-                MF_STRING,
-                TOGGLE_PAUSE_COMMAND,
-                if paused { w!("Resume") } else { w!("Pause") },
-            )?;
-            AppendMenuW(menu.handle, MF_SEPARATOR, 0, PCWSTR::null())?;
-            AppendMenuW(
-                menu.handle,
-                MF_STRING,
-                ABOUT_COMMAND,
-                w!("About CursorPeek"),
-            )?;
-            AppendMenuW(menu.handle, MF_STRING, EXIT_COMMAND, w!("Exit"))?;
-        }
+    fn create(state: TrayMenuState) -> Result<Self> {
+        let menu = Self::new()?;
+
+        menu.append_command(
+            TOGGLE_PAUSE_COMMAND,
+            if state.paused {
+                w!("Resume")
+            } else {
+                w!("Pause")
+            },
+            false,
+        )?;
+        menu.append_separator()?;
+
+        let settings = Self::new()?;
+        let dwell = Self::new()?;
+        dwell.append_command(
+            DWELL_FAST_COMMAND,
+            w!("Fast (250 ms)"),
+            state.dwell_delay_ms == 250,
+        )?;
+        dwell.append_command(
+            DWELL_STANDARD_COMMAND,
+            w!("Standard (400 ms)"),
+            state.dwell_delay_ms == 400,
+        )?;
+        dwell.append_command(
+            DWELL_RELAXED_COMMAND,
+            w!("Relaxed (700 ms)"),
+            state.dwell_delay_ms == 700,
+        )?;
+        settings.append_submenu(dwell, w!("Dwell delay"))?;
+
+        let preview = Self::new()?;
+        preview.append_command(
+            PREVIEW_COMPACT_COMMAND,
+            w!("Compact (480 x 360)"),
+            (state.preview_width, state.preview_height) == (480, 360),
+        )?;
+        preview.append_command(
+            PREVIEW_STANDARD_COMMAND,
+            w!("Standard (640 x 480)"),
+            (state.preview_width, state.preview_height) == (640, 480),
+        )?;
+        preview.append_command(
+            PREVIEW_LARGE_COMMAND,
+            w!("Large (800 x 600)"),
+            (state.preview_width, state.preview_height) == (800, 600),
+        )?;
+        settings.append_submenu(preview, w!("Preview size"))?;
+        settings.append_separator()?;
+        settings.append_command(
+            TOGGLE_STARTUP_COMMAND,
+            w!("Start with Windows"),
+            state.start_with_windows,
+        )?;
+        menu.append_submenu(settings, w!("Settings"))?;
+
+        menu.append_separator()?;
+        menu.append_command(ABOUT_COMMAND, w!("About CursorPeek"), false)?;
+        menu.append_command(EXIT_COMMAND, w!("Exit"), false)?;
 
         Ok(menu)
+    }
+
+    fn append_command(&self, id: usize, label: PCWSTR, checked: bool) -> Result<()> {
+        let flags = MF_STRING
+            | if checked {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS::default()
+            };
+        // SAFETY: The menu is live, the label is terminated UTF-16, and command identifiers are
+        // unique within the complete root menu.
+        unsafe { AppendMenuW(self.handle, flags, id, label) }
+    }
+
+    fn append_separator(&self) -> Result<()> {
+        // SAFETY: The menu is live and separators do not consume the ignored string pointer.
+        unsafe { AppendMenuW(self.handle, MF_SEPARATOR, 0, PCWSTR::null()) }
+    }
+
+    fn append_submenu(&self, submenu: Self, label: PCWSTR) -> Result<()> {
+        // SAFETY: Both menus and the terminated label are live. A successful append transfers
+        // recursive destruction of the child to the parent menu.
+        unsafe {
+            AppendMenuW(self.handle, MF_POPUP, submenu.handle.0 as usize, label)?;
+        }
+        std::mem::forget(submenu);
+        Ok(())
     }
 }
 
@@ -283,10 +387,21 @@ fn callback_anchor(wparam: WPARAM, lparam: LPARAM) -> Option<POINT> {
 fn command_from_id(id: usize) -> Option<TrayCommand> {
     match id {
         TOGGLE_PAUSE_COMMAND => Some(TrayCommand::TogglePaused),
+        DWELL_FAST_COMMAND => Some(TrayCommand::SetDwellDelay(250)),
+        DWELL_STANDARD_COMMAND => Some(TrayCommand::SetDwellDelay(400)),
+        DWELL_RELAXED_COMMAND => Some(TrayCommand::SetDwellDelay(700)),
+        PREVIEW_COMPACT_COMMAND => Some(TrayCommand::SetPreviewSize(480, 360)),
+        PREVIEW_STANDARD_COMMAND => Some(TrayCommand::SetPreviewSize(640, 480)),
+        PREVIEW_LARGE_COMMAND => Some(TrayCommand::SetPreviewSize(800, 600)),
+        TOGGLE_STARTUP_COMMAND => Some(TrayCommand::ToggleStartWithWindows),
         ABOUT_COMMAND => Some(TrayCommand::About),
         EXIT_COMMAND => Some(TrayCommand::Exit),
         _ => None,
     }
+}
+
+fn terminated_utf16(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 fn write_wide_z<const N: usize>(target: &mut [u16; N], value: &str) {
@@ -310,12 +425,17 @@ fn write_wide_z<const N: usize>(target: &mut [u16; N], value: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ABOUT_COMMAND, EXIT_COMMAND, ICON_ID, NIN_KEYSELECT, NIN_SELECT, TOGGLE_PAUSE_COMMAND,
-        TrayCommand, callback_anchor, command_from_id, write_wide_z,
+        ABOUT_COMMAND, DWELL_FAST_COMMAND, DWELL_RELAXED_COMMAND, DWELL_STANDARD_COMMAND,
+        EXIT_COMMAND, ICON_ID, NIN_KEYSELECT, NIN_SELECT, PREVIEW_COMPACT_COMMAND,
+        PREVIEW_LARGE_COMMAND, PREVIEW_STANDARD_COMMAND, PopupMenu, TOGGLE_PAUSE_COMMAND,
+        TOGGLE_STARTUP_COMMAND, TrayCommand, TrayMenuState, callback_anchor, command_from_id,
+        write_wide_z,
     };
     use windows::Win32::{
         Foundation::{LPARAM, WPARAM},
-        UI::WindowsAndMessaging::WM_CONTEXTMENU,
+        UI::WindowsAndMessaging::{
+            GetMenuState, GetSubMenu, HMENU, MF_BYCOMMAND, MF_CHECKED, WM_CONTEXTMENU,
+        },
     };
 
     #[test]
@@ -346,8 +466,65 @@ mod tests {
         );
         assert_eq!(command_from_id(ABOUT_COMMAND), Some(TrayCommand::About));
         assert_eq!(command_from_id(EXIT_COMMAND), Some(TrayCommand::Exit));
+        assert_eq!(
+            command_from_id(DWELL_FAST_COMMAND),
+            Some(TrayCommand::SetDwellDelay(250))
+        );
+        assert_eq!(
+            command_from_id(DWELL_STANDARD_COMMAND),
+            Some(TrayCommand::SetDwellDelay(400))
+        );
+        assert_eq!(
+            command_from_id(DWELL_RELAXED_COMMAND),
+            Some(TrayCommand::SetDwellDelay(700))
+        );
+        assert_eq!(
+            command_from_id(PREVIEW_COMPACT_COMMAND),
+            Some(TrayCommand::SetPreviewSize(480, 360))
+        );
+        assert_eq!(
+            command_from_id(PREVIEW_STANDARD_COMMAND),
+            Some(TrayCommand::SetPreviewSize(640, 480))
+        );
+        assert_eq!(
+            command_from_id(PREVIEW_LARGE_COMMAND),
+            Some(TrayCommand::SetPreviewSize(800, 600))
+        );
+        assert_eq!(
+            command_from_id(TOGGLE_STARTUP_COMMAND),
+            Some(TrayCommand::ToggleStartWithWindows)
+        );
         assert_eq!(command_from_id(0), None);
         assert_eq!(command_from_id(usize::MAX), None);
+    }
+
+    #[test]
+    fn settings_submenus_reflect_the_saved_product_state() {
+        let menu = PopupMenu::create(TrayMenuState {
+            paused: false,
+            dwell_delay_ms: 700,
+            preview_width: 480,
+            preview_height: 360,
+            start_with_windows: true,
+        })
+        .expect("the native popup hierarchy should be created");
+
+        // SAFETY: `menu` owns the complete live hierarchy for these synchronous read-only queries.
+        let settings = unsafe { GetSubMenu(menu.handle, 2) };
+        assert!(!settings.0.is_null());
+        // SAFETY: `settings` is the live submenu returned above and its first two items are menus.
+        let dwell = unsafe { GetSubMenu(settings, 0) };
+        let preview = unsafe { GetSubMenu(settings, 1) };
+        assert!(!dwell.0.is_null());
+        assert!(!preview.0.is_null());
+
+        assert!(!is_checked(dwell, DWELL_FAST_COMMAND));
+        assert!(!is_checked(dwell, DWELL_STANDARD_COMMAND));
+        assert!(is_checked(dwell, DWELL_RELAXED_COMMAND));
+        assert!(is_checked(preview, PREVIEW_COMPACT_COMMAND));
+        assert!(!is_checked(preview, PREVIEW_STANDARD_COMMAND));
+        assert!(!is_checked(preview, PREVIEW_LARGE_COMMAND));
+        assert!(is_checked(settings, TOGGLE_STARTUP_COMMAND));
     }
 
     #[test]
@@ -362,5 +539,10 @@ mod tests {
         let mut bounded = [0xffff; 4];
         write_wide_z(&mut bounded, "A\u{1f600}B");
         assert_eq!(bounded, ['A' as u16, 0xd83d, 0xde00, 0]);
+    }
+
+    fn is_checked(menu: HMENU, command: usize) -> bool {
+        // SAFETY: Callers pass a live menu and one product command identifier.
+        (unsafe { GetMenuState(menu, command as u32, MF_BYCOMMAND) } & MF_CHECKED.0) != 0
     }
 }

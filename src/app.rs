@@ -60,7 +60,7 @@ pub(crate) fn run(process_mode: ProcessMode) -> Result<(), AppError> {
             )?;
             let worker_manager =
                 worker::WorkerManager::start(settings.settings().legacy_encoding().clone())?;
-            message_window.run_application(worker_manager)?;
+            message_window.run_application(worker_manager, settings_file, settings)?;
         }
         ProcessMode::InputDiagnostics => {
             println!(

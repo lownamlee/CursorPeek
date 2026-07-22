@@ -23,12 +23,13 @@ use crate::hover::{
     InputCoverage, InputCoverageReport, PhysicalScreenPoint,
 };
 use crate::preview::{PreviewPlacement, PreviewSize};
+use crate::settings::{SettingsDocument, SettingsFile};
 use crate::worker::{
     CompletionNotifier, PendingWorkerPoll, PendingWorkerResolution, PreviewResult, WorkerManager,
     WorkerManagerError,
 };
 
-use super::{PreviewWindow, TrayCommand, TrayIcon};
+use super::{PreviewWindow, StartupRegistration, TrayCommand, TrayIcon, TrayMenuState};
 
 use windows::{
     Win32::{
@@ -81,6 +82,9 @@ pub(crate) struct MessageWindow {
     preview_diagnostics: Option<ActivePreviewDiagnostics>,
     preview_window: Option<PreviewWindow>,
     tray_icon: Option<TrayIcon>,
+    settings_file: Option<SettingsFile>,
+    settings_document: Option<SettingsDocument>,
+    startup_registration: Option<StartupRegistration>,
     paused: bool,
     worker_manager: Option<WorkerManager>,
     pending_worker_resolution: Option<PendingWorkerResolution>,
@@ -142,6 +146,9 @@ impl MessageWindow {
             preview_diagnostics: None,
             preview_window: None,
             tray_icon: None,
+            settings_file: None,
+            settings_document: None,
+            startup_registration: None,
             paused: false,
             worker_manager: None,
             pending_worker_resolution: None,
@@ -174,8 +181,15 @@ impl MessageWindow {
     pub(crate) fn run_application(
         mut self,
         worker_manager: WorkerManager,
+        settings_file: SettingsFile,
+        settings_document: SettingsDocument,
     ) -> std::result::Result<(), ApplicationRunError> {
+        let startup_registration = StartupRegistration::for_current_executable()?;
+        startup_registration.reconcile(settings_document.settings().start_with_windows())?;
         self.worker_manager = Some(worker_manager);
+        self.settings_file = Some(settings_file);
+        self.settings_document = Some(settings_document);
+        self.startup_registration = Some(startup_registration);
         self.tray_icon = Some(TrayIcon::create(self.hwnd, TRAY_CALLBACK_MESSAGE)?);
         self.finish_application_loop()
     }
@@ -731,20 +745,22 @@ impl MessageWindow {
     }
 
     fn handle_tray_callback(&mut self, wparam: WPARAM, lparam: LPARAM) -> Result<bool> {
+        let state = self.tray_menu_state();
         let command = self
             .tray_icon
             .as_ref()
-            .map(|tray| tray.command_for_callback(wparam, lparam, self.paused))
+            .map(|tray| tray.command_for_callback(wparam, lparam, state))
             .transpose()?
             .flatten();
         self.apply_tray_command(command)
     }
 
     fn handle_instance_activation(&mut self) -> Result<bool> {
+        let state = self.tray_menu_state();
         let command = self
             .tray_icon
             .as_ref()
-            .map(|tray| tray.command_at_cursor(self.paused))
+            .map(|tray| tray.command_at_cursor(state))
             .transpose()?
             .flatten();
         self.apply_tray_command(command)
@@ -765,6 +781,18 @@ impl MessageWindow {
                 }
                 Ok(false)
             }
+            Some(TrayCommand::SetDwellDelay(dwell_delay_ms)) => {
+                self.update_dwell_delay(dwell_delay_ms);
+                Ok(false)
+            }
+            Some(TrayCommand::SetPreviewSize(width, height)) => {
+                self.update_preview_size(width, height);
+                Ok(false)
+            }
+            Some(TrayCommand::ToggleStartWithWindows) => {
+                self.toggle_start_with_windows();
+                Ok(false)
+            }
             Some(TrayCommand::About) => {
                 self.tray_icon
                     .as_ref()
@@ -774,6 +802,130 @@ impl MessageWindow {
             }
             Some(TrayCommand::Exit) => Ok(true),
         }
+    }
+
+    fn tray_menu_state(&self) -> TrayMenuState {
+        let settings = self
+            .settings_document
+            .as_ref()
+            .expect("a live tray requires the application settings")
+            .settings();
+        TrayMenuState {
+            paused: self.paused,
+            dwell_delay_ms: settings.dwell_delay_ms(),
+            preview_width: settings.preview_width(),
+            preview_height: settings.preview_height(),
+            start_with_windows: settings.start_with_windows(),
+        }
+    }
+
+    fn update_dwell_delay(&mut self, dwell_delay_ms: u64) {
+        let mut updated = self
+            .settings_document
+            .as_ref()
+            .expect("a settings command requires the loaded document")
+            .clone();
+        if let Err(error) = updated.set_dwell_delay_ms(dwell_delay_ms) {
+            self.show_settings_error("The dwell delay was not changed.", &error.to_string());
+            return;
+        }
+        if !self.save_settings(&updated) {
+            return;
+        }
+
+        self.settings_document = Some(updated);
+        self.cancel_dwell();
+        self.hover_state
+            .set_delay(Duration::from_millis(dwell_delay_ms));
+    }
+
+    fn update_preview_size(&mut self, width: u16, height: u16) {
+        let mut updated = self
+            .settings_document
+            .as_ref()
+            .expect("a settings command requires the loaded document")
+            .clone();
+        if let Err(error) = updated.set_preview_size(width, height) {
+            self.show_settings_error("The preview size was not changed.", &error.to_string());
+            return;
+        }
+        if !self.save_settings(&updated) {
+            return;
+        }
+
+        self.settings_document = Some(updated);
+        self.cancel_dwell();
+        self.preview_size = PreviewSize::new(u32::from(width), u32::from(height));
+    }
+
+    fn toggle_start_with_windows(&mut self) {
+        let current = self
+            .settings_document
+            .as_ref()
+            .expect("a settings command requires the loaded document")
+            .settings()
+            .start_with_windows();
+        let desired = !current;
+        let registration = self
+            .startup_registration
+            .as_ref()
+            .expect("a startup command requires the current executable registration");
+
+        if let Err(error) = registration.set_enabled(desired) {
+            self.show_settings_error(
+                "The Start with Windows setting was not changed.",
+                &error.to_string(),
+            );
+            return;
+        }
+
+        let mut updated = self
+            .settings_document
+            .as_ref()
+            .expect("a settings command requires the loaded document")
+            .clone();
+        updated.set_start_with_windows(desired);
+        let save_result = self
+            .settings_file
+            .as_ref()
+            .expect("a settings command requires the discovered settings file")
+            .save(&updated);
+        if let Err(error) = save_result {
+            let rollback = registration.set_enabled(current);
+            let detail = match rollback {
+                Ok(()) => error.to_string(),
+                Err(rollback_error) => format!(
+                    "{error}\r\n\r\nThe startup registration could not be rolled back: \
+                     {rollback_error}"
+                ),
+            };
+            self.show_settings_error("The Start with Windows setting was not saved.", &detail);
+            return;
+        }
+
+        self.settings_document = Some(updated);
+    }
+
+    fn save_settings(&self, updated: &SettingsDocument) -> bool {
+        match self
+            .settings_file
+            .as_ref()
+            .expect("a settings command requires the discovered settings file")
+            .save(updated)
+        {
+            Ok(()) => true,
+            Err(error) => {
+                self.show_settings_error("The settings file was not updated.", &error.to_string());
+                false
+            }
+        }
+    }
+
+    fn show_settings_error(&self, summary: &str, detail: &str) {
+        self.tray_icon
+            .as_ref()
+            .expect("a settings command requires the live tray owner")
+            .show_error(&format!("{summary}\r\n\r\n{detail}"));
     }
 
     #[cfg(test)]
