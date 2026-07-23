@@ -11,10 +11,13 @@ use std::{
 use crate::{
     hover::PhysicalScreenPoint,
     preview::{PreviewPlacement, PreviewSize, ScreenRect, place_preview},
+    settings::Theme,
     worker::{ImageFormat, ImagePreview, TextPreview},
 };
 
 use windows::{
+    Foundation::TypedEventHandler,
+    UI::ViewManagement::{UIColorType, UISettings},
     Win32::{
         Foundation::{
             D2DERR_RECREATE_TARGET, E_INVALIDARG, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
@@ -48,15 +51,19 @@ use windows::{
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
-            HiDpi::GetDpiForWindow,
+            Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
+            HiDpi::{GetDpiForWindow, SystemParametersInfoForDpi},
             WindowsAndMessaging::{
                 CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA,
                 GetClientRect, GetWindowLongPtrW, HWND_TOPMOST, MA_NOACTIVATEANDEAT,
-                RegisterClassW, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-                SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageW, SetWindowLongPtrW, SetWindowPos,
-                UnregisterClassW, WINDOW_EX_STYLE, WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_NCCREATE,
-                WM_NCDESTROY, WM_PAINT, WM_SIZE, WNDCLASSW, WS_BORDER, WS_EX_NOACTIVATE,
-                WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+                NONCLIENTMETRICSW, PostMessageW, RegisterClassW, SPI_GETHIGHCONTRAST,
+                SPI_GETNONCLIENTMETRICS, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+                SWP_NOZORDER, SWP_SHOWWINDOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW,
+                SetWindowLongPtrW, SetWindowPos, SetWindowTextW, SystemParametersInfoW,
+                UnregisterClassW, WINDOW_EX_STYLE, WM_APP, WM_ERASEBKGND, WM_MOUSEACTIVATE,
+                WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOLORCHANGE,
+                WM_THEMECHANGED, WNDCLASSW, WS_BORDER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+                WS_EX_TOPMOST, WS_POPUP,
             },
         },
     },
@@ -70,19 +77,25 @@ const BASE_DPI: f32 = 96.0;
 const CONTENT_MARGIN: f32 = 12.0;
 const HEADER_HEIGHT: f32 = 18.0;
 const HEADER_BODY_GAP: f32 = 8.0;
+const SYSTEM_APPEARANCE_CHANGED_MESSAGE: u32 = WM_APP + 20;
 
 pub(crate) struct PreviewWindow {
     hwnd: HWND,
     state: Box<RefCell<PreviewWindowState>>,
+    theme_observer: Option<ThemeObserver>,
     _class: RegisteredPreviewClass,
     _thread_affinity: PhantomData<Rc<()>>,
 }
 
 impl PreviewWindow {
     pub(crate) fn create() -> Result<Self> {
+        Self::create_with_theme(Theme::System)
+    }
+
+    pub(crate) fn create_with_theme(theme: Theme) -> Result<Self> {
         let class = RegisteredPreviewClass::register()?;
         let class_name = class.name();
-        let state = Box::new(RefCell::new(PreviewWindowState::new()?));
+        let state = Box::new(RefCell::new(PreviewWindowState::new(theme)?));
         let state_pointer = std::ptr::from_ref(state.as_ref()).cast::<c_void>();
         let ex_style: WINDOW_EX_STYLE = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
 
@@ -105,13 +118,21 @@ impl PreviewWindow {
                 Some(state_pointer),
             )?
         };
+        let theme_observer = ThemeObserver::new(hwnd);
 
         Ok(Self {
             hwnd,
             state,
+            theme_observer,
             _class: class,
             _thread_affinity: PhantomData,
         })
+    }
+
+    pub(crate) fn set_theme(&self, theme: Theme) -> Result<()> {
+        let dpi = self.window_dpi()?;
+        self.state.borrow_mut().set_theme(theme, dpi)?;
+        self.redraw()
     }
 
     pub(crate) fn show_at(&self, anchor: PhysicalScreenPoint) -> Result<PreviewPlacement> {
@@ -164,11 +185,7 @@ impl PreviewWindow {
             )?;
         }
 
-        // SAFETY: The HWND remains live after the successful positioning call.
-        let dpi = unsafe { GetDpiForWindow(self.hwnd) };
-        if dpi == 0 {
-            return Err(Error::from_thread());
-        }
+        let dpi = self.window_dpi()?;
 
         // SAFETY: MonitorFromPoint returns a borrowed monitor handle and transfers no ownership.
         let monitor = unsafe {
@@ -207,10 +224,12 @@ impl PreviewWindow {
         )
         .ok_or_else(Error::from_thread)?;
 
-        {
-            let mut state = self.state.borrow_mut();
-            state.configure(content, dpi);
-        }
+        let title = content
+            .as_ref()
+            .map_or(w!("CursorPeek preview"), RetainedContent::accessible_title);
+        // SAFETY: The live preview HWND and selected static terminated title remain valid.
+        unsafe { SetWindowTextW(self.hwnd, title)? };
+        self.state.borrow_mut().configure(content, dpi)?;
 
         // SAFETY: The HWND is positioned wholly inside the selected work area. TOPMOST and
         // SHOWWINDOW display it; NOACTIVATE plus WS_EX_NOACTIVATE preserve the foreground window.
@@ -252,6 +271,12 @@ impl PreviewWindow {
             Some(code) => Err(Error::from_hresult(code)),
             None => Ok(()),
         }
+    }
+
+    fn window_dpi(&self) -> Result<u32> {
+        // SAFETY: The preview HWND remains live for the owning UI-thread call.
+        let dpi = unsafe { GetDpiForWindow(self.hwnd) };
+        (dpi != 0).then_some(dpi).ok_or_else(Error::from_thread)
     }
 
     pub(crate) fn hide(&self) -> Result<()> {
@@ -307,11 +332,25 @@ impl PreviewWindow {
         self.state.borrow_mut().force_recreate_target = true;
         self.redraw()
     }
+
+    #[cfg(test)]
+    fn accessible_title(&self) -> String {
+        // SAFETY: Both calls synchronously inspect the live preview HWND. The allocation includes
+        // room for the terminator required by GetWindowTextW.
+        let length =
+            unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowTextLengthW(self.hwnd) };
+        let mut units = vec![0_u16; usize::try_from(length).unwrap_or(0) + 1];
+        let copied = unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(self.hwnd, &mut units)
+        };
+        String::from_utf16_lossy(&units[..usize::try_from(copied).unwrap_or(0)])
+    }
 }
 
 impl Drop for PreviewWindow {
     fn drop(&mut self) {
         let _ = self.hide();
+        drop(self.theme_observer.take());
 
         // SAFETY: Clearing GWLP_USERDATA prevents teardown callbacks from reaching the boxed state
         // through an alias to this exclusive Drop borrow. The !Send owner destroys its HWND on the
@@ -323,11 +362,46 @@ impl Drop for PreviewWindow {
     }
 }
 
+struct ThemeObserver {
+    settings: UISettings,
+    token: i64,
+}
+
+impl ThemeObserver {
+    fn new(hwnd: HWND) -> Option<Self> {
+        let settings = UISettings::new().ok()?;
+        let raw_hwnd = hwnd.0 as usize;
+        let handler =
+            TypedEventHandler::<UISettings, windows::core::IInspectable>::new(move |_, _| {
+                let hwnd = HWND(raw_hwnd as *mut c_void);
+                // SAFETY: The observer is removed before the owning preview HWND is destroyed.
+                // The event carries no borrowed state and a late post is allowed to fail.
+                let _ = unsafe {
+                    PostMessageW(
+                        Some(hwnd),
+                        SYSTEM_APPEARANCE_CHANGED_MESSAGE,
+                        WPARAM(0),
+                        LPARAM(0),
+                    )
+                };
+                Ok(())
+            });
+        let token = settings.ColorValuesChanged(&handler).ok()?;
+        Some(Self { settings, token })
+    }
+}
+
+impl Drop for ThemeObserver {
+    fn drop(&mut self) {
+        let _ = self.settings.RemoveColorValuesChanged(self.token);
+    }
+}
+
 struct PreviewWindowState {
     d2d_factory: ID2D1Factory,
     dwrite_factory: IDWriteFactory,
-    header_format: IDWriteTextFormat,
-    body_format: IDWriteTextFormat,
+    formats: TextFormats,
+    theme: Theme,
     colors: PreviewColors,
     content: Option<RetainedContent>,
     layouts: Option<ContentLayouts>,
@@ -341,7 +415,7 @@ struct PreviewWindowState {
 }
 
 impl PreviewWindowState {
-    fn new() -> Result<Self> {
+    fn new(theme: Theme) -> Result<Self> {
         // SAFETY: Both factory calls write a fresh COM interface. The Direct2D factory is used only
         // on this UI thread; the recommended shared DirectWrite factory is retained with COM
         // reference counting.
@@ -350,46 +424,14 @@ impl PreviewWindowState {
         let dwrite_factory: IDWriteFactory =
             unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }?;
 
-        // SAFETY: Static family and locale strings remain valid for each call. None selects the
-        // system font collection, and DirectWrite retains its own format state.
-        let header_format = unsafe {
-            dwrite_factory.CreateTextFormat(
-                w!("Segoe UI"),
-                None::<&IDWriteFontCollection>,
-                DWRITE_FONT_WEIGHT_SEMI_BOLD,
-                DWRITE_FONT_STYLE_NORMAL,
-                DWRITE_FONT_STRETCH_NORMAL,
-                12.0,
-                w!("en-US"),
-            )?
-        };
-        let body_format = unsafe {
-            dwrite_factory.CreateTextFormat(
-                w!("Consolas"),
-                None::<&IDWriteFontCollection>,
-                DWRITE_FONT_WEIGHT_NORMAL,
-                DWRITE_FONT_STYLE_NORMAL,
-                DWRITE_FONT_STRETCH_NORMAL,
-                13.0,
-                w!("en-US"),
-            )?
-        };
-        // SAFETY: These calls mutate only newly created device-independent formats owned here.
-        unsafe {
-            header_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
-            header_format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR)?;
-            header_format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
-            body_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
-            body_format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR)?;
-            body_format.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP)?;
-        }
+        let formats = TextFormats::create(&dwrite_factory, 96)?;
 
         Ok(Self {
             d2d_factory,
             dwrite_factory,
-            header_format,
-            body_format,
-            colors: PreviewColors::system(),
+            formats,
+            theme,
+            colors: PreviewColors::resolve(theme),
             content: None,
             layouts: None,
             device: None,
@@ -402,15 +444,32 @@ impl PreviewWindowState {
         })
     }
 
-    fn configure(&mut self, content: Option<RetainedContent>, dpi: u32) {
+    fn configure(&mut self, content: Option<RetainedContent>, dpi: u32) -> Result<()> {
         if self.dpi != dpi {
             self.dpi = dpi;
-            self.discard_device_resources();
+            self.refresh_environment()?;
         }
         self.content = content;
         self.layouts = None;
         self.image_bitmap = None;
         self.last_paint_error = None;
+        Ok(())
+    }
+
+    fn set_theme(&mut self, theme: Theme, dpi: u32) -> Result<()> {
+        self.theme = theme;
+        self.dpi = dpi;
+        self.refresh_environment()
+    }
+
+    fn refresh_environment(&mut self) -> Result<()> {
+        let colors = PreviewColors::resolve(self.theme);
+        let formats = TextFormats::create(&self.dwrite_factory, self.dpi)?;
+        self.colors = colors;
+        self.formats = formats;
+        self.layouts = None;
+        self.discard_device_resources();
+        Ok(())
     }
 
     fn discard_device_resources(&mut self) {
@@ -462,7 +521,7 @@ impl PreviewWindowState {
         let header = unsafe {
             self.dwrite_factory.CreateTextLayout(
                 content.header(),
-                &self.header_format,
+                &self.formats.header,
                 layout_width,
                 HEADER_HEIGHT,
             )?
@@ -471,7 +530,7 @@ impl PreviewWindowState {
             RetainedContent::Text(content) if !content.body.is_empty() => Some(unsafe {
                 self.dwrite_factory.CreateTextLayout(
                     &content.body,
-                    &self.body_format,
+                    &self.formats.body,
                     layout_width,
                     body_height,
                 )?
@@ -651,6 +710,13 @@ impl RetainedContent {
             Self::Image(content) => &content.header,
         }
     }
+
+    const fn accessible_title(&self) -> PCWSTR {
+        match self {
+            Self::Text(_) => w!("CursorPeek text preview"),
+            Self::Image(_) => w!("CursorPeek image preview"),
+        }
+    }
 }
 
 struct ImageContent {
@@ -679,6 +745,100 @@ struct DeviceResources {
     metadata_brush: ID2D1SolidColorBrush,
 }
 
+struct TextFormats {
+    header: IDWriteTextFormat,
+    body: IDWriteTextFormat,
+}
+
+impl TextFormats {
+    fn create(factory: &IDWriteFactory, dpi: u32) -> Result<Self> {
+        let font = system_message_font(dpi);
+        let family = PCWSTR(font.family.as_ptr());
+
+        // SAFETY: The terminated family buffer remains live for both synchronous calls. None
+        // selects the system font collection, and DirectWrite retains its own format state.
+        let header = unsafe {
+            factory.CreateTextFormat(
+                family,
+                None::<&IDWriteFontCollection>,
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                font.size,
+                w!("en-US"),
+            )?
+        };
+        let body = unsafe {
+            factory.CreateTextFormat(
+                family,
+                None::<&IDWriteFontCollection>,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                (font.size + 1.0).min(32.0),
+                w!("en-US"),
+            )?
+        };
+        // SAFETY: These calls mutate only newly created device-independent formats owned here.
+        unsafe {
+            header.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
+            header.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR)?;
+            header.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            body.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
+            body.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR)?;
+            body.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP)?;
+        }
+        Ok(Self { header, body })
+    }
+}
+
+struct SystemFont {
+    family: Vec<u16>,
+    size: f32,
+}
+
+fn system_message_font(dpi: u32) -> SystemFont {
+    let mut metrics = NONCLIENTMETRICSW {
+        cbSize: size_of::<NONCLIENTMETRICSW>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: metrics is writable storage with the required size and dpi is obtained from the
+    // target window. A failed query falls back to the documented Windows UI family.
+    let queried = unsafe {
+        SystemParametersInfoForDpi(
+            SPI_GETNONCLIENTMETRICS.0,
+            size_of::<NONCLIENTMETRICSW>() as u32,
+            Some(std::ptr::from_mut(&mut metrics).cast()),
+            0,
+            dpi,
+        )
+    }
+    .is_ok();
+
+    if queried {
+        let face = &metrics.lfMessageFont.lfFaceName;
+        let length = face
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(face.len());
+        if length != 0 {
+            let mut family = face[..length].to_vec();
+            family.push(0);
+            let pixel_height = metrics.lfMessageFont.lfHeight.unsigned_abs().max(1);
+            let size = (pixel_height as f32 * BASE_DPI / dpi.max(1) as f32).clamp(9.0, 32.0);
+            return SystemFont { family, size };
+        }
+    }
+
+    SystemFont {
+        family: "Segoe UI"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect(),
+        size: 12.0,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct PreviewColors {
     background: D2D1_COLOR_F,
@@ -696,6 +856,81 @@ impl PreviewColors {
                 metadata: color_from_colorref(GetSysColor(COLOR_GRAYTEXT)),
             }
         }
+    }
+
+    fn resolve(theme: Theme) -> Self {
+        Self::resolve_for_environment(theme, high_contrast_active(), system_dark_mode())
+    }
+
+    fn resolve_for_environment(
+        theme: Theme,
+        high_contrast: bool,
+        system_dark: Option<bool>,
+    ) -> Self {
+        if high_contrast {
+            return Self::system();
+        }
+
+        match (theme, system_dark) {
+            (Theme::System, Some(true)) => Self::dark(),
+            (Theme::System, Some(false)) => Self::light(),
+            (Theme::System, None) => Self::system(),
+            (Theme::Light, _) => Self::light(),
+            (Theme::Dark, _) => Self::dark(),
+        }
+    }
+
+    const fn light() -> Self {
+        Self {
+            background: color_from_rgb(250, 250, 250),
+            body: color_from_rgb(27, 27, 27),
+            metadata: color_from_rgb(79, 79, 79),
+        }
+    }
+
+    const fn dark() -> Self {
+        Self {
+            background: color_from_rgb(32, 32, 32),
+            body: color_from_rgb(245, 245, 245),
+            metadata: color_from_rgb(200, 200, 200),
+        }
+    }
+}
+
+fn system_dark_mode() -> Option<bool> {
+    let foreground = UISettings::new()
+        .and_then(|settings| settings.GetColorValue(UIColorType::Foreground))
+        .ok()?;
+    let weighted_brightness =
+        5 * u16::from(foreground.G) + 2 * u16::from(foreground.R) + u16::from(foreground.B);
+    Some(weighted_brightness > 8 * 128)
+}
+
+fn high_contrast_active() -> bool {
+    let mut high_contrast = HIGHCONTRASTW {
+        cbSize: size_of::<HIGHCONTRASTW>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: high_contrast is writable storage with the required size. This is a read-only
+    // accessibility query; failure conservatively falls back to the selected palette.
+    unsafe {
+        SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            size_of::<HIGHCONTRASTW>() as u32,
+            Some(std::ptr::from_mut(&mut high_contrast).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS::default(),
+        )
+    }
+    .is_ok()
+        && high_contrast.dwFlags.contains(HCF_HIGHCONTRASTON)
+}
+
+const fn color_from_rgb(red: u8, green: u8, blue: u8) -> D2D1_COLOR_F {
+    D2D1_COLOR_F {
+        r: red as f32 / 255.0,
+        g: green as f32 / 255.0,
+        b: blue as f32 / 255.0,
+        a: 1.0,
     }
 }
 
@@ -961,7 +1196,26 @@ fn dispatch_preview_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
         return LRESULT(1);
     }
 
-    if message == WM_SIZE {
+    if matches!(
+        message,
+        WM_SETTINGCHANGE | WM_SYSCOLORCHANGE | WM_THEMECHANGED | SYSTEM_APPEARANCE_CHANGED_MESSAGE
+    ) {
+        if let Some(state) = preview_state(hwnd) {
+            // SAFETY: The callback HWND is live for this synchronous DPI query.
+            let dpi = unsafe { GetDpiForWindow(hwnd) };
+            let result = if dpi == 0 {
+                Err(Error::from_thread())
+            } else {
+                let mut state = state.borrow_mut();
+                state.dpi = dpi;
+                state.refresh_environment()
+            };
+            state.borrow_mut().last_paint_error = result.err().map(|error| error.code());
+        }
+        // SAFETY: This schedules a repaint of the live preview without forcing synchronous work
+        // inside a broadcast settings callback.
+        let _ = unsafe { RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE | RDW_ERASE) };
+    } else if message == WM_SIZE {
         if let Some(state) = preview_state(hwnd) {
             let mut state = state.borrow_mut();
             let result = state.prepare(hwnd);
@@ -991,13 +1245,15 @@ fn preview_state(hwnd: HWND) -> Option<&'static RefCell<PreviewWindowState>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        D2D_SIZE_U, PreviewWindow, PreviewWindowState, RetainedContent, TextContent,
+        D2D_SIZE_U, PreviewColors, PreviewWindow, PreviewWindowState, RetainedContent, TextContent,
         checked_image_layout, color_from_colorref, format_file_size, image_destination_rect,
-        image_preview_header, preview_header,
+        image_preview_header, preview_header, system_dark_mode, system_message_font,
     };
     use crate::{
         hover::PhysicalScreenPoint,
+        platform::{ApartmentKind, ComApartment},
         preview::PreviewSize,
+        settings::Theme,
         worker::{ImageFormat, ImagePreview, TextPreview, image_corpus_previews},
     };
     use std::thread;
@@ -1053,6 +1309,80 @@ mod tests {
     }
 
     #[test]
+    fn explicit_palettes_are_distinct_and_high_contrast_uses_system_colors() {
+        let light = PreviewColors::resolve_for_environment(Theme::Light, false, Some(true));
+        let dark = PreviewColors::resolve_for_environment(Theme::Dark, false, Some(false));
+        assert!(light.background.r > dark.background.r);
+        assert!(light.body.r < dark.body.r);
+
+        let system = PreviewColors::system();
+        let overridden = PreviewColors::resolve_for_environment(Theme::Dark, true, Some(true));
+        assert_eq!(overridden.background, system.background);
+        assert_eq!(overridden.body, system.body);
+        assert_eq!(overridden.metadata, system.metadata);
+
+        let system_dark = PreviewColors::resolve_for_environment(Theme::System, false, Some(true));
+        let system_light =
+            PreviewColors::resolve_for_environment(Theme::System, false, Some(false));
+        assert_eq!(system_dark.background, dark.background);
+        assert_eq!(system_light.background, light.background);
+    }
+
+    #[test]
+    fn documented_system_theme_source_is_available_in_a_runtime_apartment() {
+        thread::spawn(|| {
+            let _apartment = ComApartment::initialize(ApartmentKind::SingleThreaded)
+                .expect("the Windows Runtime apartment should initialize");
+            assert!(
+                system_dark_mode().is_some(),
+                "UISettings should expose the current foreground mode"
+            );
+            let preview = PreviewWindow::create_with_theme(Theme::System)
+                .expect("the system-themed preview should be created");
+            assert!(
+                preview.theme_observer.is_some(),
+                "the system appearance observer should subscribe while the preview is alive"
+            );
+        })
+        .join()
+        .expect("the system-theme query thread should not panic");
+    }
+
+    #[test]
+    fn system_message_font_is_terminated_and_dpi_bounded() {
+        for dpi in [96, 120, 144, 168, 192] {
+            let font = system_message_font(dpi);
+            assert_eq!(font.family.last(), Some(&0));
+            assert!(!font.family[..font.family.len() - 1].contains(&0));
+            assert!((9.0..=32.0).contains(&font.size));
+        }
+    }
+
+    #[test]
+    fn changing_theme_recreates_visible_device_resources() {
+        thread::spawn(|| {
+            let preview = PreviewWindow::create_with_theme(Theme::Dark)
+                .expect("the dark preview window should be created");
+            preview
+                .show_text_at(
+                    PhysicalScreenPoint::new(200, 200),
+                    PreviewSize::new(640, 480),
+                    &text_preview(),
+                )
+                .expect("the dark preview should render");
+            assert!(preview.has_device_resources());
+
+            preview
+                .set_theme(Theme::Light)
+                .expect("the visible preview should refresh in light mode");
+            assert!(preview.has_content_layouts());
+            assert!(preview.has_device_resources());
+        })
+        .join()
+        .expect("the theme-refresh test thread should not panic");
+    }
+
+    #[test]
     fn text_layout_renders_and_recovers_device_resources() {
         thread::spawn(|| {
             let preview = PreviewWindow::create().expect("the preview window should be created");
@@ -1064,6 +1394,7 @@ mod tests {
                 )
                 .expect("bounded text should render");
             assert!(preview.is_visible());
+            assert_eq!(preview.accessible_title(), "CursorPeek text preview");
             assert!(preview.has_content_layouts());
             assert!(preview.has_device_resources());
 
@@ -1088,6 +1419,7 @@ mod tests {
                 )
                 .expect("bounded image pixels should render");
             assert!(preview.is_visible());
+            assert_eq!(preview.accessible_title(), "CursorPeek image preview");
             assert!(preview.has_content_layouts());
             assert!(preview.has_image_bitmap());
             assert!(preview.has_device_resources());
@@ -1152,12 +1484,14 @@ mod tests {
             };
 
             for dpi in [96, 120, 144, 168, 192] {
-                let mut state =
-                    PreviewWindowState::new().expect("DirectWrite factories should initialize");
-                state.configure(
-                    Some(RetainedContent::Text(TextContent::from_preview(&preview))),
-                    dpi,
-                );
+                let mut state = PreviewWindowState::new(Theme::System)
+                    .expect("DirectWrite factories should initialize");
+                state
+                    .configure(
+                        Some(RetainedContent::Text(TextContent::from_preview(&preview))),
+                        dpi,
+                    )
+                    .expect("system fonts should refresh for the target DPI");
                 state.pixel_size = D2D_SIZE_U {
                     width: 640 * dpi / 96,
                     height: 480 * dpi / 96,

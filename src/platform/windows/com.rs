@@ -1,9 +1,8 @@
 use std::{marker::PhantomData, rc::Rc};
 
 use windows::{
-    Win32::System::Com::{
-        COINIT, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, COINIT_MULTITHREADED,
-        CoInitializeEx, CoUninitialize,
+    Win32::System::WinRT::{
+        RO_INIT_MULTITHREADED, RO_INIT_SINGLETHREADED, RO_INIT_TYPE, RoInitialize, RoUninitialize,
     },
     core::Result,
 };
@@ -15,10 +14,10 @@ pub(crate) enum ApartmentKind {
 }
 
 impl ApartmentKind {
-    fn flags(self) -> COINIT {
+    fn runtime_type(self) -> RO_INIT_TYPE {
         match self {
-            Self::SingleThreaded => COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
-            Self::MultiThreaded => COINIT_MULTITHREADED | COINIT_DISABLE_OLE1DDE,
+            Self::SingleThreaded => RO_INIT_SINGLETHREADED,
+            Self::MultiThreaded => RO_INIT_MULTITHREADED,
         }
     }
 }
@@ -29,11 +28,11 @@ pub(crate) struct ComApartment {
 
 impl ComApartment {
     pub(crate) fn initialize(kind: ApartmentKind) -> Result<Self> {
-        // SAFETY: The reserved pointer is null as required, and `kind.flags()` contains only
-        // documented COINIT flags. A guard is constructed for every successful HRESULT,
-        // including S_FALSE, so Drop balances this exact call on the current thread.
+        // SAFETY: The selected documented apartment type initializes both Windows Runtime and
+        // underlying COM use. A guard is constructed for every successful HRESULT, including
+        // S_FALSE, so Drop balances this exact call on the current thread.
         unsafe {
-            CoInitializeEx(None, kind.flags()).ok()?;
+            RoInitialize(kind.runtime_type())?;
         }
 
         Ok(Self {
@@ -45,10 +44,10 @@ impl ComApartment {
 impl Drop for ComApartment {
     fn drop(&mut self) {
         // SAFETY: `PhantomData<Rc<()>>` makes the guard neither Send nor Sync, so safe code cannot
-        // move this destructor away from the thread whose successful CoInitializeEx call it
+        // move this destructor away from the thread whose successful RoInitialize call it
         // balances. This guard owns exactly one matching uninitialization.
         unsafe {
-            CoUninitialize();
+            RoUninitialize();
         }
     }
 }

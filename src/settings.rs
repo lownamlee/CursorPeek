@@ -49,7 +49,7 @@ pub(crate) enum SettingsMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Theme {
+pub(crate) enum Theme {
     System,
     Light,
     Dark,
@@ -147,6 +147,10 @@ impl AppSettings {
         self.preview_height
     }
 
+    pub(crate) const fn theme(&self) -> Theme {
+        self.theme
+    }
+
     pub(crate) const fn start_with_windows(&self) -> bool {
         self.start_with_windows
     }
@@ -212,6 +216,10 @@ impl SettingsDocument {
 
     pub(crate) fn set_start_with_windows(&mut self, start_with_windows: bool) {
         self.settings.start_with_windows = start_with_windows;
+    }
+
+    pub(crate) fn set_theme(&mut self, theme: Theme) {
+        self.settings.theme = theme;
     }
 
     fn parse(text: &str) -> Result<Self, SettingsParseError> {
@@ -978,6 +986,7 @@ mod tests {
             .set_preview_size(800, 600)
             .expect("the tray size preset should be valid");
         document.set_start_with_windows(true);
+        document.set_theme(Theme::Dark);
         assert_eq!(document.settings().dwell_delay_ms(), 700);
         assert_eq!(
             (
@@ -987,6 +996,7 @@ mod tests {
             (800, 600)
         );
         assert!(document.settings().start_with_windows());
+        assert_eq!(document.settings().theme(), Theme::Dark);
         assert!(
             std::str::from_utf8(&document.encode().unwrap())
                 .unwrap()

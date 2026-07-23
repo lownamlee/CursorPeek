@@ -23,7 +23,7 @@ use crate::hover::{
     InputCoverage, InputCoverageReport, PhysicalScreenPoint,
 };
 use crate::preview::{PreviewPlacement, PreviewSize};
-use crate::settings::{SettingsDocument, SettingsFile};
+use crate::settings::{SettingsDocument, SettingsFile, Theme};
 use crate::worker::{
     CompletionNotifier, PendingWorkerPoll, PendingWorkerResolution, PreviewResult, WorkerManager,
     WorkerManagerError,
@@ -664,7 +664,13 @@ impl MessageWindow {
         }
 
         if self.preview_window.is_none() {
-            let Ok(preview) = PreviewWindow::create() else {
+            let theme = self
+                .settings_document
+                .as_ref()
+                .expect("normal preview creation requires loaded settings")
+                .settings()
+                .theme();
+            let Ok(preview) = PreviewWindow::create_with_theme(theme) else {
                 return;
             };
             self.preview_window = Some(preview);
@@ -789,6 +795,10 @@ impl MessageWindow {
                 self.update_preview_size(width, height);
                 Ok(false)
             }
+            Some(TrayCommand::SetTheme(theme)) => {
+                self.update_theme(theme);
+                Ok(false)
+            }
             Some(TrayCommand::ToggleStartWithWindows) => {
                 self.toggle_start_with_windows();
                 Ok(false)
@@ -815,6 +825,7 @@ impl MessageWindow {
             dwell_delay_ms: settings.dwell_delay_ms(),
             preview_width: settings.preview_width(),
             preview_height: settings.preview_height(),
+            theme: settings.theme(),
             start_with_windows: settings.start_with_windows(),
         }
     }
@@ -856,6 +867,30 @@ impl MessageWindow {
         self.settings_document = Some(updated);
         self.cancel_dwell();
         self.preview_size = PreviewSize::new(u32::from(width), u32::from(height));
+    }
+
+    fn update_theme(&mut self, theme: Theme) {
+        let mut updated = self
+            .settings_document
+            .as_ref()
+            .expect("a settings command requires the loaded document")
+            .clone();
+        updated.set_theme(theme);
+        if !self.save_settings(&updated) {
+            return;
+        }
+
+        self.settings_document = Some(updated);
+        self.cancel_dwell();
+        if let Some(preview) = self.preview_window.as_ref()
+            && let Err(error) = preview.set_theme(theme)
+        {
+            drop(self.preview_window.take());
+            self.show_settings_error(
+                "The theme was saved, but the preview could not be refreshed.",
+                &error.to_string(),
+            );
+        }
     }
 
     fn toggle_start_with_windows(&mut self) {

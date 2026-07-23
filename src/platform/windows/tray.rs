@@ -1,5 +1,7 @@
 use std::mem::size_of;
 
+use crate::settings::Theme;
+
 use windows::{
     Win32::{
         Foundation::{E_FAIL, HWND, LPARAM, POINT, WPARAM},
@@ -32,6 +34,9 @@ const PREVIEW_COMPACT_COMMAND: usize = 20;
 const PREVIEW_STANDARD_COMMAND: usize = 21;
 const PREVIEW_LARGE_COMMAND: usize = 22;
 const TOGGLE_STARTUP_COMMAND: usize = 30;
+const THEME_SYSTEM_COMMAND: usize = 40;
+const THEME_LIGHT_COMMAND: usize = 41;
+const THEME_DARK_COMMAND: usize = 42;
 const NIN_KEYSELECT: u32 = NIN_SELECT + 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,6 +45,7 @@ pub(crate) struct TrayMenuState {
     pub(crate) dwell_delay_ms: u64,
     pub(crate) preview_width: u16,
     pub(crate) preview_height: u16,
+    pub(crate) theme: Theme,
     pub(crate) start_with_windows: bool,
 }
 
@@ -184,6 +190,7 @@ pub(crate) enum TrayCommand {
     TogglePaused,
     SetDwellDelay(u64),
     SetPreviewSize(u16, u16),
+    SetTheme(Theme),
     ToggleStartWithWindows,
     About,
     Exit,
@@ -319,6 +326,20 @@ impl PopupMenu {
             (state.preview_width, state.preview_height) == (800, 600),
         )?;
         settings.append_submenu(preview, w!("Preview size"))?;
+
+        let theme = Self::new()?;
+        theme.append_command(
+            THEME_SYSTEM_COMMAND,
+            w!("Use system colors"),
+            state.theme == Theme::System,
+        )?;
+        theme.append_command(
+            THEME_LIGHT_COMMAND,
+            w!("Light"),
+            state.theme == Theme::Light,
+        )?;
+        theme.append_command(THEME_DARK_COMMAND, w!("Dark"), state.theme == Theme::Dark)?;
+        settings.append_submenu(theme, w!("Theme"))?;
         settings.append_separator()?;
         settings.append_command(
             TOGGLE_STARTUP_COMMAND,
@@ -393,6 +414,9 @@ fn command_from_id(id: usize) -> Option<TrayCommand> {
         PREVIEW_COMPACT_COMMAND => Some(TrayCommand::SetPreviewSize(480, 360)),
         PREVIEW_STANDARD_COMMAND => Some(TrayCommand::SetPreviewSize(640, 480)),
         PREVIEW_LARGE_COMMAND => Some(TrayCommand::SetPreviewSize(800, 600)),
+        THEME_SYSTEM_COMMAND => Some(TrayCommand::SetTheme(Theme::System)),
+        THEME_LIGHT_COMMAND => Some(TrayCommand::SetTheme(Theme::Light)),
+        THEME_DARK_COMMAND => Some(TrayCommand::SetTheme(Theme::Dark)),
         TOGGLE_STARTUP_COMMAND => Some(TrayCommand::ToggleStartWithWindows),
         ABOUT_COMMAND => Some(TrayCommand::About),
         EXIT_COMMAND => Some(TrayCommand::Exit),
@@ -427,10 +451,11 @@ mod tests {
     use super::{
         ABOUT_COMMAND, DWELL_FAST_COMMAND, DWELL_RELAXED_COMMAND, DWELL_STANDARD_COMMAND,
         EXIT_COMMAND, ICON_ID, NIN_KEYSELECT, NIN_SELECT, PREVIEW_COMPACT_COMMAND,
-        PREVIEW_LARGE_COMMAND, PREVIEW_STANDARD_COMMAND, PopupMenu, TOGGLE_PAUSE_COMMAND,
-        TOGGLE_STARTUP_COMMAND, TrayCommand, TrayMenuState, callback_anchor, command_from_id,
-        write_wide_z,
+        PREVIEW_LARGE_COMMAND, PREVIEW_STANDARD_COMMAND, PopupMenu, THEME_DARK_COMMAND,
+        THEME_LIGHT_COMMAND, THEME_SYSTEM_COMMAND, TOGGLE_PAUSE_COMMAND, TOGGLE_STARTUP_COMMAND,
+        TrayCommand, TrayMenuState, callback_anchor, command_from_id, write_wide_z,
     };
+    use crate::settings::Theme;
     use windows::Win32::{
         Foundation::{LPARAM, WPARAM},
         UI::WindowsAndMessaging::{
@@ -491,6 +516,18 @@ mod tests {
             Some(TrayCommand::SetPreviewSize(800, 600))
         );
         assert_eq!(
+            command_from_id(THEME_SYSTEM_COMMAND),
+            Some(TrayCommand::SetTheme(Theme::System))
+        );
+        assert_eq!(
+            command_from_id(THEME_LIGHT_COMMAND),
+            Some(TrayCommand::SetTheme(Theme::Light))
+        );
+        assert_eq!(
+            command_from_id(THEME_DARK_COMMAND),
+            Some(TrayCommand::SetTheme(Theme::Dark))
+        );
+        assert_eq!(
             command_from_id(TOGGLE_STARTUP_COMMAND),
             Some(TrayCommand::ToggleStartWithWindows)
         );
@@ -505,6 +542,7 @@ mod tests {
             dwell_delay_ms: 700,
             preview_width: 480,
             preview_height: 360,
+            theme: Theme::Dark,
             start_with_windows: true,
         })
         .expect("the native popup hierarchy should be created");
@@ -524,6 +562,13 @@ mod tests {
         assert!(is_checked(preview, PREVIEW_COMPACT_COMMAND));
         assert!(!is_checked(preview, PREVIEW_STANDARD_COMMAND));
         assert!(!is_checked(preview, PREVIEW_LARGE_COMMAND));
+
+        // SAFETY: Theme is the third live submenu in the settings hierarchy.
+        let theme = unsafe { GetSubMenu(settings, 2) };
+        assert!(!theme.0.is_null());
+        assert!(!is_checked(theme, THEME_SYSTEM_COMMAND));
+        assert!(!is_checked(theme, THEME_LIGHT_COMMAND));
+        assert!(is_checked(theme, THEME_DARK_COMMAND));
         assert!(is_checked(settings, TOGGLE_STARTUP_COMMAND));
     }
 
