@@ -8,8 +8,8 @@ use windows::{
         UI::{
             Shell::{
                 NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-                NIM_SETVERSION, NIN_SELECT, NOTIFYICON_VERSION_4, NOTIFYICONDATAW,
-                NOTIFYICONDATAW_0, Shell_NotifyIconW,
+                NIM_SETVERSION, NIN_SELECT, NOTIFY_ICON_MESSAGE, NOTIFYICON_VERSION_4,
+                NOTIFYICONDATAW, NOTIFYICONDATAW_0, Shell_NotifyIconW,
             },
             WindowsAndMessaging::{
                 AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
@@ -77,24 +77,29 @@ impl TrayIcon {
             menu_owner,
             added: false,
         };
-
-        // SAFETY: `data` has the current structure size, a live application-owned callback HWND,
-        // a shared system icon, a terminated bounded tooltip, and a private callback message.
-        if !unsafe { Shell_NotifyIconW(NIM_ADD, &tray.data) }.as_bool() {
-            return Err(Error::from_hresult(E_FAIL));
-        }
-        tray.added = true;
-
-        tray.data.Anonymous = NOTIFYICONDATAW_0 {
-            uVersion: NOTIFYICON_VERSION_4,
-        };
-        // SAFETY: NIM_SETVERSION identifies the icon by the same live HWND/uID pair and reads the
-        // initialized uVersion union member.
-        if !unsafe { Shell_NotifyIconW(NIM_SETVERSION, &tray.data) }.as_bool() {
-            return Err(Error::from_hresult(E_FAIL));
-        }
-
+        tray.add_to_notification_area(false)?;
         Ok(tray)
+    }
+
+    fn add_to_notification_area(&mut self, accept_existing: bool) -> Result<()> {
+        establish_notification_area_registration(
+            &mut self.data,
+            &mut self.added,
+            accept_existing,
+            |message, data| {
+                // SAFETY: The caller supplies a complete application-owned registration record,
+                // and Shell_NotifyIcon reads it synchronously without retaining the pointer.
+                unsafe { Shell_NotifyIconW(message, data) }.as_bool()
+            },
+        )
+    }
+
+    pub(crate) fn restore_after_taskbar_created(&mut self) -> Result<()> {
+        // TaskbarCreated means Explorer discarded notification registrations. Do not issue a
+        // speculative NIM_DELETE against the new taskbar; recreate the complete registration and
+        // renegotiate version 4 exactly as at startup.
+        self.added = false;
+        self.add_to_notification_area(true)
     }
 
     pub(crate) fn set_paused(&mut self, paused: bool) -> Result<()> {
@@ -172,6 +177,35 @@ impl TrayIcon {
             );
         }
     }
+}
+
+fn establish_notification_area_registration(
+    data: &mut NOTIFYICONDATAW,
+    added_state: &mut bool,
+    accept_existing: bool,
+    mut notify: impl FnMut(NOTIFY_ICON_MESSAGE, &NOTIFYICONDATAW) -> bool,
+) -> Result<()> {
+    data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+    let added = notify(NIM_ADD, data);
+    // A TaskbarCreated broadcast can race with a registration performed against the freshly
+    // created taskbar. If the exact HWND/uID entry already exists, NIM_MODIFY proves ownership and
+    // refreshes every field without treating the benign race as an application failure.
+    let refreshed = accept_existing && !added && notify(NIM_MODIFY, data);
+    if !added && !refreshed {
+        return Err(Error::from_hresult(E_FAIL));
+    }
+    *added_state = true;
+
+    data.Anonymous = NOTIFYICONDATAW_0 {
+        uVersion: NOTIFYICON_VERSION_4,
+    };
+    if !notify(NIM_SETVERSION, data) {
+        let _ = notify(NIM_DELETE, data);
+        *added_state = false;
+        return Err(Error::from_hresult(E_FAIL));
+    }
+
+    Ok(())
 }
 
 impl Drop for TrayIcon {
@@ -453,13 +487,20 @@ mod tests {
         EXIT_COMMAND, ICON_ID, NIN_KEYSELECT, NIN_SELECT, PREVIEW_COMPACT_COMMAND,
         PREVIEW_LARGE_COMMAND, PREVIEW_STANDARD_COMMAND, PopupMenu, THEME_DARK_COMMAND,
         THEME_LIGHT_COMMAND, THEME_SYSTEM_COMMAND, TOGGLE_PAUSE_COMMAND, TOGGLE_STARTUP_COMMAND,
-        TrayCommand, TrayMenuState, callback_anchor, command_from_id, write_wide_z,
+        TrayCommand, TrayMenuState, callback_anchor, command_from_id,
+        establish_notification_area_registration, write_wide_z,
     };
     use crate::settings::Theme;
     use windows::Win32::{
         Foundation::{LPARAM, WPARAM},
-        UI::WindowsAndMessaging::{
-            GetMenuState, GetSubMenu, HMENU, MF_BYCOMMAND, MF_CHECKED, WM_CONTEXTMENU,
+        UI::{
+            Shell::{
+                NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+                NIM_SETVERSION, NOTIFYICON_VERSION_4, NOTIFYICONDATAW,
+            },
+            WindowsAndMessaging::{
+                GetMenuState, GetSubMenu, HMENU, MF_BYCOMMAND, MF_CHECKED, WM_CONTEXTMENU,
+            },
         },
     };
 
@@ -584,6 +625,59 @@ mod tests {
         let mut bounded = [0xffff; 4];
         write_wide_z(&mut bounded, "A\u{1f600}B");
         assert_eq!(bounded, ['A' as u16, 0xd83d, 0xde00, 0]);
+    }
+
+    #[test]
+    fn taskbar_registration_recovers_duplicates_and_cleans_version_failures() {
+        let mut recovered = NOTIFYICONDATAW::default();
+        let mut recovered_state = false;
+        let mut recovery_calls = Vec::new();
+        establish_notification_area_registration(
+            &mut recovered,
+            &mut recovered_state,
+            true,
+            |message, _| {
+                recovery_calls.push(message.0);
+                message == NIM_MODIFY || message == NIM_SETVERSION
+            },
+        )
+        .expect("an existing exact tray entry should be refreshed");
+        assert_eq!(
+            recovery_calls,
+            vec![NIM_ADD.0, NIM_MODIFY.0, NIM_SETVERSION.0]
+        );
+        assert!(recovered_state);
+        assert_eq!(
+            recovered.uFlags,
+            NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP
+        );
+        // SAFETY: The successful helper initialized the uVersion union member before returning.
+        assert_eq!(
+            unsafe { recovered.Anonymous.uVersion },
+            NOTIFYICON_VERSION_4
+        );
+
+        let mut rejected = NOTIFYICONDATAW::default();
+        let mut rejected_state = false;
+        let mut rejection_calls = Vec::new();
+        assert!(
+            establish_notification_area_registration(
+                &mut rejected,
+                &mut rejected_state,
+                false,
+                |message, _| {
+                    rejection_calls.push(message.0);
+                    message == NIM_ADD || message == NIM_DELETE
+                },
+            )
+            .is_err(),
+            "a version failure must reject and remove the partial registration"
+        );
+        assert_eq!(
+            rejection_calls,
+            vec![NIM_ADD.0, NIM_SETVERSION.0, NIM_DELETE.0]
+        );
+        assert!(!rejected_state);
     }
 
     fn is_checked(menu: HMENU, command: usize) -> bool {

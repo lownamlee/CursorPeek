@@ -60,10 +60,10 @@ use windows::{
                 SPI_GETNONCLIENTMETRICS, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
                 SWP_NOZORDER, SWP_SHOWWINDOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW,
                 SetWindowLongPtrW, SetWindowPos, SetWindowTextW, SystemParametersInfoW,
-                UnregisterClassW, WINDOW_EX_STYLE, WM_APP, WM_ERASEBKGND, WM_MOUSEACTIVATE,
-                WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOLORCHANGE,
-                WM_THEMECHANGED, WNDCLASSW, WS_BORDER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-                WS_EX_TOPMOST, WS_POPUP,
+                UnregisterClassW, WINDOW_EX_STYLE, WM_APP, WM_DISPLAYCHANGE, WM_DPICHANGED,
+                WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
+                WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOLORCHANGE, WM_THEMECHANGED, WNDCLASSW,
+                WS_BORDER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
             },
         },
     },
@@ -1196,9 +1196,53 @@ fn dispatch_preview_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
         return LRESULT(1);
     }
 
+    if message == WM_DPICHANGED {
+        let result = (|| {
+            let dpi = u32::from((wparam.0 & 0xffff) as u16);
+            if dpi == 0 || lparam.0 == 0 {
+                return Err(Error::from_hresult(E_INVALIDARG));
+            }
+            let state = preview_state(hwnd).ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
+            {
+                let mut state = state.borrow_mut();
+                state.dpi = dpi;
+                state.refresh_environment()?;
+            }
+
+            // SAFETY: WM_DPICHANGED supplies a synchronous pointer to one suggested RECT that
+            // remains valid for the duration of this callback.
+            let suggested = unsafe { &*(lparam.0 as *const RECT) };
+            let (x, y, width, height) = checked_window_rect(suggested)?;
+            // SAFETY: The callback HWND is live, the rectangle was copied and checked above, and
+            // these flags preserve both activation and Z order.
+            unsafe {
+                SetWindowPos(
+                    hwnd,
+                    None,
+                    x,
+                    y,
+                    width,
+                    height,
+                    SWP_NOACTIVATE | SWP_NOZORDER,
+                )?
+            };
+            Ok(())
+        })();
+        if let Some(state) = preview_state(hwnd) {
+            state.borrow_mut().last_paint_error = result.err().map(|error| error.code());
+        }
+        // SAFETY: Schedule one repaint after applying the new DPI and suggested physical bounds.
+        let _ = unsafe { RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE | RDW_ERASE) };
+        return LRESULT(0);
+    }
+
     if matches!(
         message,
-        WM_SETTINGCHANGE | WM_SYSCOLORCHANGE | WM_THEMECHANGED | SYSTEM_APPEARANCE_CHANGED_MESSAGE
+        WM_DISPLAYCHANGE
+            | WM_SETTINGCHANGE
+            | WM_SYSCOLORCHANGE
+            | WM_THEMECHANGED
+            | SYSTEM_APPEARANCE_CHANGED_MESSAGE
     ) {
         if let Some(state) = preview_state(hwnd) {
             // SAFETY: The callback HWND is live for this synchronous DPI query.
@@ -1235,6 +1279,20 @@ fn dispatch_preview_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
 
+fn checked_window_rect(rect: &RECT) -> Result<(i32, i32, i32, i32)> {
+    let width = rect
+        .right
+        .checked_sub(rect.left)
+        .filter(|width| *width > 0)
+        .ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
+    let height = rect
+        .bottom
+        .checked_sub(rect.top)
+        .filter(|height| *height > 0)
+        .ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
+    Ok((rect.left, rect.top, width, height))
+}
+
 fn preview_state(hwnd: HWND) -> Option<&'static RefCell<PreviewWindowState>> {
     // SAFETY: PreviewWindow stores a stable Box pointer at WM_NCCREATE and clears it before either
     // HWND or Box teardown. This helper is called only synchronously on the owning UI thread.
@@ -1246,8 +1304,9 @@ fn preview_state(hwnd: HWND) -> Option<&'static RefCell<PreviewWindowState>> {
 mod tests {
     use super::{
         D2D_SIZE_U, PreviewColors, PreviewWindow, PreviewWindowState, RetainedContent, TextContent,
-        checked_image_layout, color_from_colorref, format_file_size, image_destination_rect,
-        image_preview_header, preview_header, system_dark_mode, system_message_font,
+        checked_image_layout, checked_window_rect, color_from_colorref, format_file_size,
+        image_destination_rect, image_preview_header, preview_header, system_dark_mode,
+        system_message_font,
     };
     use crate::{
         hover::PhysicalScreenPoint,
@@ -1258,7 +1317,9 @@ mod tests {
     };
     use std::thread;
     use windows::Win32::{
-        Graphics::DirectWrite::DWRITE_TEXT_METRICS, UI::WindowsAndMessaging::IsWindow,
+        Foundation::{LPARAM, RECT, WPARAM},
+        Graphics::DirectWrite::DWRITE_TEXT_METRICS,
+        UI::WindowsAndMessaging::{GetWindowRect, IsWindow, SendMessageW, WM_DPICHANGED},
     };
 
     fn text_preview() -> TextPreview {
@@ -1356,6 +1417,83 @@ mod tests {
             assert!(!font.family[..font.family.len() - 1].contains(&0));
             assert!((9.0..=32.0).contains(&font.size));
         }
+    }
+
+    #[test]
+    fn suggested_dpi_rectangles_require_positive_checked_dimensions() {
+        assert_eq!(
+            checked_window_rect(&RECT {
+                left: -320,
+                top: 40,
+                right: 320,
+                bottom: 520,
+            })
+            .expect("the physical rectangle should be valid"),
+            (-320, 40, 640, 480)
+        );
+        assert!(
+            checked_window_rect(&RECT {
+                left: 10,
+                top: 10,
+                right: 10,
+                bottom: 20,
+            })
+            .is_err()
+        );
+        assert!(
+            checked_window_rect(&RECT {
+                left: i32::MIN,
+                top: 0,
+                right: i32::MAX,
+                bottom: 1,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn dpi_change_applies_suggested_bounds_and_rebuilds_visible_resources() {
+        thread::spawn(|| {
+            let preview = PreviewWindow::create().expect("the preview window should be created");
+            preview
+                .show_text_at(
+                    PhysicalScreenPoint::new(200, 200),
+                    PreviewSize::new(640, 480),
+                    &text_preview(),
+                )
+                .expect("the initial preview should render");
+
+            let suggested = RECT {
+                left: 50,
+                top: 60,
+                right: 370,
+                bottom: 300,
+            };
+            let packed_dpi = usize::from(144_u16) | (usize::from(144_u16) << 16);
+            // SAFETY: SendMessageW consumes the pointer synchronously, and suggested stays alive
+            // for the complete WM_DPICHANGED callback.
+            unsafe {
+                SendMessageW(
+                    preview.handle(),
+                    WM_DPICHANGED,
+                    Some(WPARAM(packed_dpi)),
+                    Some(LPARAM(std::ptr::from_ref(&suggested) as isize)),
+                );
+            }
+            preview
+                .redraw()
+                .expect("the DPI-refreshed preview should repaint");
+
+            let mut actual = RECT::default();
+            // SAFETY: The preview HWND remains live and actual is writable output storage.
+            unsafe { GetWindowRect(preview.handle(), &mut actual) }
+                .expect("the physical window rectangle should be queryable");
+            assert_eq!(actual, suggested);
+            assert!(preview.has_content_layouts());
+            assert!(preview.has_device_resources());
+        })
+        .join()
+        .expect("the DPI-change render test thread should not panic");
     }
 
     #[test]

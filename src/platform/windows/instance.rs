@@ -6,7 +6,7 @@ use std::{
 
 use windows::{
     Win32::{
-        Foundation::{E_FAIL, ERROR_ALREADY_EXISTS, GetLastError, HWND},
+        Foundation::{E_FAIL, ERROR_ALREADY_EXISTS, GetLastError},
         System::Threading::CreateMutexW,
         UI::WindowsAndMessaging::{
             AllowSetForegroundWindow, FindWindowExW, GetWindowThreadProcessId, PostMessageW,
@@ -52,11 +52,9 @@ impl SingleInstance {
 pub(crate) fn activate_existing_instance() -> Result<()> {
     let deadline = Instant::now() + ACTIVATION_WAIT;
     let hwnd = loop {
-        // SAFETY: HWND_MESSAGE requests only message-only children. Both class and title arguments
-        // are terminated and no returned handle ownership is transferred.
-        if let Ok(hwnd) =
-            unsafe { FindWindowExW(Some(HWND_MESSAGE), None, CLASS_NAME, PCWSTR::null()) }
-        {
+        // SAFETY: Two null traversal handles search top-level windows. The exact private class
+        // disambiguates CursorPeek, and no returned handle ownership transfers.
+        if let Ok(hwnd) = unsafe { FindWindowExW(None, None, CLASS_NAME, PCWSTR::null()) } {
             break hwnd;
         }
         if Instant::now() >= deadline {
@@ -66,7 +64,8 @@ pub(crate) fn activate_existing_instance() -> Result<()> {
     };
 
     let mut process_id = 0;
-    // SAFETY: `hwnd` is the live message-only window found above and the output pointer is valid.
+    // SAFETY: `hwnd` is the live hidden coordinator window found above and the output pointer is
+    // valid.
     let thread_id = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
     if thread_id == 0 || process_id == 0 {
         return Err(windows::core::Error::from_hresult(E_FAIL));
@@ -77,7 +76,7 @@ pub(crate) fn activate_existing_instance() -> Result<()> {
     // when policy rejects this optional transfer.
     let _ = unsafe { AllowSetForegroundWindow(process_id) };
 
-    // SAFETY: The private message carries no pointers and targets the exact live message window.
+    // SAFETY: The private message carries no pointers and targets the exact live coordinator.
     unsafe {
         PostMessageW(
             Some(hwnd),
@@ -87,8 +86,6 @@ pub(crate) fn activate_existing_instance() -> Result<()> {
         )
     }
 }
-
-const HWND_MESSAGE: HWND = HWND(-3_isize as *mut core::ffi::c_void);
 
 #[cfg(test)]
 mod tests {

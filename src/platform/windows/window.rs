@@ -5,6 +5,7 @@ use std::{
     marker::PhantomData,
     panic::{AssertUnwindSafe, catch_unwind},
     rc::Rc,
+    sync::atomic::{AtomicU32, Ordering},
     time::{Duration, Instant},
 };
 
@@ -40,10 +41,11 @@ use windows::{
             WindowsAndMessaging::{
                 CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
                 EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND,
-                GetForegroundWindow, GetMessageW, HWND_MESSAGE, KillTimer, MSG, PostMessageW,
-                RegisterClassW, SetTimer, TranslateMessage, USER_TIMER_MAXIMUM, USER_TIMER_MINIMUM,
-                UnregisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE, WINEVENT_OUTOFCONTEXT,
-                WINEVENT_SKIPOWNPROCESS, WM_APP, WM_INPUT, WM_TIMER, WNDCLASSW,
+                GetForegroundWindow, GetMessageW, KillTimer, MSG, PostMessageW, RegisterClassW,
+                RegisterWindowMessageW, SPI_SETWORKAREA, SetTimer, TranslateMessage,
+                USER_TIMER_MAXIMUM, USER_TIMER_MINIMUM, UnregisterClassW, WINEVENT_OUTOFCONTEXT,
+                WINEVENT_SKIPOWNPROCESS, WM_APP, WM_DISPLAYCHANGE, WM_INPUT, WM_SETTINGCHANGE,
+                WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
             },
         },
     },
@@ -59,18 +61,39 @@ const WORKER_RESULT_MESSAGE: u32 = WM_APP + 2;
 const TRAY_CALLBACK_MESSAGE: u32 = WM_APP + 3;
 pub(super) const ACTIVATE_MESSAGE: u32 = WM_APP + 4;
 const PREVIEW_CONTEXT_INVALIDATED_MESSAGE: u32 = WM_APP + 6;
+const SYSTEM_LIFECYCLE_CHANGED_MESSAGE: u32 = WM_APP + 7;
 const DWELL_TIMER_ID: usize = 1;
 const INPUT_SAMPLE_TIMER_ID: usize = 2;
 const INPUT_DIAGNOSTIC_DEADLINE_TIMER_ID: usize = 3;
 const PREVIEW_DIAGNOSTIC_DEADLINE_TIMER_ID: usize = 4;
 const PREVIEW_GUARD_TIMER_ID: usize = 5;
 const PREVIEW_GUARD_INTERVAL: Duration = Duration::from_millis(125);
+static TASKBAR_CREATED_MESSAGE: AtomicU32 = AtomicU32::new(0);
 
 pub(crate) const PREVIEW_WINDOW_DIAGNOSTIC_DURATION: Duration = Duration::from_millis(1_500);
 pub(crate) const PREVIEW_WINDOW_PRACTICE_DURATION: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
 const TEST_PANIC_MESSAGE: u32 = WM_APP + 5;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+enum SystemLifecycleChange {
+    DisplayConfiguration = 1,
+    WorkArea = 2,
+    TaskbarCreated = 3,
+}
+
+impl SystemLifecycleChange {
+    const fn from_message_parameter(value: usize) -> Option<Self> {
+        match value {
+            1 => Some(Self::DisplayConfiguration),
+            2 => Some(Self::WorkArea),
+            3 => Some(Self::TaskbarCreated),
+            _ => None,
+        }
+    }
+}
 
 pub(crate) struct MessageWindow {
     hwnd: HWND,
@@ -114,22 +137,29 @@ impl MessageWindow {
     }
 
     fn create_with_preview_size(dwell_delay: Duration, preview_size: PreviewSize) -> Result<Self> {
+        // SAFETY: The static terminated string remains valid for this session-wide registration.
+        let taskbar_created_message = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
+        if taskbar_created_message == 0 {
+            return Err(Error::from_thread());
+        }
+        TASKBAR_CREATED_MESSAGE.store(taskbar_created_message, Ordering::Release);
         let class = RegisteredWindowClass::register()?;
 
         // SAFETY: The class remains registered in `class`, all string pointers are static, the
-        // module instance belongs to this process, and no creation parameter is passed. Using
-        // HWND_MESSAGE creates a non-visible message-only window on the current thread.
+        // module instance belongs to this process, and no creation parameter is passed. Omitting
+        // WS_VISIBLE creates a hidden top-level tool window that receives Shell/system broadcasts
+        // without activation or a taskbar button.
         let hwnd = unsafe {
             CreateWindowExW(
-                WINDOW_EX_STYLE::default(),
+                WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
                 CLASS_NAME,
                 w!(""),
-                WINDOW_STYLE::default(),
+                WS_POPUP,
                 0,
                 0,
                 0,
                 0,
-                Some(HWND_MESSAGE),
+                None,
                 None,
                 Some(class.instance),
                 None,
@@ -380,6 +410,16 @@ impl MessageWindow {
             if message.hwnd == self.hwnd && message.message == ACTIVATE_MESSAGE {
                 if self.handle_instance_activation()? {
                     return Ok(MessageLoopExit::Shutdown);
+                }
+                self.record_preview_ui_task(ui_task_started.elapsed());
+                continue;
+            }
+
+            if message.hwnd == self.hwnd && message.message == SYSTEM_LIFECYCLE_CHANGED_MESSAGE {
+                if let Some(change) =
+                    SystemLifecycleChange::from_message_parameter(message.wParam.0)
+                {
+                    self.handle_system_lifecycle_change(change)?;
                 }
                 self.record_preview_ui_task(ui_task_started.elapsed());
                 continue;
@@ -733,6 +773,19 @@ impl MessageWindow {
         if preview_context_generation_matches(self.active_preview, generation) {
             self.cancel_dwell();
         }
+    }
+
+    fn handle_system_lifecycle_change(&mut self, change: SystemLifecycleChange) -> Result<()> {
+        // Display topology, work-area, and taskbar recreation can invalidate both the physical
+        // anchor and the Explorer UIA/Shell context. Require fresh input before another preview.
+        self.cancel_dwell();
+
+        if change == SystemLifecycleChange::TaskbarCreated
+            && let Some(tray) = self.tray_icon.as_mut()
+        {
+            tray.restore_after_taskbar_created()?;
+        }
+        Ok(())
     }
 
     fn hide_product_preview(&mut self) {
@@ -1161,9 +1214,9 @@ unsafe extern "system" fn preview_event_callback(
                 return;
             };
 
-            // SAFETY: The target is the live message-only HWND owned by the registering thread.
-            // The private message carries only a generation scalar, never a callback pointer or
-            // borrowed event data.
+            // SAFETY: The target is the live hidden coordinator HWND owned by the registering
+            // thread. The private message carries only a generation scalar, never a callback
+            // pointer or borrowed event data.
             unsafe {
                 let _ = PostMessageW(
                     Some(target.message_window),
@@ -1410,18 +1463,50 @@ fn dispatch_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) ->
         panic!("intentional callback panic for containment testing");
     }
 
+    if let Some(change) = system_lifecycle_change_for_message(message, wparam) {
+        // SAFETY: Broadcasts and registered Shell messages enter WNDPROC synchronously. This
+        // pointer-free private message targets the same live HWND and defers all product state
+        // changes to its normal queue.
+        let _ = unsafe {
+            PostMessageW(
+                Some(hwnd),
+                SYSTEM_LIFECYCLE_CHANGED_MESSAGE,
+                WPARAM(change as usize),
+                LPARAM(0),
+            )
+        };
+        return LRESULT(0);
+    }
+
     // SAFETY: These are the untouched parameters supplied by Windows to this window procedure.
     // Every WM_INPUT reaches this default procedure because the owning loop copies it before
     // dispatch and applies safe state only after required foreground cleanup.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
 
+fn system_lifecycle_change_for_message(
+    message: u32,
+    wparam: WPARAM,
+) -> Option<SystemLifecycleChange> {
+    if message == WM_DISPLAYCHANGE {
+        return Some(SystemLifecycleChange::DisplayConfiguration);
+    }
+    if message == WM_SETTINGCHANGE && wparam.0 == SPI_SETWORKAREA.0 as usize {
+        return Some(SystemLifecycleChange::WorkArea);
+    }
+
+    let taskbar_created = TASKBAR_CREATED_MESSAGE.load(Ordering::Acquire);
+    (taskbar_created != 0 && message == taskbar_created)
+        .then_some(SystemLifecycleChange::TaskbarCreated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivePreview, DWELL_TIMER_ID, IsWindow, LPARAM, MessageWindow,
-        PREVIEW_WINDOW_DIAGNOSTIC_DURATION, PREVIEW_WINDOW_PRACTICE_DURATION, PostMessageW,
-        TEST_PANIC_MESSAGE, WM_TIMER, WPARAM, accept_worker_completion, post_worker_result,
+        ActivePreview, CLASS_NAME, DWELL_TIMER_ID, IsWindow, LPARAM, MessageWindow,
+        PREVIEW_WINDOW_DIAGNOSTIC_DURATION, PREVIEW_WINDOW_PRACTICE_DURATION,
+        SYSTEM_LIFECYCLE_CHANGED_MESSAGE, SystemLifecycleChange, TASKBAR_CREATED_MESSAGE,
+        TEST_PANIC_MESSAGE, WPARAM, accept_worker_completion, post_worker_result,
         preview_context_generation_matches, preview_context_is_current,
         preview_input_requires_dismissal, registered_raw_devices, timer_interval_ms,
     };
@@ -1430,11 +1515,20 @@ mod tests {
     use crate::platform::windows::input::{RawInputActivity, RawMouseActivity};
     use crate::worker::WorkerManager;
     use std::{
+        sync::atomic::Ordering,
         thread,
         time::{Duration, Instant},
     };
-    use windows::Win32::UI::Input::RIDEV_INPUTSINK;
-    use windows::core::Error;
+    use windows::{
+        Win32::UI::{
+            Input::RIDEV_INPUTSINK,
+            WindowsAndMessaging::{
+                FindWindowExW, HWND_MESSAGE, MSG, PM_REMOVE, PeekMessageW, PostMessageW,
+                SPI_SETWORKAREA, SendMessageW, WM_DISPLAYCHANGE, WM_SETTINGCHANGE, WM_TIMER,
+            },
+        },
+        core::{Error, PCWSTR},
+    };
 
     #[test]
     fn worker_delivery_accepts_only_the_current_generation() {
@@ -1465,19 +1559,99 @@ mod tests {
     fn message_window_lifecycle_and_callback_boundary_are_sound() {
         thread::spawn(|| {
             let mut first =
-                MessageWindow::create().expect("the message-only window should be created");
+                MessageWindow::create().expect("the hidden coordinator should be created");
             let first_handle = first.handle();
 
             // SAFETY: `first_handle` belongs to the live window on this test thread.
             assert!(unsafe { IsWindow(Some(first_handle)).as_bool() });
+            // SAFETY: The exact class is process-private. The null-parent search finds the hidden
+            // top-level coordinator; HWND_MESSAGE must not find it.
+            assert_eq!(
+                unsafe { FindWindowExW(None, None, CLASS_NAME, PCWSTR::null()) }
+                    .expect("the top-level coordinator should be discoverable"),
+                first_handle
+            );
+            assert!(
+                unsafe { FindWindowExW(Some(HWND_MESSAGE), None, CLASS_NAME, PCWSTR::null()) }
+                    .is_err(),
+                "the coordinator must not remain message-only because broadcasts would be lost"
+            );
             assert!(
                 !is_explorer_window(first_handle),
-                "the private message window must fail the Explorer candidate gate"
+                "the private coordinator must fail the Explorer candidate gate"
             );
             assert_raw_input_registrations(first_handle);
 
+            let taskbar_created = TASKBAR_CREATED_MESSAGE.load(Ordering::Acquire);
+            assert_ne!(taskbar_created, 0);
+            for (message, parameter, expected) in [
+                (
+                    WM_DISPLAYCHANGE,
+                    WPARAM(32),
+                    SystemLifecycleChange::DisplayConfiguration,
+                ),
+                (
+                    WM_SETTINGCHANGE,
+                    WPARAM(SPI_SETWORKAREA.0 as usize),
+                    SystemLifecycleChange::WorkArea,
+                ),
+                (
+                    taskbar_created,
+                    WPARAM(0),
+                    SystemLifecycleChange::TaskbarCreated,
+                ),
+            ] {
+                // SAFETY: These synchronous, pointer-free messages target the live coordinator
+                // directly rather than broadcasting into other applications.
+                unsafe { SendMessageW(first_handle, message, Some(parameter), None) };
+                let mut queued = MSG::default();
+                // SAFETY: queued is writable storage; the exact private-message filter removes
+                // only CursorPeek's reduced lifecycle event from this owning thread's queue.
+                assert!(
+                    unsafe {
+                        PeekMessageW(
+                            &mut queued,
+                            Some(first_handle),
+                            SYSTEM_LIFECYCLE_CHANGED_MESSAGE,
+                            SYSTEM_LIFECYCLE_CHANGED_MESSAGE,
+                            PM_REMOVE,
+                        )
+                    }
+                    .as_bool()
+                );
+                assert_eq!(
+                    SystemLifecycleChange::from_message_parameter(queued.wParam.0),
+                    Some(expected)
+                );
+            }
+
+            // Unrelated settings broadcasts still receive default processing and do not cancel
+            // product state through the private lifecycle path.
+            unsafe { SendMessageW(first_handle, WM_SETTINGCHANGE, Some(WPARAM(0)), None) };
+            let mut unrelated = MSG::default();
+            assert!(
+                !unsafe {
+                    PeekMessageW(
+                        &mut unrelated,
+                        Some(first_handle),
+                        SYSTEM_LIFECYCLE_CHANGED_MESSAGE,
+                        SYSTEM_LIFECYCLE_CHANGED_MESSAGE,
+                        PM_REMOVE,
+                    )
+                }
+                .as_bool()
+            );
+
             first.restart_dwell(PhysicalScreenPoint::new(-10, 20), Instant::now());
             assert!(first.dwell_timer_is_armed());
+            first
+                .handle_system_lifecycle_change(SystemLifecycleChange::DisplayConfiguration)
+                .expect("display invalidation without a tray should be infallible");
+            assert!(
+                !first.dwell_timer_is_armed(),
+                "display changes must cancel stale physical hover work"
+            );
+            first.restart_dwell(PhysicalScreenPoint::new(-10, 20), Instant::now());
             first.handle_dwell_timer(Instant::now());
             assert!(
                 first.dwell_timer_is_armed(),
