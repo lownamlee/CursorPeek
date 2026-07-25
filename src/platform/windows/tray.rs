@@ -40,6 +40,23 @@ const THEME_DARK_COMMAND: usize = 42;
 const NIN_KEYSELECT: u32 = NIN_SELECT + 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TrayStatus {
+    Active,
+    Paused,
+    WorkerRecovering,
+}
+
+impl TrayStatus {
+    const fn tooltip(self) -> &'static str {
+        match self {
+            Self::Active => "CursorPeek",
+            Self::Paused => "CursorPeek (paused)",
+            Self::WorkerRecovering => "CursorPeek (worker retry on next hover)",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TrayMenuState {
     pub(crate) paused: bool,
     pub(crate) dwell_delay_ms: u64,
@@ -70,7 +87,7 @@ impl TrayIcon {
             hIcon: icon,
             ..Default::default()
         };
-        write_wide_z(&mut data.szTip, "CursorPeek");
+        write_wide_z(&mut data.szTip, TrayStatus::Active.tooltip());
 
         let mut tray = Self {
             data,
@@ -102,16 +119,9 @@ impl TrayIcon {
         self.add_to_notification_area(true)
     }
 
-    pub(crate) fn set_paused(&mut self, paused: bool) -> Result<()> {
+    pub(crate) fn set_status(&mut self, status: TrayStatus) -> Result<()> {
         self.data.uFlags = NIF_TIP | NIF_SHOWTIP;
-        write_wide_z(
-            &mut self.data.szTip,
-            if paused {
-                "CursorPeek (paused)"
-            } else {
-                "CursorPeek"
-            },
-        );
+        write_wide_z(&mut self.data.szTip, status.tooltip());
 
         // SAFETY: The icon remains registered by this owner and the bounded tooltip is terminated.
         if unsafe { Shell_NotifyIconW(NIM_MODIFY, &self.data) }.as_bool() {
@@ -487,7 +497,7 @@ mod tests {
         EXIT_COMMAND, ICON_ID, NIN_KEYSELECT, NIN_SELECT, PREVIEW_COMPACT_COMMAND,
         PREVIEW_LARGE_COMMAND, PREVIEW_STANDARD_COMMAND, PopupMenu, THEME_DARK_COMMAND,
         THEME_LIGHT_COMMAND, THEME_SYSTEM_COMMAND, TOGGLE_PAUSE_COMMAND, TOGGLE_STARTUP_COMMAND,
-        TrayCommand, TrayMenuState, callback_anchor, command_from_id,
+        TrayCommand, TrayMenuState, TrayStatus, callback_anchor, command_from_id,
         establish_notification_area_registration, write_wide_z,
     };
     use crate::settings::Theme;
@@ -625,6 +635,25 @@ mod tests {
         let mut bounded = [0xffff; 4];
         write_wide_z(&mut bounded, "A\u{1f600}B");
         assert_eq!(bounded, ['A' as u16, 0xd83d, 0xde00, 0]);
+    }
+
+    #[test]
+    fn tray_status_tooltips_are_bounded_and_distinguish_recovery() {
+        assert_eq!(TrayStatus::Active.tooltip(), "CursorPeek");
+        assert_eq!(TrayStatus::Paused.tooltip(), "CursorPeek (paused)");
+        assert_eq!(
+            TrayStatus::WorkerRecovering.tooltip(),
+            "CursorPeek (worker retry on next hover)"
+        );
+        assert!(
+            TrayStatus::WorkerRecovering
+                .tooltip()
+                .encode_utf16()
+                .count()
+                < windows::Win32::UI::Shell::NOTIFYICONDATAW::default()
+                    .szTip
+                    .len()
+        );
     }
 
     #[test]

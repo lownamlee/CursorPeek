@@ -30,7 +30,7 @@ use crate::worker::{
     WorkerManagerError,
 };
 
-use super::{PreviewWindow, StartupRegistration, TrayCommand, TrayIcon, TrayMenuState};
+use super::{PreviewWindow, StartupRegistration, TrayCommand, TrayIcon, TrayMenuState, TrayStatus};
 
 use windows::{
     Win32::{
@@ -41,11 +41,13 @@ use windows::{
             WindowsAndMessaging::{
                 CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
                 EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND,
-                GetForegroundWindow, GetMessageW, KillTimer, MSG, PostMessageW, RegisterClassW,
-                RegisterWindowMessageW, SPI_SETWORKAREA, SetTimer, TranslateMessage,
-                USER_TIMER_MAXIMUM, USER_TIMER_MINIMUM, UnregisterClassW, WINEVENT_OUTOFCONTEXT,
-                WINEVENT_SKIPOWNPROCESS, WM_APP, WM_DISPLAYCHANGE, WM_INPUT, WM_SETTINGCHANGE,
-                WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+                GetForegroundWindow, GetMessageW, KillTimer, MSG, PBT_APMRESUMEAUTOMATIC,
+                PBT_APMRESUMECRITICAL, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, PostMessageW,
+                RegisterClassW, RegisterWindowMessageW, SPI_SETWORKAREA, SetTimer,
+                TranslateMessage, USER_TIMER_MAXIMUM, USER_TIMER_MINIMUM, UnregisterClassW,
+                WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP, WM_DISPLAYCHANGE, WM_INPUT,
+                WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE,
+                WS_EX_TOOLWINDOW, WS_POPUP,
             },
         },
     },
@@ -82,6 +84,8 @@ enum SystemLifecycleChange {
     DisplayConfiguration = 1,
     WorkArea = 2,
     TaskbarCreated = 3,
+    Suspend = 4,
+    Resume = 5,
 }
 
 impl SystemLifecycleChange {
@@ -90,8 +94,20 @@ impl SystemLifecycleChange {
             1 => Some(Self::DisplayConfiguration),
             2 => Some(Self::WorkArea),
             3 => Some(Self::TaskbarCreated),
+            4 => Some(Self::Suspend),
+            5 => Some(Self::Resume),
             _ => None,
         }
+    }
+}
+
+const fn tray_status(paused: bool, worker_recovering: bool) -> TrayStatus {
+    if paused {
+        TrayStatus::Paused
+    } else if worker_recovering {
+        TrayStatus::WorkerRecovering
+    } else {
+        TrayStatus::Active
     }
 }
 
@@ -109,6 +125,8 @@ pub(crate) struct MessageWindow {
     settings_document: Option<SettingsDocument>,
     startup_registration: Option<StartupRegistration>,
     paused: bool,
+    power_suspended: bool,
+    worker_recovering: bool,
     worker_manager: Option<WorkerManager>,
     pending_worker_resolution: Option<PendingWorkerResolution>,
     pending_worker_anchor: Option<(Generation, PhysicalScreenPoint)>,
@@ -180,6 +198,8 @@ impl MessageWindow {
             settings_document: None,
             startup_registration: None,
             paused: false,
+            power_suspended: false,
+            worker_recovering: false,
             worker_manager: None,
             pending_worker_resolution: None,
             pending_worker_anchor: None,
@@ -499,7 +519,7 @@ impl MessageWindow {
             self.handle_input_diagnostic_raw(raw_input);
             return;
         }
-        if self.paused {
+        if self.paused || self.power_suspended {
             return;
         }
 
@@ -643,12 +663,20 @@ impl MessageWindow {
                     return;
                 }
 
-                let Some(manager) = self.worker_manager.as_ref() else {
+                if !self.ensure_worker_manager_running() {
                     return;
-                };
+                }
+                let manager = self
+                    .worker_manager
+                    .as_ref()
+                    .expect("a successful recovery check retains the worker manager");
                 let notifier = worker_result_notifier(self.hwnd);
-                let Ok(pending) = manager.submit_with_notifier(generation, point, notifier) else {
-                    return;
+                let pending = match manager.submit_with_notifier(generation, point, notifier) {
+                    Ok(pending) => pending,
+                    Err(_) => {
+                        self.set_worker_recovering(true);
+                        return;
+                    }
                 };
 
                 self.pending_worker_resolution = Some(pending);
@@ -669,6 +697,7 @@ impl MessageWindow {
                 let anchor = self.pending_worker_anchor.take();
                 match result {
                     Ok(resolution) => {
+                        self.set_worker_recovering(false);
                         let generation = accept_worker_completion(
                             self.hover_state.generation(),
                             Some(resolution.generation()),
@@ -684,12 +713,44 @@ impl MessageWindow {
                             self.hide_product_preview();
                         }
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        if !error.is_request_cancellation() {
+                            self.set_worker_recovering(true);
+                        }
                         self.latest_worker_completion = None;
                         self.hide_product_preview();
                     }
                 }
             }
+        }
+    }
+
+    fn ensure_worker_manager_running(&mut self) -> bool {
+        let Some(manager) = self.worker_manager.as_mut() else {
+            return false;
+        };
+        match manager.restart_if_stopped() {
+            Ok(restarted) => {
+                if restarted {
+                    self.set_worker_recovering(true);
+                }
+                true
+            }
+            Err(_) => {
+                self.set_worker_recovering(true);
+                false
+            }
+        }
+    }
+
+    fn set_worker_recovering(&mut self, recovering: bool) {
+        if self.worker_recovering == recovering {
+            return;
+        }
+        self.worker_recovering = recovering;
+        let status = tray_status(self.paused, self.worker_recovering);
+        if let Some(tray) = self.tray_icon.as_mut() {
+            let _ = tray.set_status(status);
         }
     }
 
@@ -776,14 +837,28 @@ impl MessageWindow {
     }
 
     fn handle_system_lifecycle_change(&mut self, change: SystemLifecycleChange) -> Result<()> {
-        // Display topology, work-area, and taskbar recreation can invalidate both the physical
-        // anchor and the Explorer UIA/Shell context. Require fresh input before another preview.
+        // Display topology, power transitions, work-area changes, and taskbar recreation can
+        // invalidate both the physical anchor and the Explorer UIA/Shell context. Require fresh
+        // input before another preview.
         self.cancel_dwell();
 
-        if change == SystemLifecycleChange::TaskbarCreated
-            && let Some(tray) = self.tray_icon.as_mut()
-        {
-            tray.restore_after_taskbar_created()?;
+        match change {
+            SystemLifecycleChange::Suspend | SystemLifecycleChange::Resume => {
+                self.power_suspended = change == SystemLifecycleChange::Suspend;
+                let recycle = self
+                    .worker_manager
+                    .as_ref()
+                    .map(WorkerManager::request_session_recycle);
+                if matches!(recycle, Some(Err(_))) {
+                    self.set_worker_recovering(true);
+                }
+            }
+            SystemLifecycleChange::TaskbarCreated => {
+                if let Some(tray) = self.tray_icon.as_mut() {
+                    tray.restore_after_taskbar_created()?;
+                }
+            }
+            SystemLifecycleChange::DisplayConfiguration | SystemLifecycleChange::WorkArea => {}
         }
         Ok(())
     }
@@ -830,10 +905,11 @@ impl MessageWindow {
             None => Ok(false),
             Some(TrayCommand::TogglePaused) => {
                 let paused = !self.paused;
+                let status = tray_status(paused, self.worker_recovering);
                 self.tray_icon
                     .as_mut()
                     .expect("a tray command requires the live tray owner")
-                    .set_paused(paused)?;
+                    .set_status(status)?;
                 self.paused = paused;
                 if paused {
                     self.cancel_dwell();
@@ -1475,7 +1551,11 @@ fn dispatch_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) ->
                 LPARAM(0),
             )
         };
-        return LRESULT(0);
+        return if message == WM_POWERBROADCAST {
+            LRESULT(1)
+        } else {
+            LRESULT(0)
+        };
     }
 
     // SAFETY: These are the untouched parameters supplied by Windows to this window procedure.
@@ -1494,6 +1574,15 @@ fn system_lifecycle_change_for_message(
     if message == WM_SETTINGCHANGE && wparam.0 == SPI_SETWORKAREA.0 as usize {
         return Some(SystemLifecycleChange::WorkArea);
     }
+    if message == WM_POWERBROADCAST {
+        return match wparam.0 as u32 {
+            PBT_APMSUSPEND => Some(SystemLifecycleChange::Suspend),
+            PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMECRITICAL | PBT_APMRESUMESUSPEND => {
+                Some(SystemLifecycleChange::Resume)
+            }
+            _ => None,
+        };
+    }
 
     let taskbar_created = TASKBAR_CREATED_MESSAGE.load(Ordering::Acquire);
     (taskbar_created != 0 && message == taskbar_created)
@@ -1508,9 +1597,10 @@ mod tests {
         SYSTEM_LIFECYCLE_CHANGED_MESSAGE, SystemLifecycleChange, TASKBAR_CREATED_MESSAGE,
         TEST_PANIC_MESSAGE, WPARAM, accept_worker_completion, post_worker_result,
         preview_context_generation_matches, preview_context_is_current,
-        preview_input_requires_dismissal, registered_raw_devices, timer_interval_ms,
+        preview_input_requires_dismissal, registered_raw_devices, timer_interval_ms, tray_status,
     };
     use crate::hover::{Generation, PhysicalScreenPoint};
+    use crate::platform::windows::TrayStatus;
     use crate::platform::windows::explorer::is_explorer_window;
     use crate::platform::windows::input::{RawInputActivity, RawMouseActivity};
     use crate::worker::WorkerManager;
@@ -1523,8 +1613,9 @@ mod tests {
         Win32::UI::{
             Input::RIDEV_INPUTSINK,
             WindowsAndMessaging::{
-                FindWindowExW, HWND_MESSAGE, MSG, PM_REMOVE, PeekMessageW, PostMessageW,
-                SPI_SETWORKAREA, SendMessageW, WM_DISPLAYCHANGE, WM_SETTINGCHANGE, WM_TIMER,
+                FindWindowExW, HWND_MESSAGE, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND,
+                PM_REMOVE, PeekMessageW, PostMessageW, SPI_SETWORKAREA, SendMessageW,
+                WM_DISPLAYCHANGE, WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_TIMER,
             },
         },
         core::{Error, PCWSTR},
@@ -1556,6 +1647,14 @@ mod tests {
     }
 
     #[test]
+    fn tray_status_prioritizes_pause_and_exposes_worker_recovery() {
+        assert_eq!(tray_status(false, false), TrayStatus::Active);
+        assert_eq!(tray_status(false, true), TrayStatus::WorkerRecovering);
+        assert_eq!(tray_status(true, false), TrayStatus::Paused);
+        assert_eq!(tray_status(true, true), TrayStatus::Paused);
+    }
+
+    #[test]
     fn message_window_lifecycle_and_callback_boundary_are_sound() {
         thread::spawn(|| {
             let mut first =
@@ -1584,26 +1683,42 @@ mod tests {
 
             let taskbar_created = TASKBAR_CREATED_MESSAGE.load(Ordering::Acquire);
             assert_ne!(taskbar_created, 0);
-            for (message, parameter, expected) in [
+            for (message, parameter, expected, expected_result) in [
                 (
                     WM_DISPLAYCHANGE,
                     WPARAM(32),
                     SystemLifecycleChange::DisplayConfiguration,
+                    0,
                 ),
                 (
                     WM_SETTINGCHANGE,
                     WPARAM(SPI_SETWORKAREA.0 as usize),
                     SystemLifecycleChange::WorkArea,
+                    0,
                 ),
                 (
                     taskbar_created,
                     WPARAM(0),
                     SystemLifecycleChange::TaskbarCreated,
+                    0,
+                ),
+                (
+                    WM_POWERBROADCAST,
+                    WPARAM(PBT_APMSUSPEND as usize),
+                    SystemLifecycleChange::Suspend,
+                    1,
+                ),
+                (
+                    WM_POWERBROADCAST,
+                    WPARAM(PBT_APMRESUMEAUTOMATIC as usize),
+                    SystemLifecycleChange::Resume,
+                    1,
                 ),
             ] {
                 // SAFETY: These synchronous, pointer-free messages target the live coordinator
                 // directly rather than broadcasting into other applications.
-                unsafe { SendMessageW(first_handle, message, Some(parameter), None) };
+                let result = unsafe { SendMessageW(first_handle, message, Some(parameter), None) };
+                assert_eq!(result.0, expected_result);
                 let mut queued = MSG::default();
                 // SAFETY: queued is writable storage; the exact private-message filter removes
                 // only CursorPeek's reduced lifecycle event from this owning thread's queue.
@@ -1642,6 +1757,29 @@ mod tests {
                 .as_bool()
             );
 
+            // Unknown or pointer-bearing power events stay with DefWindowProc and are never
+            // copied into CursorPeek's scalar lifecycle queue.
+            unsafe {
+                SendMessageW(
+                    first_handle,
+                    WM_POWERBROADCAST,
+                    Some(WPARAM(u32::MAX as usize)),
+                    None,
+                )
+            };
+            assert!(
+                !unsafe {
+                    PeekMessageW(
+                        &mut unrelated,
+                        Some(first_handle),
+                        SYSTEM_LIFECYCLE_CHANGED_MESSAGE,
+                        SYSTEM_LIFECYCLE_CHANGED_MESSAGE,
+                        PM_REMOVE,
+                    )
+                }
+                .as_bool()
+            );
+
             first.restart_dwell(PhysicalScreenPoint::new(-10, 20), Instant::now());
             assert!(first.dwell_timer_is_armed());
             first
@@ -1651,6 +1789,14 @@ mod tests {
                 !first.dwell_timer_is_armed(),
                 "display changes must cancel stale physical hover work"
             );
+            first
+                .handle_system_lifecycle_change(SystemLifecycleChange::Suspend)
+                .expect("suspend invalidation without a worker should be infallible");
+            assert!(first.power_suspended);
+            first
+                .handle_system_lifecycle_change(SystemLifecycleChange::Resume)
+                .expect("resume invalidation without a worker should be infallible");
+            assert!(!first.power_suspended);
             first.restart_dwell(PhysicalScreenPoint::new(-10, 20), Instant::now());
             first.handle_dwell_timer(Instant::now());
             assert!(

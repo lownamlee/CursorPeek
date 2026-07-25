@@ -63,10 +63,17 @@ pub(crate) fn run_launch_diagnostic() -> Result<WorkerDiagnosticReport, WorkerMa
             return Err(WorkerManagerError::SessionNotRestarted);
         }
 
+        manager.request_session_recycle()?;
+        let fourth = manager.resolve(Generation::from_raw(4), PhysicalScreenPoint::new(0, 0))?;
+        ensure_unavailable(&fourth.result)?;
+        if fourth.session_id == third.session_id {
+            return Err(WorkerManagerError::SessionNotRecycled);
+        }
+
         Ok(WorkerDiagnosticReport {
             elapsed: started.elapsed(),
-            requests: 3,
-            sessions: 2,
+            requests: 4,
+            sessions: 3,
         })
     })();
 
@@ -161,6 +168,7 @@ impl Default for WorkerManagerConfig {
 }
 
 pub(crate) struct WorkerManager {
+    config: WorkerManagerConfig,
     requests: Arc<LatestRequestMailbox>,
     idle_receiver: Receiver<u64>,
     thread: Option<JoinHandle<Result<(), WorkerManagerError>>>,
@@ -175,19 +183,21 @@ impl WorkerManager {
     }
 
     fn start_with_config(config: WorkerManagerConfig) -> Result<Self, WorkerManagerError> {
+        let manager_config = config.clone();
         let requests = Arc::new(LatestRequestMailbox::new());
         let manager_requests = Arc::clone(&requests);
         let (idle_sender, idle_receiver) = mpsc::channel();
         let thread = thread::Builder::new()
             .name("cursorpeek-worker-manager".into())
             .spawn(move || {
-                let result = manager_loop(config, &manager_requests, idle_sender);
+                let result = manager_loop(manager_config, &manager_requests, idle_sender);
                 manager_requests.close();
                 result
             })
             .map_err(WorkerManagerError::ThreadStart)?;
 
         Ok(Self {
+            config,
             requests,
             idle_receiver,
             thread: Some(thread),
@@ -223,6 +233,38 @@ impl WorkerManager {
                 .requests
                 .submit_with_notifier(generation, point, notifier)?,
         })
+    }
+
+    pub(crate) fn request_session_recycle(&self) -> Result<(), WorkerManagerError> {
+        // This only updates the bounded mailbox and wakes the manager thread. Process teardown
+        // stays off the caller, including the application's UI thread.
+        self.requests.request_session_recycle()
+    }
+
+    pub(crate) fn restart_if_stopped(&mut self) -> Result<bool, WorkerManagerError> {
+        if self
+            .thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
+        {
+            return Ok(false);
+        }
+
+        let config = self.config.clone();
+        let previous = self.finish();
+        match Self::start_with_config(config) {
+            Ok(replacement) => {
+                *self = replacement;
+                Ok(true)
+            }
+            Err(restart) => match previous {
+                Ok(()) => Err(restart),
+                Err(operation) => Err(WorkerManagerError::RestartAfterFailure {
+                    operation: Box::new(operation),
+                    restart: Box::new(restart),
+                }),
+            },
+        }
     }
 
     fn wait_for_idle_expiry(&self, timeout: Duration) -> Result<u64, WorkerManagerError> {
@@ -327,6 +369,7 @@ impl CompletionNotifier {
 #[derive(Default)]
 struct RequestMailboxState {
     pending: Option<PendingRequest>,
+    recycle_requested: bool,
     closed: bool,
     #[cfg(test)]
     max_pending: usize,
@@ -398,6 +441,25 @@ impl LatestRequestMailbox {
         Ok(response_receiver)
     }
 
+    fn request_session_recycle(&self) -> Result<(), WorkerManagerError> {
+        let cancelled = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| WorkerManagerError::RequestMailboxPoisoned)?;
+            if state.closed {
+                return Err(WorkerManagerError::ManagerChannelDisconnected);
+            }
+            state.recycle_requested = true;
+            state.pending.take()
+        };
+        if let Some(cancelled) = cancelled {
+            complete_request(cancelled, Err(WorkerManagerError::RequestCancelled));
+        }
+        self.changed.notify_one();
+        Ok(())
+    }
+
     fn take(&self, timeout: Option<Duration>) -> Result<MailboxTake, WorkerManagerError> {
         let deadline = timeout.map(|duration| Instant::now() + duration);
         let mut state = self
@@ -406,6 +468,10 @@ impl LatestRequestMailbox {
             .map_err(|_| WorkerManagerError::RequestMailboxPoisoned)?;
 
         loop {
+            if state.recycle_requested {
+                state.recycle_requested = false;
+                return Ok(MailboxTake::RecycleSession);
+            }
             if let Some(request) = state.pending.take() {
                 return Ok(MailboxTake::Request(request));
             }
@@ -442,11 +508,13 @@ impl LatestRequestMailbox {
         let cancelled = match self.state.lock() {
             Ok(mut state) => {
                 state.closed = true;
+                state.recycle_requested = false;
                 state.pending.take()
             }
             Err(poisoned) => {
                 let mut state = poisoned.into_inner();
                 state.closed = true;
+                state.recycle_requested = false;
                 state.pending.take()
             }
         };
@@ -467,6 +535,7 @@ impl LatestRequestMailbox {
 
 enum MailboxTake {
     Request(PendingRequest),
+    RecycleSession,
     TimedOut,
     Closed,
 }
@@ -557,6 +626,12 @@ fn manager_loop(
                 let session_id = expired.id;
                 expired.shutdown()?;
                 let _ = idle_sender.send(session_id);
+            }
+            MailboxTake::RecycleSession => {
+                if let Some(retained) = session.take() {
+                    retained.terminate_and_join()?;
+                }
+                last_used = Instant::now();
             }
             MailboxTake::Closed => return shutdown_session(session),
         }
@@ -877,8 +952,9 @@ impl fmt::Display for WorkerDiagnosticReport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "Contained worker diagnostic completed: generation=1, status=Unavailable, \
-             requests={}, sessions={}, reuse=yes, idle_restart=yes, elapsed={} ms",
+            "Contained worker diagnostic completed: final_generation=4, status=Unavailable, \
+             requests={}, sessions={}, reuse=yes, idle_restart=yes, session_recycle=yes, \
+             elapsed={} ms",
             self.requests,
             self.sessions,
             self.elapsed.as_millis()
@@ -911,6 +987,7 @@ pub(crate) enum WorkerManagerError {
     UnexpectedIdleSession,
     SessionNotReused,
     SessionNotRestarted,
+    SessionNotRecycled,
     SessionIdExhausted,
     UnexpectedExit {
         exit_code: u32,
@@ -923,10 +1000,20 @@ pub(crate) enum WorkerManagerError {
         operation: Box<WorkerManagerError>,
         cleanup: Box<WorkerManagerError>,
     },
+    RestartAfterFailure {
+        operation: Box<WorkerManagerError>,
+        restart: Box<WorkerManagerError>,
+    },
     ShutdownAfterFailure {
         operation: Box<WorkerManagerError>,
         shutdown: Box<WorkerManagerError>,
     },
+}
+
+impl WorkerManagerError {
+    pub(crate) const fn is_request_cancellation(&self) -> bool {
+        matches!(self, Self::RequestSuperseded | Self::RequestCancelled)
+    }
 }
 
 impl fmt::Display for WorkerManagerError {
@@ -984,6 +1071,9 @@ impl fmt::Display for WorkerManagerError {
             Self::SessionNotRestarted => {
                 write!(formatter, "an idle worker was reused instead of restarted")
             }
+            Self::SessionNotRecycled => {
+                write!(formatter, "a recycled worker session was reused")
+            }
             Self::SessionIdExhausted => write!(formatter, "worker session IDs were exhausted"),
             Self::UnexpectedExit {
                 exit_code,
@@ -998,6 +1088,10 @@ impl fmt::Display for WorkerManagerError {
             Self::RecoveryCleanupFailed { operation, cleanup } => write!(
                 formatter,
                 "worker request failed ({operation}) and cleanup also failed ({cleanup})"
+            ),
+            Self::RestartAfterFailure { operation, restart } => write!(
+                formatter,
+                "worker manager failed ({operation}) and replacement also failed ({restart})"
             ),
             Self::ShutdownAfterFailure {
                 operation,
@@ -1020,6 +1114,7 @@ impl Error for WorkerManagerError {
             Self::Random(error) => Some(error),
             Self::Protocol(error) => Some(error),
             Self::RecoveryCleanupFailed { operation, .. }
+            | Self::RestartAfterFailure { operation, .. }
             | Self::ShutdownAfterFailure { operation, .. } => Some(operation),
             Self::WorkerExitedBeforeReady
             | Self::UnexpectedReady
@@ -1038,6 +1133,7 @@ impl Error for WorkerManagerError {
             | Self::UnexpectedIdleSession
             | Self::SessionNotReused
             | Self::SessionNotRestarted
+            | Self::SessionNotRecycled
             | Self::SessionIdExhausted
             | Self::UnexpectedExit { .. }
             | Self::ProtocolThreadPanicked
@@ -1063,8 +1159,8 @@ impl From<ProtocolStreamError> for WorkerManagerError {
 mod tests {
     use super::{
         CompletionNotifier, DEFAULT_WORKER_IDLE_LIFETIME, LatestRequestMailbox, MailboxTake,
-        PendingWorkerPoll, PendingWorkerResolution, WorkerManagerConfig, WorkerManagerError,
-        WorkerResolution, validate_ready, validate_result,
+        PendingWorkerPoll, PendingWorkerResolution, WorkerManager, WorkerManagerConfig,
+        WorkerManagerError, WorkerResolution, validate_ready, validate_result,
     };
     use crate::{
         hover::{Generation, PhysicalScreenPoint},
@@ -1075,7 +1171,8 @@ mod tests {
     };
     use std::{
         sync::atomic::{AtomicUsize, Ordering},
-        time::Duration,
+        thread,
+        time::{Duration, Instant},
     };
 
     const NONCE: SessionNonce = SessionNonce::from_bytes([0x11; 16]);
@@ -1093,6 +1190,14 @@ mod tests {
             DEFAULT_WORKER_IDLE_LIFETIME
         );
         assert_eq!(DEFAULT_WORKER_IDLE_LIFETIME, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn only_expected_request_displacement_avoids_recovery_state() {
+        assert!(WorkerManagerError::RequestSuperseded.is_request_cancellation());
+        assert!(WorkerManagerError::RequestCancelled.is_request_cancellation());
+        assert!(!WorkerManagerError::DeadlineExceeded.is_request_cancellation());
+        assert!(!WorkerManagerError::ManagerChannelDisconnected.is_request_cancellation());
     }
 
     #[test]
@@ -1133,7 +1238,9 @@ mod tests {
         ));
         let pending = match mailbox.take(Some(Duration::ZERO)).unwrap() {
             MailboxTake::Request(request) => request,
-            MailboxTake::TimedOut | MailboxTake::Closed => panic!("latest request was not pending"),
+            MailboxTake::RecycleSession | MailboxTake::TimedOut | MailboxTake::Closed => {
+                panic!("latest request was not pending")
+            }
         };
         assert_eq!(pending.generation, Generation::from_raw(2));
         assert_eq!(pending.point, PhysicalScreenPoint::new(2, 2));
@@ -1227,6 +1334,58 @@ mod tests {
     }
 
     #[test]
+    fn session_recycle_cancels_pending_work_and_coalesces() {
+        let mailbox = LatestRequestMailbox::new();
+        let pending = mailbox
+            .submit(Generation::from_raw(1), PhysicalScreenPoint::new(0, 0))
+            .unwrap();
+
+        mailbox.request_session_recycle().unwrap();
+        mailbox.request_session_recycle().unwrap();
+
+        assert!(matches!(
+            pending.recv().unwrap(),
+            Err(WorkerManagerError::RequestCancelled)
+        ));
+        assert!(matches!(
+            mailbox.take(Some(Duration::ZERO)).unwrap(),
+            MailboxTake::RecycleSession
+        ));
+        assert!(matches!(
+            mailbox.take(Some(Duration::ZERO)).unwrap(),
+            MailboxTake::TimedOut
+        ));
+    }
+
+    #[test]
+    fn a_stopped_manager_thread_can_be_replaced_without_restarting_the_app() {
+        let mut manager = WorkerManager::start_with_config(WorkerManagerConfig::default()).unwrap();
+        manager.requests.close();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while manager
+            .thread
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the closed manager should stop promptly"
+            );
+            thread::yield_now();
+        }
+
+        assert!(manager.restart_if_stopped().unwrap());
+        assert!(
+            manager
+                .thread
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+        );
+        manager.shutdown().unwrap();
+    }
+
+    #[test]
     fn ten_thousand_submissions_keep_only_the_latest_request() {
         let mailbox = LatestRequestMailbox::new();
         let active_receiver = mailbox
@@ -1234,7 +1393,9 @@ mod tests {
             .unwrap();
         let active = match mailbox.take(Some(Duration::ZERO)).unwrap() {
             MailboxTake::Request(request) => request,
-            MailboxTake::TimedOut | MailboxTake::Closed => panic!("first request was not active"),
+            MailboxTake::RecycleSession | MailboxTake::TimedOut | MailboxTake::Closed => {
+                panic!("first request was not active")
+            }
         };
         let mut previous = mailbox
             .submit(Generation::from_raw(2), PhysicalScreenPoint::new(2, -2))
@@ -1266,7 +1427,9 @@ mod tests {
         assert!(active_receiver.recv().unwrap().is_ok());
         let latest = match mailbox.take(Some(Duration::ZERO)).unwrap() {
             MailboxTake::Request(request) => request,
-            MailboxTake::TimedOut | MailboxTake::Closed => panic!("latest request was not pending"),
+            MailboxTake::RecycleSession | MailboxTake::TimedOut | MailboxTake::Closed => {
+                panic!("latest request was not pending")
+            }
         };
         assert_eq!(latest.generation, Generation::from_raw(10_000));
         assert_eq!(latest.point, PhysicalScreenPoint::new(10_000, -10_000));

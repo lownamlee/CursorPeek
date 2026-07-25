@@ -18,7 +18,7 @@ pub(crate) use instance::{SingleInstance, activate_existing_instance};
 pub(crate) use preview::PreviewWindow;
 pub(crate) use process::{ContainedWorker, ProcessError, WorkerPipes};
 pub(crate) use startup::StartupRegistration;
-pub(crate) use tray::{TrayCommand, TrayIcon, TrayMenuState};
+pub(crate) use tray::{TrayCommand, TrayIcon, TrayMenuState, TrayStatus};
 pub(crate) use window::{
     ApplicationRunError, MessageWindow, PREVIEW_WINDOW_DIAGNOSTIC_DURATION,
     PREVIEW_WINDOW_PRACTICE_DURATION,
