@@ -12,11 +12,31 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Get-Sha256Hex {
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
+
+    $stream = [System.IO.File]::OpenRead($LiteralPath)
+    try {
+        $algorithm = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            return [System.BitConverter]::ToString(
+                $algorithm.ComputeHash($stream)
+            ).Replace("-", "")
+        }
+        finally {
+            $algorithm.Dispose()
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
 $expectedSourceHash = '096FDCF9A0CEE5DDF83728593FF47AA7B600047317A8E19D21FD730F88BB5AF8'
 $iconSizes = @(16, 20, 24, 32, 40, 48, 64, 128, 256)
 
 $resolvedInput = (Resolve-Path -LiteralPath $InputPath).Path
-$sourceHash = (Get-FileHash -LiteralPath $resolvedInput -Algorithm SHA256).Hash
+$sourceHash = Get-Sha256Hex -LiteralPath $resolvedInput
 if ($sourceHash -cne $expectedSourceHash) {
     throw "The logo hash is $sourceHash; expected the approved source $expectedSourceHash."
 }
@@ -158,6 +178,6 @@ finally {
     Source = $resolvedInput
     SourceSha256 = $sourceHash
     Output = $resolvedOutput
-    OutputSha256 = (Get-FileHash -LiteralPath $resolvedOutput -Algorithm SHA256).Hash
+    OutputSha256 = Get-Sha256Hex -LiteralPath $resolvedOutput
     Sizes = $iconSizes -join ','
 }

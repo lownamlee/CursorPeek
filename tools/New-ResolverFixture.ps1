@@ -15,6 +15,26 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+function Get-Sha256Hex {
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
+
+    $stream = [System.IO.File]::OpenRead($LiteralPath)
+    try {
+        $algorithm = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            return [System.BitConverter]::ToString(
+                $algorithm.ComputeHash($stream)
+            ).Replace("-", "")
+        }
+        finally {
+            $algorithm.Dispose()
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
 $destinationPath = [System.IO.Path]::GetFullPath($Destination)
 $destinationRoot = [System.IO.Path]::GetPathRoot($destinationPath)
 if ([System.StringComparer]::OrdinalIgnoreCase.Equals(
@@ -79,7 +99,7 @@ for ($index = 1; $index -le $FileCount; $index++) {
     $path = Join-Path $destinationPath $name
     $content = "CursorPeek resolver fixture {0:D4}`r`n" -f $index
     [System.IO.File]::WriteAllText($path, $content, $utf8WithoutBom)
-    $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash
+    $hash = Get-Sha256Hex -LiteralPath $path
     $length = (Get-Item -LiteralPath $path).Length
     $inventoryLines.Add("$name`t$hash`t$length")
 }
