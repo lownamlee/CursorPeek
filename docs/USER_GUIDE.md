@@ -1,0 +1,303 @@
+# CursorPeek user guide
+
+CursorPeek shows a temporary preview after the pointer rests over a supported local file in
+Windows File Explorer. It runs as a notification-area application and does not replace Explorer,
+install a shell extension, or open a network service.
+
+## Start and exit
+
+Run `CursorPeek.exe`. Its icon appears in the notification area. Windows may place the icon behind
+the notification-area overflow button.
+
+Open File Explorer and leave the pointer over a supported file for the configured dwell delay
+(400 ms by default). Moving the pointer, scrolling, clicking, pressing Escape, changing the active
+Explorer item/view, or switching applications dismisses the preview.
+
+CursorPeek allows one normal instance in the current interactive session. Starting it again asks
+the existing instance to show its tray menu.
+
+To stop it, right-click the tray icon and choose **Exit**. Ending only the contained worker process
+does not exit CursorPeek; the application replaces that worker when needed.
+
+## Tray menu
+
+Right-click the CursorPeek icon:
+
+- **Pause** / **Resume** — temporarily stops or resumes new previews. Pause is not persisted.
+- **Settings > Dwell delay**
+  - Fast: 250 ms
+  - Standard: 400 ms
+  - Relaxed: 700 ms
+- **Settings > Preview size**
+  - Compact: 480 x 360
+  - Standard: 640 x 480
+  - Large: 800 x 600
+- **Settings > Theme**
+  - Use system colors
+  - Light
+  - Dark
+- **Settings > Start with Windows** — adds or removes the current executable from the current
+  user’s startup list.
+- **About CursorPeek** — shows the product version.
+- **Exit** — closes CursorPeek and its worker.
+
+Setting changes are saved immediately. If saving fails, CursorPeek leaves the previous setting in
+effect and shows an error.
+
+## Supported images
+
+Eligible extensions:
+
+| Family | Extensions | Behavior |
+| --- | --- | --- |
+| JPEG | `.jpg`, `.jpeg`, `.jpe`, `.jfif` | Applies supported EXIF orientation |
+| PNG | `.png` | Preserves alpha |
+| GIF | `.gif` | Uses the first composited frame |
+| WebP | `.webp` | Uses a still preview |
+| Bitmap | `.bmp`, `.dib` | Bounded raster decode |
+| Icon | `.ico` | Uses a deterministic first-image policy |
+| TIFF | `.tif`, `.tiff` | Uses a deterministic first-page policy |
+
+An eligible extension is only the first check. CursorPeek also validates the file signature and
+image layout. A renamed or malformed file does not become a valid image because its extension is
+supported.
+
+Current image limits:
+
+- file size: 128 MiB;
+- source width or height: 20,000 pixels;
+- source pixels: 40,000,000;
+- decoded image bytes: 160 MiB;
+- decoder allocation: 256 MiB;
+- displayed preview bitmap: at most 960 x 720 pixels.
+
+Images are never enlarged beyond their decoded size and are fitted without changing aspect ratio.
+
+## Supported text
+
+Eligible extensions:
+
+```text
+txt text log md csv tsv json jsonc xml yaml yml toml ini cfg conf properties
+rs c h cc cpp cxx hh hpp hxx ipp inl cs java kt kts go py pyw rb php
+js mjs cjs jsx ts mts cts tsx html htm css sql sh bash zsh ps1 bat cmd
+```
+
+Eligible exact filenames:
+
+```text
+README LICENSE COPYING NOTICE Makefile Dockerfile Gemfile
+.env .editorconfig .gitattributes .gitignore .dockerignore .npmrc
+.prettierrc .prettierignore .eslintrc .eslintignore
+```
+
+Filename matching is case-insensitive. A file must still pass the binary-content checks.
+
+CursorPeek recognizes strict UTF-8 and BOM-marked UTF-8, UTF-16, and UTF-32. When Unicode does not
+apply, the default `auto` policy may select a supported legacy encoding. Guessed legacy text is
+identified in the preview. Invalid sequences, binary-looking content, and unsupported encodings
+fail closed.
+
+Text is normalized and displayed as inert plain text:
+
+- HTML and Markdown are not rendered;
+- scripts and terminal escape sequences are not executed;
+- unsafe control and bidirectional formatting characters are neutralized;
+- tabs are retained and hard line endings are normalized;
+- output is bounded to 128 KiB of UTF-8, 32,000 Unicode scalars, and 200 lines;
+- only a bounded 256 KiB prefix is read for a text preview.
+
+Previewing a sensitive text file, including `.env`, displays its content on your screen. CursorPeek
+does not upload that content, but you should pause or exit CursorPeek when screen sharing or when
+other people can see the display.
+
+## Files that intentionally do not preview
+
+CursorPeek requires one unambiguous local filesystem file from the active Explorer view. It does
+not preview:
+
+- folders or multiple/ambiguous candidates;
+- UNC and network paths;
+- device paths and non-disk handles;
+- offline files and placeholders marked for recall-on-open or recall-on-data-access;
+- Explorer virtual items without a verified local path;
+- unsupported extensions or special filenames;
+- malformed, oversized, binary-disguised-as-text, or otherwise rejected content.
+
+For these cases CursorPeek normally shows nothing. This is intentional fail-closed behavior, not
+always an application error.
+
+Explorer or a sync provider may have hydrated a file before CursorPeek examines it. CursorPeek
+does not request hydration itself and rejects a target that still advertises an offline/recall
+state when the worker opens it.
+
+## Installed and portable settings
+
+### Installed mode
+
+Without a portable marker, settings are stored at:
+
+```text
+%LOCALAPPDATA%\CursorPeek\config.ini
+```
+
+The **Start with Windows** option writes the current executable command to the current user’s
+`Software\Microsoft\Windows\CurrentVersion\Run` registry key under the value `CursorPeek`. It does
+not require administrator rights.
+
+### Portable mode
+
+Create a regular file named `CursorPeek.portable` beside `CursorPeek.exe` before starting it.
+CursorPeek then stores `config.ini` beside the executable. The marker may be empty. A directory
+with that name is rejected.
+
+Portable mode does not copy files, modify PATH, or write the registry merely by starting. Choosing
+**Start with Windows** is an explicit request to add the current portable executable to the
+current-user startup key.
+
+Keep the executable directory writable if you want settings to persist. Move the executable,
+marker, and configuration together when relocating a portable copy.
+
+### Configuration keys
+
+The canonical file contains:
+
+```ini
+# CursorPeek settings
+dwell_delay_ms=400
+preview_width=640
+preview_height=480
+theme=system
+legacy_encoding=auto
+start_with_windows=false
+```
+
+| Key | Accepted value |
+| --- | --- |
+| `dwell_delay_ms` | integer from 150 through 2000 |
+| `preview_width` | integer from 320 through 960 |
+| `preview_height` | integer from 240 through 720 |
+| `theme` | `system`, `light`, or `dark` |
+| `legacy_encoding` | `auto`, `system`, `off`, or a supported legacy label such as `windows-1252` or `shift_jis` |
+| `start_with_windows` | `true` or `false` |
+
+The tray exposes safe presets rather than every numeric value. To use another accepted value, exit
+CursorPeek, edit `config.ini` as UTF-8, and restart it.
+
+Malformed UTF-8, duplicate keys, invalid known values, oversized lines/files, or too many unknown
+settings prevent startup and do not overwrite the existing file. Valid bounded unknown keys are
+preserved for forward compatibility.
+
+## Privacy and containment
+
+CursorPeek has no account, telemetry, content upload, update check, or application network
+protocol. It reads the selected local file only after Explorer identity checks succeed. Parsing
+and decoding occur in a separate worker process with strict resource limits, authenticated bounded
+IPC, process mitigations, and kill-on-close Job containment.
+
+The worker runs as the same Windows user. It is not an AppContainer, a different integrity level,
+or a security sandbox. Containment is designed to recover from decoder crashes, hangs, malformed
+messages, and excess resource retention; it cannot promise isolation from every same-user process
+compromise.
+
+See [../PRIVACY.md](../PRIVACY.md) and [../SECURITY.md](../SECURITY.md).
+
+## Diagnostics
+
+Run commands from PowerShell or Command Prompt so their output remains visible.
+
+Show version and help:
+
+```powershell
+.\CursorPeek.exe --version
+.\CursorPeek.exe --help
+```
+
+Measure Raw Input coverage for one labeled input device:
+
+```powershell
+.\CursorPeek.exe --input-diagnostics
+```
+
+The command runs for 30 seconds. Keep File Explorer in the foreground and move the chosen mouse,
+touchpad, or pen. An unmatched movement is a candidate coverage gap, not by itself proof that the
+device is unsupported.
+
+Verify contained-worker reuse, idle restart, and teardown:
+
+```powershell
+.\CursorPeek.exe --worker-diagnostics
+```
+
+Other command-line modes mentioned by `--help` are private test interfaces and are not supported
+for normal use.
+
+## Troubleshooting
+
+### The tray icon is not visible
+
+- Check the notification-area overflow.
+- Start `CursorPeek.exe` once more; a second launch asks the existing instance to show its menu.
+- If no instance exists, run it from PowerShell to capture the error text.
+- An invalid or unwritable configuration can stop startup. Use the configuration recovery steps
+  below.
+
+### A supported file shows no preview
+
+- Confirm the file is in Windows File Explorer, not a browser, desktop replacement, file dialog,
+  archive viewer, or another file manager.
+- Confirm it is a local file and does not need cloud hydration.
+- Check that CursorPeek is not paused.
+- Leave the pointer still for at least the selected dwell delay.
+- Verify the extension or exact filename is eligible.
+- Try a small known-good file. Malformed, binary, oversized, ambiguous, or changing files are
+  intentionally rejected.
+- Exit other development/test copies and start only the build you intend to test.
+
+### The preview disappears immediately
+
+Pointer motion, wheel input, clicks, Escape, foreground/selection changes, display changes, and
+Explorer lifecycle events dismiss it by design. Increase the dwell delay if small device movements
+continually restart the timer.
+
+### OneDrive or another cloud file does not preview
+
+Make the file locally available through its provider before hovering. CursorPeek will not download
+or hydrate it and will still reject files that advertise offline or recall attributes.
+
+### Settings prevent startup
+
+1. Exit CursorPeek.
+2. Locate the active `config.ini` in the executable directory (portable) or
+   `%LOCALAPPDATA%\CursorPeek` (installed).
+3. Rename the file so it can be recovered.
+4. Start CursorPeek to create defaults.
+5. Reapply settings through the tray or copy back only valid key/value pairs.
+
+Do not replace the portable marker with a directory.
+
+### Start with Windows points to an old location
+
+Start the intended copy, turn **Start with Windows** off, then turn it on again. This rewrites the
+current-user startup value with the exact current executable path.
+
+### High contrast or theme colors look different
+
+High contrast takes precedence over the selected light/dark theme and uses Windows system colors.
+This is intentional. System font and DPI changes apply when Windows sends the corresponding
+notifications.
+
+### Reporting a bug
+
+Include:
+
+- CursorPeek version or full commit;
+- Windows version/build and Explorer view;
+- portable or installed mode;
+- display scaling and monitor layout;
+- input device;
+- minimal file type/size and whether it is local, linked, or cloud-managed;
+- exact non-sensitive diagnostic output and reproduction steps.
+
+Remove personal paths, file contents, credentials, and undisclosed vulnerability details. Use
+[SECURITY.md](../SECURITY.md) for security reports.
