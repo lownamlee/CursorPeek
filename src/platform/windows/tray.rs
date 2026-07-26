@@ -1,5 +1,6 @@
 use std::mem::size_of;
 
+use super::load_small_application_icon;
 use crate::settings::Theme;
 
 use windows::{
@@ -13,10 +14,10 @@ use windows::{
             },
             WindowsAndMessaging::{
                 AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
-                GetCursorPos, HMENU, IDI_APPLICATION, LoadIconW, MB_ICONERROR, MB_ICONINFORMATION,
-                MB_OK, MENU_ITEM_FLAGS, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MessageBoxW,
-                PostMessageW, SetForegroundWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-                TrackPopupMenu, WM_CONTEXTMENU, WM_NULL, WS_EX_TOOLWINDOW, WS_POPUP,
+                GetCursorPos, HMENU, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MENU_ITEM_FLAGS,
+                MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MessageBoxW, PostMessageW,
+                SetForegroundWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
+                WM_CONTEXTMENU, WM_NULL, WS_EX_TOOLWINDOW, WS_POPUP,
             },
         },
     },
@@ -75,9 +76,7 @@ pub(crate) struct TrayIcon {
 impl TrayIcon {
     pub(crate) fn create(callback_window: HWND, callback_message: u32) -> Result<Self> {
         let menu_owner = TrayMenuOwner::create()?;
-        // SAFETY: IDI_APPLICATION selects a system-owned shared icon. The returned handle remains
-        // valid without DestroyIcon and is used only while the notification icon is registered.
-        let icon = unsafe { LoadIconW(None, IDI_APPLICATION)? };
+        let icon = load_small_application_icon()?;
         let mut data = NOTIFYICONDATAW {
             cbSize: size_of::<NOTIFYICONDATAW>() as u32,
             hWnd: callback_window,

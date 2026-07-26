@@ -52,6 +52,10 @@ $dumpbinOutput = & $dumpbin.FullName /nologo /dependents $resolvedExecutable
 if ($LASTEXITCODE -ne 0) {
     throw "dumpbin.exe failed with exit code $LASTEXITCODE."
 }
+$headersOutput = & $dumpbin.FullName /nologo /headers $resolvedExecutable
+if ($LASTEXITCODE -ne 0) {
+    throw "dumpbin.exe header inspection failed with exit code $LASTEXITCODE."
+}
 
 $imports = @(
     $dumpbinOutput |
@@ -87,6 +91,85 @@ if ($unexpectedImports.Count -ne 0) {
     throw "Unexpected direct DLL imports: $($unexpectedImports -join ', ')."
 }
 
+$subsystemLine = $headersOutput |
+    Where-Object { $_ -match '^\s+([0-9A-Fa-f]+)\s+subsystem \((.+)\)\s*$' } |
+    Select-Object -First 1
+if ($null -eq $subsystemLine -or $subsystemLine -notmatch '^\s+([0-9A-Fa-f]+)\s+subsystem \((.+)\)\s*$') {
+    throw 'Could not read the PE subsystem.'
+}
+$subsystem = [Convert]::ToUInt32($Matches[1], 16)
+$subsystemName = $Matches[2]
+if ($subsystem -ne 2 -or $subsystemName -cne 'Windows GUI') {
+    throw "Expected PE subsystem 2 (Windows GUI); found $subsystem ($subsystemName)."
+}
+
+$resourceLine = $headersOutput |
+    Where-Object {
+        $_ -match '^\s+([0-9A-Fa-f]+)\s+\[\s*([0-9A-Fa-f]+)\]\s+RVA \[size\] of Resource Directory\s*$'
+    } |
+    Select-Object -First 1
+if (
+    $null -eq $resourceLine -or
+    $resourceLine -notmatch '^\s+([0-9A-Fa-f]+)\s+\[\s*([0-9A-Fa-f]+)\]\s+RVA \[size\] of Resource Directory\s*$'
+) {
+    throw 'Could not read the PE resource directory.'
+}
+$resourceRva = [Convert]::ToUInt32($Matches[1], 16)
+$resourceBytes = [Convert]::ToUInt32($Matches[2], 16)
+if ($resourceRva -eq 0 -or $resourceBytes -eq 0) {
+    throw 'The PE resource directory is empty.'
+}
+
+$metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0) {
+    throw 'Could not read Cargo package metadata.'
+}
+$package = $metadata.packages |
+    Where-Object { $_.name -ceq 'windows-cursorpeek' } |
+    Select-Object -First 1
+if ($null -eq $package) {
+    throw 'Cargo metadata did not contain the windows-cursorpeek package.'
+}
+$expectedVersion = [string] $package.version
+$versionInfo = $artifact.VersionInfo
+$expectedVersionFields = [ordered] @{
+    CompanyName = 'CursorPeek contributors'
+    FileDescription = 'File Explorer hover previews'
+    FileVersion = "$expectedVersion.0"
+    InternalName = 'CursorPeek'
+    OriginalFilename = 'CursorPeek.exe'
+    ProductName = 'CursorPeek'
+    ProductVersion = $expectedVersion
+}
+foreach ($field in $expectedVersionFields.GetEnumerator()) {
+    if ([string] $versionInfo.($field.Key) -cne [string] $field.Value) {
+        throw "Version field $($field.Key) is '$($versionInfo.($field.Key))'; expected '$($field.Value)'."
+    }
+}
+
+Add-Type -AssemblyName System.Drawing
+$extractedIcon = [System.Drawing.Icon]::ExtractAssociatedIcon($resolvedExecutable)
+if ($null -eq $extractedIcon) {
+    throw 'The release artifact does not expose an associated application icon.'
+}
+try {
+    $iconWidth = $extractedIcon.Width
+    $iconHeight = $extractedIcon.Height
+    if ($iconWidth -le 0 -or $iconHeight -le 0) {
+        throw 'The extracted application icon has invalid dimensions.'
+    }
+}
+finally {
+    $extractedIcon.Dispose()
+}
+
+$logoPath = Join-Path $PSScriptRoot '..\assets\windows\CursorPeek.png'
+$expectedLogoHash = '096FDCF9A0CEE5DDF83728593FF47AA7B600047317A8E19D21FD730F88BB5AF8'
+$logoHash = (Get-FileHash -LiteralPath $logoPath -Algorithm SHA256).Hash
+if ($logoHash -cne $expectedLogoHash) {
+    throw "The canonical logo hash is $logoHash; expected $expectedLogoHash."
+}
+
 $hash = (Get-FileHash -LiteralPath $resolvedExecutable -Algorithm SHA256).Hash
 $rustVersion = (rustc --version).Trim()
 $cargoVersion = (cargo --version).Trim()
@@ -115,6 +198,18 @@ $evidence = [ordered] @{
         maximum_bytes = $MaximumBytes
         sha256 = $hash
     }
+    pe = [ordered] @{
+        subsystem = $subsystem
+        subsystem_name = $subsystemName
+        resource_rva = $resourceRva
+        resource_bytes = $resourceBytes
+    }
+    version_info = $expectedVersionFields
+    application_icon = [ordered] @{
+        extracted_width = $iconWidth
+        extracted_height = $iconHeight
+        canonical_logo_sha256 = $logoHash
+    }
     direct_imports = $imports
 }
 
@@ -138,6 +233,8 @@ $summary = @"
 | Artifact | ``$($artifact.Name)`` |
 | Size | $($artifact.Length) bytes |
 | SHA-256 | ``$hash`` |
+| PE subsystem | ``$subsystem ($subsystemName)`` |
+| Resources | $resourceBytes bytes; application icon $($iconWidth)x$iconHeight |
 | Direct imports | $($imports.Count) approved system DLL families |
 | Rust | ``$rustVersion`` |
 "@

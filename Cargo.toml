@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.97.1"
 description = "A lightweight native hover-preview utility for Windows File Explorer"
 publish = false
+build = "build.rs"
 
 [[bin]]
 name = "CursorPeek"
@@ -56,6 +57,9 @@ windows = { version = "=0.62.2", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 windows-numerics = { version = "=0.3.1", default-features = false }
+
+[build-dependencies]
+winresource = { version = "=0.1.31", default-features = false }
 
 [profile.release]
 opt-level = "z"

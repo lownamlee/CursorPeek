@@ -68,6 +68,21 @@ fn run_live_page_collector(extra_arguments: &[&str]) -> Output {
         .expect("the live resolver page collector should start")
 }
 
+fn run_icon_generator(extra_arguments: &[&str]) -> Output {
+    Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(repository_path("tools/New-WindowsIcon.ps1"))
+        .args(extra_arguments)
+        .output()
+        .expect("the Windows icon generator should start")
+}
+
 fn example_arguments() -> Vec<String> {
     vec![
         "-ResolverResults".into(),
@@ -84,6 +99,36 @@ fn example_arguments() -> Vec<String> {
 fn run_owned_arguments(arguments: &[String]) -> Output {
     let borrowed = arguments.iter().map(String::as_str).collect::<Vec<_>>();
     run_gate(&borrowed)
+}
+
+#[test]
+fn windows_icon_generator_reproduces_the_checked_in_asset() {
+    let generated = repository_path("target/qualification-tests/CursorPeek.generated.ico");
+    if generated.exists() {
+        fs::remove_file(&generated).expect("the prior generated icon should be removable");
+    }
+
+    let output = run_icon_generator(&[
+        "-InputPath",
+        repository_path("assets/windows/CursorPeek.png")
+            .to_str()
+            .expect("the source logo path should be Unicode"),
+        "-OutputPath",
+        generated
+            .to_str()
+            .expect("the generated icon path should be Unicode"),
+    ]);
+    assert!(
+        output.status.success(),
+        "icon generation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(&generated).expect("the generated icon should be readable"),
+        fs::read(repository_path("assets/windows/CursorPeek.ico"))
+            .expect("the checked-in icon should be readable")
+    );
+    fs::remove_file(generated).expect("the generated icon should be removable");
 }
 
 #[test]
