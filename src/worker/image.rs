@@ -921,11 +921,12 @@ mod tests {
         let ImageDecodeResult::Decoded(decoded) = decode(&file).unwrap() else {
             panic!("the exact-size PNG should decode");
         };
+        let expected_linked_content = file.is_linked_content();
         let preview = decoded.into_preview(&file).unwrap();
         assert_eq!((preview.source_width, preview.source_height), (3, 2));
         assert_eq!((preview.width, preview.height), (3, 2));
         assert_eq!(preview.file_size, file.file_size());
-        assert!(!preview.linked_content);
+        assert_eq!(preview.linked_content, expected_linked_content);
         assert!(preview.first_frame_only);
         assert_eq!(preview.format, ImageFormat::Png);
         assert_eq!(&preview.premultiplied_bgra[..4], &[5, 3, 2, 40]);

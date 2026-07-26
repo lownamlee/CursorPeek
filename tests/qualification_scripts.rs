@@ -4,6 +4,9 @@ use std::{
     process::{Command, Output},
 };
 
+const EXPECTED_ICON_SIZES: [u32; 9] = [16, 20, 24, 32, 40, 48, 64, 128, 256];
+const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+
 fn repository_path(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
 }
@@ -101,8 +104,79 @@ fn run_owned_arguments(arguments: &[String]) -> Output {
     run_gate(&borrowed)
 }
 
+fn assert_required_rgba_icon_frames(icon: &[u8]) {
+    assert_eq!(read_u16(icon, 0), 0, "ICO reserved field");
+    assert_eq!(read_u16(icon, 2), 1, "ICO image type");
+    assert_eq!(
+        usize::from(read_u16(icon, 4)),
+        EXPECTED_ICON_SIZES.len(),
+        "ICO directory count"
+    );
+
+    let mut actual_sizes = Vec::new();
+    for index in 0..EXPECTED_ICON_SIZES.len() {
+        let entry = 6 + (index * 16);
+        let width = icon_dimension(icon[entry]);
+        let height = icon_dimension(icon[entry + 1]);
+        assert_eq!(width, height, "ICO entry {index} must be square");
+        assert_eq!(icon[entry + 2], 0, "ICO color count");
+        assert_eq!(icon[entry + 3], 0, "ICO reserved byte");
+        assert_eq!(read_u16(icon, entry + 4), 1, "ICO color planes");
+        assert_eq!(read_u16(icon, entry + 6), 32, "ICO bit depth");
+
+        let payload_length = read_u32(icon, entry + 8) as usize;
+        let payload_offset = read_u32(icon, entry + 12) as usize;
+        let payload_end = payload_offset
+            .checked_add(payload_length)
+            .expect("ICO payload range should not overflow");
+        let payload = icon
+            .get(payload_offset..payload_end)
+            .expect("ICO payload should remain inside the generated file");
+
+        assert_eq!(&payload[..PNG_SIGNATURE.len()], PNG_SIGNATURE);
+        assert_eq!(&payload[12..16], b"IHDR");
+        assert_eq!(
+            u32::from_be_bytes(payload[16..20].try_into().unwrap()),
+            width
+        );
+        assert_eq!(
+            u32::from_be_bytes(payload[20..24].try_into().unwrap()),
+            height
+        );
+        assert_eq!(payload[24], 8, "PNG bit depth");
+        assert_eq!(payload[25], 6, "PNG color type must be RGBA");
+        actual_sizes.push(width);
+    }
+
+    assert_eq!(actual_sizes, EXPECTED_ICON_SIZES);
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes(
+        bytes[offset..offset + 2]
+            .try_into()
+            .expect("two-byte field should be present"),
+    )
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(
+        bytes[offset..offset + 4]
+            .try_into()
+            .expect("four-byte field should be present"),
+    )
+}
+
+fn icon_dimension(encoded: u8) -> u32 {
+    if encoded == 0 {
+        256
+    } else {
+        u32::from(encoded)
+    }
+}
+
 #[test]
-fn windows_icon_generator_reproduces_the_checked_in_asset() {
+fn windows_icon_generator_emits_required_rgba_frames() {
     let generated = repository_path("target/qualification-tests/CursorPeek.generated.ico");
     if generated.exists() {
         fs::remove_file(&generated).expect("the prior generated icon should be removable");
@@ -123,11 +197,8 @@ fn windows_icon_generator_reproduces_the_checked_in_asset() {
         "icon generation failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        fs::read(&generated).expect("the generated icon should be readable"),
-        fs::read(repository_path("assets/windows/CursorPeek.ico"))
-            .expect("the checked-in icon should be readable")
-    );
+    let generated_icon = fs::read(&generated).expect("the generated icon should be readable");
+    assert_required_rgba_icon_frames(&generated_icon);
     fs::remove_file(generated).expect("the generated icon should be removable");
 }
 

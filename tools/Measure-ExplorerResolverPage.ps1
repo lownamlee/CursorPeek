@@ -71,6 +71,26 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+function Get-Sha256Hex {
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
+
+    $stream = [System.IO.File]::OpenRead($LiteralPath)
+    try {
+        $algorithm = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            return [System.BitConverter]::ToString(
+                $algorithm.ComputeHash($stream)
+            ).Replace("-", "")
+        }
+        finally {
+            $algorithm.Dispose()
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 if ([string]::IsNullOrWhiteSpace($ScenarioMatrix)) {
     $ScenarioMatrix = Join-Path $repoRoot "corpus\scenarios.tsv"
@@ -820,10 +840,10 @@ for ($index = 1; $index -lt $resultLines.Count; $index++) {
     }
 }
 
-$probeHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $probeExecutable).Hash
-$manifestHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $manifestPath).Hash
-$resultsHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $resultsPath).Hash
-$screenshotHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $screenshotPath).Hash
+$probeHash = Get-Sha256Hex -LiteralPath $probeExecutable
+$manifestHash = Get-Sha256Hex -LiteralPath $manifestPath
+$resultsHash = Get-Sha256Hex -LiteralPath $resultsPath
+$screenshotHash = Get-Sha256Hex -LiteralPath $screenshotPath
 $state = [ordered]@{
     status = "passed"
     session_name = $SessionName
