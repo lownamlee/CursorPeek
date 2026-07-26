@@ -38,7 +38,8 @@ pub(crate) fn run(process_mode: ProcessMode) -> Result<(), AppError> {
         | ProcessMode::PreviewWindowDiagnostics
         | ProcessMode::PreviewWindowPracticeDiagnostics
         | ProcessMode::WorkerDiagnostics
-        | ProcessMode::WorkerTimeoutDiagnostics => {
+        | ProcessMode::WorkerTimeoutDiagnostics
+        | ProcessMode::RecoverySoakDiagnostics => {
             Some(ComApartment::initialize(ApartmentKind::SingleThreaded)?)
         }
         ProcessMode::DpiDiagnostics | ProcessMode::PreviewWorker => None,
@@ -93,6 +94,10 @@ pub(crate) fn run(process_mode: ProcessMode) -> Result<(), AppError> {
         ProcessMode::WorkerTimeoutDiagnostics => {
             worker::run_timeout_diagnostic()?;
             println!("Contained worker timeout cleanup completed.");
+        }
+        ProcessMode::RecoverySoakDiagnostics => {
+            let report = MessageWindow::create()?.run_recovery_soak_diagnostics()?;
+            println!("{report}");
         }
         ProcessMode::PreviewWorker => {
             let stdin = io::stdin();

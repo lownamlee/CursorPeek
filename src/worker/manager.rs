@@ -182,6 +182,13 @@ impl WorkerManager {
         })
     }
 
+    pub(crate) fn start_recovery_diagnostics() -> Result<Self, WorkerManagerError> {
+        Self::start_with_config(WorkerManagerConfig {
+            idle_lifetime: DIAGNOSTIC_IDLE_LIFETIME,
+            ..WorkerManagerConfig::default()
+        })
+    }
+
     fn start_with_config(config: WorkerManagerConfig) -> Result<Self, WorkerManagerError> {
         let manager_config = config.clone();
         let requests = Arc::new(LatestRequestMailbox::new());
@@ -210,6 +217,15 @@ impl WorkerManager {
         point: PhysicalScreenPoint,
     ) -> Result<WorkerResolution, WorkerManagerError> {
         self.submit(generation, point)?.wait()
+    }
+
+    pub(crate) fn resolve_diagnostic_session(
+        &self,
+        generation: Generation,
+    ) -> Result<u64, WorkerManagerError> {
+        let resolution = self.resolve(generation, PhysicalScreenPoint::new(0, 0))?;
+        ensure_unavailable(&resolution.result)?;
+        Ok(resolution.session_id)
     }
 
     pub(crate) fn submit(
@@ -275,6 +291,10 @@ impl WorkerManager {
                 Err(WorkerManagerError::ManagerChannelDisconnected)
             }
         }
+    }
+
+    pub(crate) fn wait_for_diagnostic_idle_expiry(&self) -> Result<u64, WorkerManagerError> {
+        self.wait_for_idle_expiry(WORKER_DEADLINE)
     }
 
     pub(crate) fn shutdown(mut self) -> Result<(), WorkerManagerError> {
@@ -967,6 +987,7 @@ pub(crate) enum WorkerManagerError {
     CurrentExecutable(io::Error),
     Process(ProcessError),
     Random(WindowsError),
+    Lifecycle(WindowsError),
     ThreadStart(io::Error),
     Protocol(ProtocolStreamError),
     Stderr(io::Error),
@@ -988,6 +1009,8 @@ pub(crate) enum WorkerManagerError {
     SessionNotReused,
     SessionNotRestarted,
     SessionNotRecycled,
+    UnexpectedLifecycleSignal,
+    UnexpectedLifecycleState,
     SessionIdExhausted,
     UnexpectedExit {
         exit_code: u32,
@@ -1027,6 +1050,7 @@ impl fmt::Display for WorkerManagerError {
             }
             Self::Process(error) => write!(formatter, "contained process failed: {error}"),
             Self::Random(error) => write!(formatter, "session nonce generation failed: {error}"),
+            Self::Lifecycle(error) => write!(formatter, "lifecycle recovery failed: {error}"),
             Self::ThreadStart(error) => write!(formatter, "worker I/O thread failed: {error}"),
             Self::Protocol(error) => write!(formatter, "{error}"),
             Self::Stderr(error) => write!(formatter, "worker stderr drain failed: {error}"),
@@ -1074,6 +1098,18 @@ impl fmt::Display for WorkerManagerError {
             Self::SessionNotRecycled => {
                 write!(formatter, "a recycled worker session was reused")
             }
+            Self::UnexpectedLifecycleSignal => {
+                write!(
+                    formatter,
+                    "the recovery soak produced an unknown lifecycle signal"
+                )
+            }
+            Self::UnexpectedLifecycleState => {
+                write!(
+                    formatter,
+                    "the recovery soak observed an invalid lifecycle state"
+                )
+            }
             Self::SessionIdExhausted => write!(formatter, "worker session IDs were exhausted"),
             Self::UnexpectedExit {
                 exit_code,
@@ -1111,7 +1147,7 @@ impl Error for WorkerManagerError {
                 Some(error)
             }
             Self::Process(error) => Some(error),
-            Self::Random(error) => Some(error),
+            Self::Random(error) | Self::Lifecycle(error) => Some(error),
             Self::Protocol(error) => Some(error),
             Self::RecoveryCleanupFailed { operation, .. }
             | Self::RestartAfterFailure { operation, .. }
@@ -1134,6 +1170,8 @@ impl Error for WorkerManagerError {
             | Self::SessionNotReused
             | Self::SessionNotRestarted
             | Self::SessionNotRecycled
+            | Self::UnexpectedLifecycleSignal
+            | Self::UnexpectedLifecycleState
             | Self::SessionIdExhausted
             | Self::UnexpectedExit { .. }
             | Self::ProtocolThreadPanicked

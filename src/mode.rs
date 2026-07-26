@@ -16,7 +16,7 @@ Options:
   -h, --help           Show this help text
   -V, --version        Show the program version
 
-The DPI, preview-window, preview-worker, and timeout-diagnostic modes are private.
+The DPI, preview-window, preview-worker, recovery-soak, and timeout-diagnostic modes are private.
 ";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -28,6 +28,7 @@ pub(crate) enum ProcessMode {
     PreviewWindowPracticeDiagnostics,
     WorkerDiagnostics,
     WorkerTimeoutDiagnostics,
+    RecoverySoakDiagnostics,
     PreviewWorker,
     #[cfg(feature = "resolver-corpus")]
     ResolverCorpusProbe,
@@ -66,6 +67,7 @@ impl Command {
             Some("--worker-timeout-diagnostics") => {
                 Self::Run(ProcessMode::WorkerTimeoutDiagnostics)
             }
+            Some("--recovery-soak-diagnostics") => Self::Run(ProcessMode::RecoverySoakDiagnostics),
             Some("--preview-worker") => Self::Run(ProcessMode::PreviewWorker),
             #[cfg(feature = "resolver-corpus")]
             Some("--resolver-corpus-probe") => Self::Run(ProcessMode::ResolverCorpusProbe),
@@ -176,6 +178,10 @@ mod tests {
         assert_eq!(
             Command::parse(["--worker-timeout-diagnostics"]),
             Ok(Command::Run(ProcessMode::WorkerTimeoutDiagnostics))
+        );
+        assert_eq!(
+            Command::parse(["--recovery-soak-diagnostics"]),
+            Ok(Command::Run(ProcessMode::RecoverySoakDiagnostics))
         );
     }
 

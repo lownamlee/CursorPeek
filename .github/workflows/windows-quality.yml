@@ -84,6 +84,12 @@ jobs:
             - name: Build release executable
               run: cargo build --locked --release
 
+            - name: Soak worker and Explorer recovery
+              run: >
+                  ./tools/Test-RecoverySoak.ps1
+                  -Executable target/release/CursorPeek.exe
+                  -Runs 2
+
             - name: Verify release artifact
               run: >
                   ./tools/Test-WindowsQuality.ps1

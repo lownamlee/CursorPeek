@@ -32,6 +32,8 @@ use crate::worker::{
 
 use super::{PreviewWindow, StartupRegistration, TrayCommand, TrayIcon, TrayMenuState, TrayStatus};
 
+mod recovery;
+
 use windows::{
     Win32::{
         Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
@@ -98,6 +100,10 @@ impl SystemLifecycleChange {
             5 => Some(Self::Resume),
             _ => None,
         }
+    }
+
+    const fn recycles_worker(self) -> bool {
+        matches!(self, Self::TaskbarCreated | Self::Suspend | Self::Resume)
     }
 }
 
@@ -845,13 +851,6 @@ impl MessageWindow {
         match change {
             SystemLifecycleChange::Suspend | SystemLifecycleChange::Resume => {
                 self.power_suspended = change == SystemLifecycleChange::Suspend;
-                let recycle = self
-                    .worker_manager
-                    .as_ref()
-                    .map(WorkerManager::request_session_recycle);
-                if matches!(recycle, Some(Err(_))) {
-                    self.set_worker_recovering(true);
-                }
             }
             SystemLifecycleChange::TaskbarCreated => {
                 if let Some(tray) = self.tray_icon.as_mut() {
@@ -859,6 +858,16 @@ impl MessageWindow {
                 }
             }
             SystemLifecycleChange::DisplayConfiguration | SystemLifecycleChange::WorkArea => {}
+        }
+
+        if change.recycles_worker() {
+            let recycle = self
+                .worker_manager
+                .as_ref()
+                .map(WorkerManager::request_session_recycle);
+            if matches!(recycle, Some(Err(_))) {
+                self.set_worker_recovering(true);
+            }
         }
         Ok(())
     }
@@ -1652,6 +1661,15 @@ mod tests {
         assert_eq!(tray_status(false, true), TrayStatus::WorkerRecovering);
         assert_eq!(tray_status(true, false), TrayStatus::Paused);
         assert_eq!(tray_status(true, true), TrayStatus::Paused);
+    }
+
+    #[test]
+    fn shell_and_power_lifecycle_changes_recycle_the_worker() {
+        assert!(SystemLifecycleChange::TaskbarCreated.recycles_worker());
+        assert!(SystemLifecycleChange::Suspend.recycles_worker());
+        assert!(SystemLifecycleChange::Resume.recycles_worker());
+        assert!(!SystemLifecycleChange::DisplayConfiguration.recycles_worker());
+        assert!(!SystemLifecycleChange::WorkArea.recycles_worker());
     }
 
     #[test]
