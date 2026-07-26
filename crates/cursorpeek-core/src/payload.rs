@@ -1,24 +1,23 @@
 use std::{error::Error, fmt};
 
-pub(super) const MAX_PREVIEW_PAYLOAD_LEN: usize = 4 * 1024 * 1024;
-pub(super) const MIN_PREVIEW_RESULT_LEN: usize = 8;
-pub(super) const MAX_TEXT_UTF8_LEN: usize = 128 * 1024;
-pub(super) const MAX_TEXT_SCALARS: usize = 32_000;
-pub(super) const MAX_TEXT_LINES: usize = 200;
-pub(super) const MAX_ENCODING_LABEL_LEN: usize = 40;
-pub(super) const MAX_SOURCE_IMAGE_AXIS: u32 = 20_000;
-pub(super) const MAX_SOURCE_IMAGE_PIXELS: u64 = 40_000_000;
-pub(super) const MAX_PREVIEW_IMAGE_WIDTH: u32 = 960;
-pub(super) const MAX_PREVIEW_IMAGE_HEIGHT: u32 = 720;
+pub use crate::layout::{
+    BGRA_BYTES_PER_PIXEL, IMAGE_FIXED_LEN, MAX_PREVIEW_IMAGE_HEIGHT, MAX_PREVIEW_IMAGE_WIDTH,
+    MAX_PREVIEW_PAYLOAD_LEN, MAX_SOURCE_IMAGE_AXIS, MAX_SOURCE_IMAGE_PIXELS,
+    fitted_preview_dimensions,
+};
+use crate::layout::{LayoutError, checked_bgra_layout};
+
+pub const MIN_PREVIEW_RESULT_LEN: usize = 8;
+pub const MAX_TEXT_UTF8_LEN: usize = 128 * 1024;
+pub const MAX_TEXT_SCALARS: usize = 32_000;
+pub const MAX_TEXT_LINES: usize = 200;
+pub const MAX_ENCODING_LABEL_LEN: usize = 40;
 
 const RESULT_STATUS: u32 = 0;
 const RESULT_TEXT: u32 = 1;
 const RESULT_IMAGE: u32 = 2;
 const STATUS_PAYLOAD_LEN: usize = 8;
 const TEXT_FIXED_LEN: usize = 24;
-pub(super) const IMAGE_FIXED_LEN: usize = 40;
-pub(super) const BGRA_BYTES_PER_PIXEL: usize = 4;
-
 const FLAG_LINKED_CONTENT: u32 = 1 << 0;
 const FLAG_TEXT_ENCODING_GUESSED: u32 = 1 << 1;
 const FLAG_TEXT_TRUNCATED: u32 = 1 << 2;
@@ -27,7 +26,7 @@ const FLAG_IMAGE_FIRST_FRAME_ONLY: u32 = 1 << 1;
 const IMAGE_FLAGS: u32 = FLAG_LINKED_CONTENT | FLAG_IMAGE_FIRST_FRAME_ONLY;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ResolverStatus {
+pub enum ResolverStatus {
     Resolved = 0,
     Unsupported = 1,
     Ambiguous = 2,
@@ -49,7 +48,7 @@ impl ResolverStatus {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ImageFormat {
+pub enum ImageFormat {
     Jpeg = 0,
     Png = 1,
     Gif = 2,
@@ -75,37 +74,37 @@ impl ImageFormat {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TextPreview {
-    pub(crate) file_size: u64,
-    pub(crate) linked_content: bool,
-    pub(crate) encoding_was_guessed: bool,
-    pub(crate) truncated: bool,
-    pub(crate) encoding: String,
-    pub(crate) text: String,
+pub struct TextPreview {
+    pub file_size: u64,
+    pub linked_content: bool,
+    pub encoding_was_guessed: bool,
+    pub truncated: bool,
+    pub encoding: String,
+    pub text: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ImagePreview {
-    pub(crate) file_size: u64,
-    pub(crate) linked_content: bool,
-    pub(crate) first_frame_only: bool,
-    pub(crate) format: ImageFormat,
-    pub(crate) source_width: u32,
-    pub(crate) source_height: u32,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) premultiplied_bgra: Vec<u8>,
+pub struct ImagePreview {
+    pub file_size: u64,
+    pub linked_content: bool,
+    pub first_frame_only: bool,
+    pub format: ImageFormat,
+    pub source_width: u32,
+    pub source_height: u32,
+    pub width: u32,
+    pub height: u32,
+    pub premultiplied_bgra: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum PreviewResult {
+pub enum PreviewResult {
     Status(ResolverStatus),
     Text(TextPreview),
     Image(ImagePreview),
 }
 
 impl PreviewResult {
-    pub(super) const fn status(&self) -> Option<ResolverStatus> {
+    pub const fn status(&self) -> Option<ResolverStatus> {
         match self {
             Self::Status(status) => Some(*status),
             Self::Text(_) | Self::Image(_) => None,
@@ -113,7 +112,7 @@ impl PreviewResult {
     }
 }
 
-pub(super) fn encode_result(result: &PreviewResult) -> Result<Vec<u8>, PayloadError> {
+pub fn encode_result(result: &PreviewResult) -> Result<Vec<u8>, PayloadError> {
     let mut output = Vec::new();
     match result {
         PreviewResult::Status(status) => {
@@ -183,7 +182,7 @@ pub(super) fn encode_result(result: &PreviewResult) -> Result<Vec<u8>, PayloadEr
     Ok(output)
 }
 
-pub(super) fn decode_result(bytes: &[u8]) -> Result<PreviewResult, PayloadError> {
+pub fn decode_result(bytes: &[u8]) -> Result<PreviewResult, PayloadError> {
     if !(MIN_PREVIEW_RESULT_LEN..=MAX_PREVIEW_PAYLOAD_LEN).contains(&bytes.len()) {
         return Err(PayloadError::PayloadLengthOutOfRange {
             actual: bytes.len(),
@@ -320,11 +319,11 @@ fn validate_text(preview: &TextPreview) -> Result<(), PayloadError> {
     Ok(())
 }
 
-pub(super) const fn is_noncanonical_text_line_break(scalar: char) -> bool {
+pub const fn is_noncanonical_text_line_break(scalar: char) -> bool {
     matches!(scalar, '\r' | '\u{0085}' | '\u{2028}' | '\u{2029}')
 }
 
-pub(super) const fn is_unsafe_text_control(scalar: char) -> bool {
+pub const fn is_unsafe_text_control(scalar: char) -> bool {
     matches!(
         scalar,
         '\u{0000}'..='\u{0008}'
@@ -336,42 +335,6 @@ pub(super) const fn is_unsafe_text_control(scalar: char) -> bool {
             | '\u{2066}'..='\u{206f}'
             | '\u{feff}'
     )
-}
-
-pub(super) fn fitted_preview_dimensions(
-    source_width: u32,
-    source_height: u32,
-) -> Option<(u32, u32)> {
-    if source_width == 0 || source_height == 0 {
-        return None;
-    }
-
-    let width_bound = source_width.min(MAX_PREVIEW_IMAGE_WIDTH);
-    let height_bound = source_height.min(MAX_PREVIEW_IMAGE_HEIGHT);
-    if (width_bound, height_bound) == (source_width, source_height) {
-        return Some((source_width, source_height));
-    }
-
-    let round_ratio = |value: u32, numerator: u32, denominator: u32| {
-        u64::from(value)
-            .checked_mul(u64::from(numerator))?
-            .checked_add(u64::from(denominator) / 2)?
-            .checked_div(u64::from(denominator))
-            .and_then(|result| u32::try_from(result.max(1)).ok())
-    };
-    if u64::from(width_bound) * u64::from(source_height)
-        <= u64::from(height_bound) * u64::from(source_width)
-    {
-        Some((
-            width_bound,
-            round_ratio(source_height, width_bound, source_width)?.min(height_bound),
-        ))
-    } else {
-        Some((
-            round_ratio(source_width, height_bound, source_height)?.min(width_bound),
-            height_bound,
-        ))
-    }
 }
 
 fn validate_image(preview: &ImagePreview) -> Result<(), PayloadError> {
@@ -418,15 +381,14 @@ fn validate_image(preview: &ImagePreview) -> Result<(), PayloadError> {
         });
     }
 
-    let expected = usize::try_from(preview.width)
-        .ok()
-        .and_then(|width| width.checked_mul(BGRA_BYTES_PER_PIXEL))
-        .and_then(|stride| {
-            usize::try_from(preview.height)
-                .ok()
-                .and_then(|height| stride.checked_mul(height))
-        })
-        .ok_or(PayloadError::LengthOverflow)?;
+    let (_, expected) =
+        checked_bgra_layout(preview.width, preview.height).map_err(|error| match error {
+            LayoutError::InvalidDimensions { width, height } => {
+                PayloadError::InvalidPreviewDimensions { width, height }
+            }
+            LayoutError::ArithmeticOverflow => PayloadError::LengthOverflow,
+            LayoutError::PayloadTooLarge { actual } => PayloadError::PayloadTooLarge { actual },
+        })?;
     if preview.premultiplied_bgra.len() != expected {
         return Err(PayloadError::InvalidPixelLength {
             expected,
@@ -519,7 +481,7 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) enum PayloadError {
+pub enum PayloadError {
     PayloadLengthOutOfRange {
         actual: usize,
     },

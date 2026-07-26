@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "crates/cursorpeek-core"]
+resolver = "3"
+
 [package]
 name = "windows-cursorpeek"
 version = "0.1.0"
@@ -19,6 +23,7 @@ resolver-corpus = []
 [dependencies]
 chardetng = { version = "=1.0.0", default-features = false }
 codepage = { version = "=0.1.2", default-features = false }
+cursorpeek-core = { version = "=0.1.0", path = "crates/cursorpeek-core" }
 encoding_rs = { version = "=0.8.35", default-features = false, features = ["alloc"] }
 image = { version = "=0.25.10", default-features = false, features = [
     "bmp",

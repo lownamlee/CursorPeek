@@ -56,18 +56,18 @@ jobs:
               run: cargo fmt --all -- --check
 
             - name: Test default features
-              run: cargo test --locked
+              run: cargo test --locked --workspace
 
             - name: Test all features
-              run: cargo test --locked --all-features
+              run: cargo test --locked --workspace --all-features
 
             - name: Deny Clippy warnings
-              run: cargo clippy --locked --all-targets --all-features -- -D warnings
+              run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
             - name: Record resolved feature graph
               run: |
                   New-Item -ItemType Directory -Force target/windows-quality | Out-Null
-                  cargo tree --locked -e features |
+                  cargo tree --locked --workspace -e features |
                     Tee-Object -FilePath target/windows-quality/cargo-features.txt
 
             - name: Build release executable

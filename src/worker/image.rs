@@ -1,4 +1,4 @@
-use std::{error::Error, fmt, io::BufReader, path::Path};
+use std::{error::Error, fmt, io::BufReader};
 
 #[cfg(test)]
 pub(super) mod corpus;
@@ -12,11 +12,18 @@ use ::image::{
     imageops::{self, FilterType},
     metadata::Orientation,
 };
+#[cfg(test)]
+use cursorpeek_core::sniff::IMAGE_EXTENSIONS;
+pub(super) use cursorpeek_core::sniff::is_image_eligible_path as is_eligible_path;
+use cursorpeek_core::{
+    layout::{LayoutError, checked_bgra_layout as core_checked_bgra_layout},
+    sniff::sniff_image_format,
+};
 
 use super::{
     file::{PreviewFile, PreviewFileError},
     payload::{
-        BGRA_BYTES_PER_PIXEL, IMAGE_FIXED_LEN, ImageFormat, ImagePreview, MAX_PREVIEW_IMAGE_HEIGHT,
+        BGRA_BYTES_PER_PIXEL, ImageFormat, ImagePreview, MAX_PREVIEW_IMAGE_HEIGHT,
         MAX_PREVIEW_IMAGE_WIDTH, MAX_PREVIEW_PAYLOAD_LEN, MAX_SOURCE_IMAGE_AXIS,
         MAX_SOURCE_IMAGE_PIXELS, fitted_preview_dimensions,
     },
@@ -26,10 +33,6 @@ const MAGIC_PREFIX_LEN: usize = 16;
 const MAX_IMAGE_FILE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_DECODED_IMAGE_BYTES: u64 = 160 * 1024 * 1024;
 const MAX_DECODER_ALLOC_BYTES: u64 = 256 * 1024 * 1024;
-
-const IMAGE_EXTENSIONS: &[&str] = &[
-    "jpg", "jpeg", "jpe", "jfif", "png", "gif", "webp", "bmp", "dib", "ico", "tif", "tiff",
-];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ValidatedImage {
@@ -220,12 +223,11 @@ fn selected_format(
     }
 
     let prefix = file.read_prefix(MAGIC_PREFIX_LEN)?;
-    let Ok(decoder_format) = ::image::guess_format(&prefix) else {
+    let Some(sniffed) = sniff_image_format(&prefix) else {
         return Ok(None);
     };
-    let Some(format) = supported_format(decoder_format) else {
-        return Ok(None);
-    };
+    let decoder_format = sniffed.decoder;
+    let format = sniffed.preview;
     if !decoder_format.reading_enabled() {
         return Ok(None);
     }
@@ -375,29 +377,6 @@ fn decoder_limits() -> Limits {
     limits
 }
 
-pub(super) fn is_eligible_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            IMAGE_EXTENSIONS
-                .iter()
-                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
-        })
-}
-
-fn supported_format(format: DecoderFormat) -> Option<ImageFormat> {
-    match format {
-        DecoderFormat::Jpeg => Some(ImageFormat::Jpeg),
-        DecoderFormat::Png => Some(ImageFormat::Png),
-        DecoderFormat::Gif => Some(ImageFormat::Gif),
-        DecoderFormat::WebP => Some(ImageFormat::WebP),
-        DecoderFormat::Bmp => Some(ImageFormat::Bmp),
-        DecoderFormat::Ico => Some(ImageFormat::Ico),
-        DecoderFormat::Tiff => Some(ImageFormat::Tiff),
-        _ => None,
-    }
-}
-
 fn validate_source_layout(
     width: u32,
     height: u32,
@@ -425,30 +404,15 @@ pub(super) fn checked_bgra_layout(
     width: u32,
     height: u32,
 ) -> Result<(usize, usize), ImageValidationError> {
-    if width == 0
-        || height == 0
-        || width > MAX_PREVIEW_IMAGE_WIDTH
-        || height > MAX_PREVIEW_IMAGE_HEIGHT
-    {
-        return Err(ImageValidationError::InvalidPreviewDimensions { width, height });
-    }
-    let stride = usize::try_from(width)
-        .ok()
-        .and_then(|value| value.checked_mul(BGRA_BYTES_PER_PIXEL))
-        .ok_or(ImageValidationError::ArithmeticOverflow)?;
-    let length = usize::try_from(height)
-        .ok()
-        .and_then(|value| stride.checked_mul(value))
-        .ok_or(ImageValidationError::ArithmeticOverflow)?;
-    let wire_length = IMAGE_FIXED_LEN
-        .checked_add(length)
-        .ok_or(ImageValidationError::ArithmeticOverflow)?;
-    if wire_length > MAX_PREVIEW_PAYLOAD_LEN {
-        return Err(ImageValidationError::PreviewPayloadTooLarge {
-            actual: wire_length,
-        });
-    }
-    Ok((stride, length))
+    core_checked_bgra_layout(width, height).map_err(|error| match error {
+        LayoutError::InvalidDimensions { width, height } => {
+            ImageValidationError::InvalidPreviewDimensions { width, height }
+        }
+        LayoutError::ArithmeticOverflow => ImageValidationError::ArithmeticOverflow,
+        LayoutError::PayloadTooLarge { actual } => {
+            ImageValidationError::PreviewPayloadTooLarge { actual }
+        }
+    })
 }
 
 #[derive(Debug)]
