@@ -1,0 +1,77 @@
+name: Bug report
+description: Report a reproducible CursorPeek problem
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Do not include security-sensitive details here; use the private process in SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: CursorPeek version or commit
+      description: Use the version shown by CursorPeek or the tested commit hash.
+      placeholder: 0.1.0 or a full commit hash
+    validations:
+      required: true
+  - type: dropdown
+    id: windows
+    attributes:
+      label: Windows version
+      options:
+        - Windows 10 22H2
+        - Windows 11
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: distribution
+    attributes:
+      label: How CursorPeek was run
+      options:
+        - Local development build
+        - Portable package
+        - Installed package
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Include the file type, Explorer view, display scaling, and input device when relevant.
+      placeholder: |
+        1. Open File Explorer...
+        2. Hover over...
+        3. Observe...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include exact error text and non-sensitive diagnostic output when available.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add screenshots or minimal redistributable fixtures if they help. Remove personal paths and content.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues for the same problem.
+          required: true
+        - label: This report contains no private file contents, credentials, or undisclosed vulnerability details.
+          required: true

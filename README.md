@@ -31,3 +31,14 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 cargo build --release
 ```
+
+## Contributing
+
+Bug reports, focused feature proposals, documentation improvements, and code contributions are
+welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Please report
+security issues privately as described in [SECURITY.md](SECURITY.md).
+
+## License
+
+CursorPeek is available under your choice of the
+[Apache License 2.0](LICENSE-APACHE) or the [MIT License](LICENSE-MIT).
