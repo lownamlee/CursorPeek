@@ -23,9 +23,10 @@ From PowerShell:
 
 ```powershell
 cargo fmt --all -- --check
-cargo test --locked
-cargo test --locked --all-features
-cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo fmt --manifest-path fuzz/Cargo.toml --all -- --check
+cargo test --locked --workspace
+cargo test --locked --workspace --all-features
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 cargo build --locked --release
 ```
 
@@ -37,7 +38,8 @@ Changes to Windows resources or the release executable should also run:
 
 Tests that exercise shared qualification paths must run sequentially. Real Explorer behavior,
 focus, DPI, input, sleep, and packaging changes need reviewable Windows evidence in addition to
-unit tests.
+unit tests. The platform-neutral parser fuzz targets have a separate pinned setup documented in
+[fuzz/README.md](fuzz/README.md).
 
 ## Design expectations
 

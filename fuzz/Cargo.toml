@@ -1,0 +1,45 @@
+[package]
+name = "cursorpeek-fuzz"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+cursorpeek-core = { version = "=0.1.0", path = "../crates/cursorpeek-core" }
+libfuzzer-sys = "=0.4.13"
+
+[[bin]]
+name = "protocol"
+path = "fuzz_targets/protocol.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "payload"
+path = "fuzz_targets/payload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "content_sniff"
+path = "fuzz_targets/content_sniff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "layout"
+path = "fuzz_targets/layout.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
+resolver = "3"

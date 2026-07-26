@@ -1,1 +1,2 @@
 *.tsv text eol=lf whitespace=-blank-at-eol
+fuzz/corpus/** binary
