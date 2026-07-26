@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use encoding_rs::{Encoding, UTF_8, UTF_16BE, UTF_16LE, X_USER_DEFINED};
+pub(crate) use cursorpeek_core::LegacyEncoding;
 use windows::{
     Win32::{
         Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW},
@@ -38,8 +38,6 @@ const MIN_PREVIEW_WIDTH: u16 = 320;
 const MAX_PREVIEW_WIDTH: u16 = 960;
 const MIN_PREVIEW_HEIGHT: u16 = 240;
 const MAX_PREVIEW_HEIGHT: u16 = 720;
-const MAX_ENCODING_LABEL_BYTES: usize = 40;
-
 static NEXT_TEMPORARY_FILE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,35 +68,6 @@ impl Theme {
             Self::System => "system",
             Self::Light => "light",
             Self::Dark => "dark",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum LegacyEncoding {
-    Auto,
-    System,
-    Off,
-    Label(String),
-}
-
-impl LegacyEncoding {
-    pub(crate) fn parse(value: &str) -> Option<Self> {
-        match value {
-            "auto" => Some(Self::Auto),
-            "system" => Some(Self::System),
-            "off" => Some(Self::Off),
-            _ => supported_legacy_encoding(value)
-                .map(|encoding| Self::Label(encoding.name().to_ascii_lowercase())),
-        }
-    }
-
-    pub(crate) fn as_str(&self) -> &str {
-        match self {
-            Self::Auto => "auto",
-            Self::System => "system",
-            Self::Off => "off",
-            Self::Label(label) => label,
         }
     }
 }
@@ -695,30 +664,6 @@ fn parse_bounded_integer(
         Ok(parsed)
     } else {
         Err(SettingsParseError::new(line, range_error))
-    }
-}
-
-fn is_encoding_label(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= MAX_ENCODING_LABEL_BYTES
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-}
-
-fn supported_legacy_encoding(value: &str) -> Option<&'static Encoding> {
-    if !is_encoding_label(value) {
-        return None;
-    }
-    let encoding = Encoding::for_label_no_replacement(value.as_bytes())?;
-    if encoding == UTF_8
-        || encoding == UTF_16LE
-        || encoding == UTF_16BE
-        || encoding == X_USER_DEFINED
-    {
-        None
-    } else {
-        Some(encoding)
     }
 }
 

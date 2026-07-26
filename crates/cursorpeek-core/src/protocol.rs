@@ -5,13 +5,11 @@ use std::{
 };
 
 use crate::{
-    hover::{Generation, PhysicalScreenPoint},
-    settings::LegacyEncoding,
-};
-
-use super::payload::{
-    MAX_PREVIEW_PAYLOAD_LEN, MIN_PREVIEW_RESULT_LEN, PayloadError, PreviewResult, decode_result,
-    encode_result,
+    Generation, LegacyEncoding, PhysicalScreenPoint,
+    payload::{
+        MAX_PREVIEW_PAYLOAD_LEN, MIN_PREVIEW_RESULT_LEN, PayloadError, PreviewResult,
+        decode_result, encode_result,
+    },
 };
 
 const MAGIC: [u8; 4] = *b"CPWK";
@@ -21,16 +19,16 @@ const NONCE_LEN: usize = 16;
 const MAX_LEGACY_ENCODING_WIRE_LEN: usize = 40;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct SessionNonce([u8; NONCE_LEN]);
+pub struct SessionNonce([u8; NONCE_LEN]);
 
 impl SessionNonce {
-    pub(super) const fn from_bytes(bytes: [u8; NONCE_LEN]) -> Self {
+    pub const fn from_bytes(bytes: [u8; NONCE_LEN]) -> Self {
         Self(bytes)
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum WorkerMessage {
+pub enum WorkerMessage {
     Hello {
         nonce: SessionNonce,
         legacy_encoding: LegacyEncoding,
@@ -156,7 +154,7 @@ impl FrameHeader {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) enum ProtocolError {
+pub enum ProtocolError {
     #[cfg(test)]
     TruncatedHeader {
         actual: usize,
@@ -260,7 +258,7 @@ impl From<PayloadError> for ProtocolError {
 }
 
 #[derive(Debug)]
-pub(crate) enum ProtocolStreamError {
+pub enum ProtocolStreamError {
     Io(io::Error),
     TruncatedFrame,
     InvalidReadCount(usize),
@@ -299,9 +297,7 @@ impl From<ProtocolError> for ProtocolStreamError {
     }
 }
 
-pub(super) fn read_message<R: Read>(
-    reader: &mut R,
-) -> Result<Option<WorkerMessage>, ProtocolStreamError> {
+pub fn read_message<R: Read>(reader: &mut R) -> Result<Option<WorkerMessage>, ProtocolStreamError> {
     let mut header_bytes = [0_u8; HEADER_LEN];
     if !read_first_byte(reader, &mut header_bytes[0])? {
         return Ok(None);
@@ -317,7 +313,7 @@ pub(super) fn read_message<R: Read>(
         .map_err(Into::into)
 }
 
-pub(super) fn write_message<W: Write>(
+pub fn write_message<W: Write>(
     writer: &mut W,
     message: WorkerMessage,
 ) -> Result<(), ProtocolStreamError> {
@@ -482,9 +478,10 @@ mod tests {
         HEADER_LEN, MAGIC, NONCE_LEN, ProtocolError, ProtocolStreamError, SessionNonce, VERSION,
         WorkerMessage, decode_frame, encode_message, read_message, write_message,
     };
-    use crate::hover::{Generation, PhysicalScreenPoint};
-    use crate::settings::LegacyEncoding;
-    use crate::worker::payload::{PayloadError, PreviewResult, ResolverStatus, TextPreview};
+    use crate::{
+        Generation, LegacyEncoding, PhysicalScreenPoint,
+        payload::{PayloadError, PreviewResult, ResolverStatus, TextPreview},
+    };
     use std::io::{self, ErrorKind, Read, Write};
 
     const NONCE: SessionNonce = SessionNonce::from_bytes([

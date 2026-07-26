@@ -2,9 +2,15 @@ mod cache;
 mod file;
 mod image;
 mod manager;
-mod payload;
-mod protocol;
 mod text;
+
+mod payload {
+    pub(crate) use cursorpeek_core::payload::*;
+}
+
+mod protocol {
+    pub(crate) use cursorpeek_core::protocol::*;
+}
 
 use std::{
     error::Error,

@@ -1,33 +1,10 @@
 use std::time::{Duration, Instant};
 
+use super::{Generation, PhysicalScreenPoint};
+
 pub(crate) const DEFAULT_DWELL_DELAY: Duration = Duration::from_millis(400);
 const BASE_DPI: u32 = 96;
 const MIN_HOVER_DIMENSION: u32 = 4;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PhysicalScreenPoint {
-    pub(crate) x: i32,
-    pub(crate) y: i32,
-}
-
-impl PhysicalScreenPoint {
-    pub(crate) fn new(x: i32, y: i32) -> Self {
-        Self { x, y }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct Generation(u64);
-
-impl Generation {
-    pub(crate) const fn from_raw(value: u64) -> Self {
-        Self(value)
-    }
-
-    pub(crate) const fn get(self) -> u64 {
-        self.0
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HoverRectangle {
@@ -167,7 +144,7 @@ impl HoverState {
     }
 
     fn advance_generation(&mut self) {
-        self.generation = Generation(self.generation.0.wrapping_add(1));
+        self.generation = Generation::from_raw(self.generation.get().wrapping_add(1));
     }
 }
 
@@ -219,7 +196,7 @@ mod tests {
         assert_eq!(
             state.on_timer(start + DEFAULT_DWELL_DELAY),
             DwellTimerEvent::Candidate(DwellCandidate {
-                generation: Generation(1),
+                generation: Generation::from_raw(1),
                 anchor: FIRST_POINT,
             })
         );
@@ -244,7 +221,7 @@ mod tests {
         assert_eq!(
             state.on_timer(start + Duration::from_millis(700)),
             DwellTimerEvent::Candidate(DwellCandidate {
-                generation: Generation(2),
+                generation: Generation::from_raw(2),
                 anchor: SECOND_POINT,
             })
         );
@@ -267,7 +244,7 @@ mod tests {
         assert_eq!(
             state.on_timer(start + replacement),
             DwellTimerEvent::Candidate(DwellCandidate {
-                generation: Generation(3),
+                generation: Generation::from_raw(3),
                 anchor: SECOND_POINT,
             })
         );
@@ -293,14 +270,14 @@ mod tests {
     fn generation_wraps_without_panicking() {
         let start = Instant::now();
         let mut state = HoverState::new(DEFAULT_DWELL_DELAY);
-        state.generation = Generation(u64::MAX);
+        state.generation = Generation::from_raw(u64::MAX);
 
         state.restart(FIRST_POINT, start);
 
         assert_eq!(
             state.on_timer(start + DEFAULT_DWELL_DELAY),
             DwellTimerEvent::Candidate(DwellCandidate {
-                generation: Generation(0),
+                generation: Generation::from_raw(0),
                 anchor: FIRST_POINT,
             })
         );
@@ -365,7 +342,7 @@ mod tests {
     #[test]
     fn candidate_validation_emits_only_the_current_in_bounds_point() {
         let candidate = DwellCandidate {
-            generation: Generation(7),
+            generation: Generation::from_raw(7),
             anchor: FIRST_POINT,
         };
         let rectangle = HoverRectangle::from_96_dpi(4, 4, 96).unwrap();
@@ -374,7 +351,7 @@ mod tests {
         assert_eq!(
             candidate.validate(current, rectangle),
             Some(ReadyDwell {
-                generation: Generation(7),
+                generation: Generation::from_raw(7),
                 point: current,
             })
         );
