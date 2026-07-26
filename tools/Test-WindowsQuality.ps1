@@ -16,6 +16,26 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Get-Sha256Hex {
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
+
+    $stream = [System.IO.File]::OpenRead($LiteralPath)
+    try {
+        $algorithm = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            return [System.BitConverter]::ToString(
+                $algorithm.ComputeHash($stream)
+            ).Replace("-", "")
+        }
+        finally {
+            $algorithm.Dispose()
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
 $resolvedExecutable = (Resolve-Path -LiteralPath $Executable).Path
 $artifact = Get-Item -LiteralPath $resolvedExecutable
 if ($artifact.Length -gt $MaximumBytes) {
@@ -165,12 +185,12 @@ finally {
 
 $logoPath = Join-Path $PSScriptRoot '..\assets\windows\CursorPeek.png'
 $expectedLogoHash = '096FDCF9A0CEE5DDF83728593FF47AA7B600047317A8E19D21FD730F88BB5AF8'
-$logoHash = (Get-FileHash -LiteralPath $logoPath -Algorithm SHA256).Hash
+$logoHash = Get-Sha256Hex -LiteralPath $logoPath
 if ($logoHash -cne $expectedLogoHash) {
     throw "The canonical logo hash is $logoHash; expected $expectedLogoHash."
 }
 
-$hash = (Get-FileHash -LiteralPath $resolvedExecutable -Algorithm SHA256).Hash
+$hash = Get-Sha256Hex -LiteralPath $resolvedExecutable
 $rustVersion = (rustc --version).Trim()
 $cargoVersion = (cargo --version).Trim()
 if ($LASTEXITCODE -ne 0) {
