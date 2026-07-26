@@ -1,4 +1,4 @@
-use std::{error::Error, fmt, io};
+use std::{error::Error, fmt, io, time::Instant};
 
 #[cfg(feature = "resolver-corpus")]
 use crate::corpus;
@@ -13,11 +13,12 @@ use crate::{
     },
     preview::PreviewSize,
     resolver::{ExplorerResolver, ResolverError},
-    settings::{SettingsError, SettingsFile},
+    settings::{SettingsDocument, SettingsError, SettingsFile},
     worker::{self, WorkerManagerError, WorkerSessionError},
 };
 
 pub(crate) fn run(process_mode: ProcessMode) -> Result<(), AppError> {
+    let startup_started = Instant::now();
     verify_per_monitor_v2()?;
 
     let _single_instance_guard = if process_mode == ProcessMode::Main {
@@ -39,7 +40,8 @@ pub(crate) fn run(process_mode: ProcessMode) -> Result<(), AppError> {
         | ProcessMode::PreviewWindowPracticeDiagnostics
         | ProcessMode::WorkerDiagnostics
         | ProcessMode::WorkerTimeoutDiagnostics
-        | ProcessMode::RecoverySoakDiagnostics => {
+        | ProcessMode::RecoverySoakDiagnostics
+        | ProcessMode::PerformanceDiagnostics => {
             Some(ComApartment::initialize(ApartmentKind::SingleThreaded)?)
         }
         ProcessMode::DpiDiagnostics | ProcessMode::PreviewWorker => None,
@@ -97,6 +99,25 @@ pub(crate) fn run(process_mode: ProcessMode) -> Result<(), AppError> {
         }
         ProcessMode::RecoverySoakDiagnostics => {
             let report = MessageWindow::create()?.run_recovery_soak_diagnostics()?;
+            println!("{report}");
+        }
+        ProcessMode::PerformanceDiagnostics => {
+            let settings = SettingsDocument::default();
+            let preview_size = PreviewSize::new(
+                u32::from(settings.settings().preview_width()),
+                u32::from(settings.settings().preview_height()),
+            );
+            let message_window = MessageWindow::create_for_application(
+                settings.settings().dwell_delay(),
+                preview_size,
+            )?;
+            let worker_manager =
+                worker::WorkerManager::start(settings.settings().legacy_encoding().clone())?;
+            let report = message_window.run_performance_diagnostics(
+                worker_manager,
+                settings,
+                startup_started,
+            )?;
             println!("{report}");
         }
         ProcessMode::PreviewWorker => {

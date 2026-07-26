@@ -32,7 +32,10 @@ use crate::worker::{
 
 use super::{PreviewWindow, StartupRegistration, TrayCommand, TrayIcon, TrayMenuState, TrayStatus};
 
+mod performance;
 mod recovery;
+
+use performance::ActivePerformanceDiagnostics;
 
 use windows::{
     Win32::{
@@ -71,6 +74,7 @@ const INPUT_SAMPLE_TIMER_ID: usize = 2;
 const INPUT_DIAGNOSTIC_DEADLINE_TIMER_ID: usize = 3;
 const PREVIEW_DIAGNOSTIC_DEADLINE_TIMER_ID: usize = 4;
 const PREVIEW_GUARD_TIMER_ID: usize = 5;
+const PERFORMANCE_DIAGNOSTIC_DEADLINE_TIMER_ID: usize = 6;
 const PREVIEW_GUARD_INTERVAL: Duration = Duration::from_millis(125);
 static TASKBAR_CREATED_MESSAGE: AtomicU32 = AtomicU32::new(0);
 
@@ -125,6 +129,7 @@ pub(crate) struct MessageWindow {
     preview_size: PreviewSize,
     input_diagnostics: Option<InputDiagnostics>,
     preview_diagnostics: Option<ActivePreviewDiagnostics>,
+    performance_diagnostics: Option<ActivePerformanceDiagnostics>,
     preview_window: Option<PreviewWindow>,
     tray_icon: Option<TrayIcon>,
     settings_file: Option<SettingsFile>,
@@ -198,6 +203,7 @@ impl MessageWindow {
             preview_size,
             input_diagnostics: None,
             preview_diagnostics: None,
+            performance_diagnostics: None,
             preview_window: None,
             tray_icon: None,
             settings_file: None,
@@ -267,7 +273,9 @@ impl MessageWindow {
 
         match exit {
             MessageLoopExit::Shutdown => Ok(()),
-            MessageLoopExit::InputDiagnostics(_) | MessageLoopExit::PreviewDiagnostics(_) => {
+            MessageLoopExit::InputDiagnostics(_)
+            | MessageLoopExit::PreviewDiagnostics(_)
+            | MessageLoopExit::PerformanceDiagnostics(_) => {
                 unreachable!("normal application mode cannot complete a diagnostic")
             }
         }
@@ -299,6 +307,9 @@ impl MessageWindow {
             MessageLoopExit::InputDiagnostics(report) => Ok(report),
             MessageLoopExit::PreviewDiagnostics(_) => {
                 unreachable!("input-coverage diagnostics cannot run a preview-window diagnostic")
+            }
+            MessageLoopExit::PerformanceDiagnostics(_) => {
+                unreachable!("input-coverage diagnostics cannot run a performance diagnostic")
             }
         }
     }
@@ -336,7 +347,7 @@ impl MessageWindow {
             ui_thread_max: Duration::ZERO,
             _deadline_timer: deadline_timer,
         });
-        self.record_preview_ui_task(ui_task_started.elapsed());
+        self.record_ui_task(ui_task_started.elapsed());
 
         match self.run_loop()? {
             MessageLoopExit::PreviewDiagnostics(report) => Ok(report),
@@ -345,6 +356,9 @@ impl MessageWindow {
             }
             MessageLoopExit::InputDiagnostics(_) => {
                 unreachable!("the preview-window diagnostic cannot run input-coverage diagnostics")
+            }
+            MessageLoopExit::PerformanceDiagnostics(_) => {
+                unreachable!("the preview-window diagnostic cannot run a performance diagnostic")
             }
         }
     }
@@ -367,7 +381,7 @@ impl MessageWindow {
             let ui_task_started = Instant::now();
 
             if message.hwnd == self.hwnd && message.message == SHUTDOWN_MESSAGE {
-                self.record_preview_ui_task(ui_task_started.elapsed());
+                self.record_ui_task(ui_task_started.elapsed());
                 return Ok(MessageLoopExit::Shutdown);
             }
 
@@ -386,9 +400,19 @@ impl MessageWindow {
                 && message.message == WM_TIMER
                 && message.wParam.0 == PREVIEW_DIAGNOSTIC_DEADLINE_TIMER_ID
             {
-                self.record_preview_ui_task(ui_task_started.elapsed());
+                self.record_ui_task(ui_task_started.elapsed());
                 return Ok(MessageLoopExit::PreviewDiagnostics(
                     self.finish_preview_diagnostics(PreviewWindowDismissal::Timeout),
+                ));
+            }
+
+            if message.hwnd == self.hwnd
+                && message.message == WM_TIMER
+                && message.wParam.0 == PERFORMANCE_DIAGNOSTIC_DEADLINE_TIMER_ID
+            {
+                self.record_ui_task(ui_task_started.elapsed());
+                return Ok(MessageLoopExit::PerformanceDiagnostics(
+                    self.finish_performance_diagnostics(),
                 ));
             }
 
@@ -397,7 +421,7 @@ impl MessageWindow {
                 && message.wParam.0 == INPUT_SAMPLE_TIMER_ID
             {
                 self.handle_input_diagnostic_sample();
-                self.record_preview_ui_task(ui_task_started.elapsed());
+                self.record_ui_task(ui_task_started.elapsed());
                 continue;
             }
 
@@ -406,7 +430,7 @@ impl MessageWindow {
                 && message.wParam.0 == DWELL_TIMER_ID
             {
                 self.handle_dwell_timer(Instant::now());
-                self.record_preview_ui_task(ui_task_started.elapsed());
+                self.record_ui_task(ui_task_started.elapsed());
                 continue;
             }
 
@@ -415,13 +439,13 @@ impl MessageWindow {
                 && message.wParam.0 == PREVIEW_GUARD_TIMER_ID
             {
                 self.guard_product_preview();
-                self.record_preview_ui_task(ui_task_started.elapsed());
+                self.record_ui_task(ui_task_started.elapsed());
                 continue;
             }
 
             if message.hwnd == self.hwnd && message.message == WORKER_RESULT_MESSAGE {
                 self.handle_worker_result();
-                self.record_preview_ui_task(ui_task_started.elapsed());
+                self.record_ui_task(ui_task_started.elapsed());
                 continue;
             }
 
@@ -429,7 +453,7 @@ impl MessageWindow {
                 if self.handle_tray_callback(message.wParam, message.lParam)? {
                     return Ok(MessageLoopExit::Shutdown);
                 }
-                self.record_preview_ui_task(ui_task_started.elapsed());
+                self.record_ui_task(ui_task_started.elapsed());
                 continue;
             }
 
@@ -437,7 +461,7 @@ impl MessageWindow {
                 if self.handle_instance_activation()? {
                     return Ok(MessageLoopExit::Shutdown);
                 }
-                self.record_preview_ui_task(ui_task_started.elapsed());
+                self.record_ui_task(ui_task_started.elapsed());
                 continue;
             }
 
@@ -447,13 +471,13 @@ impl MessageWindow {
                 {
                     self.handle_system_lifecycle_change(change)?;
                 }
-                self.record_preview_ui_task(ui_task_started.elapsed());
+                self.record_ui_task(ui_task_started.elapsed());
                 continue;
             }
 
             if message.hwnd == self.hwnd && message.message == PREVIEW_CONTEXT_INVALIDATED_MESSAGE {
                 self.handle_preview_context_invalidation(message.wParam.0);
-                self.record_preview_ui_task(ui_task_started.elapsed());
+                self.record_ui_task(ui_task_started.elapsed());
                 continue;
             }
 
@@ -474,19 +498,22 @@ impl MessageWindow {
                 if preview_input_requires_dismissal(&raw_input)
                     && self.preview_diagnostics.is_some()
                 {
-                    self.record_preview_ui_task(ui_task_started.elapsed());
+                    self.record_ui_task(ui_task_started.elapsed());
                     return Ok(MessageLoopExit::PreviewDiagnostics(
                         self.finish_preview_diagnostics(PreviewWindowDismissal::Input),
                     ));
                 }
                 self.handle_raw_input(raw_input);
             }
-            self.record_preview_ui_task(ui_task_started.elapsed());
+            self.record_ui_task(ui_task_started.elapsed());
         }
     }
 
-    fn record_preview_ui_task(&mut self, duration: Duration) {
+    fn record_ui_task(&mut self, duration: Duration) {
         if let Some(diagnostics) = self.preview_diagnostics.as_mut() {
+            diagnostics.ui_thread_max = diagnostics.ui_thread_max.max(duration);
+        }
+        if let Some(diagnostics) = self.performance_diagnostics.as_mut() {
             diagnostics.ui_thread_max = diagnostics.ui_thread_max.max(duration);
         }
     }
@@ -1318,6 +1345,7 @@ impl Drop for MessageWindow {
     fn drop(&mut self) {
         drop(self.tray_icon.take());
         drop(self.preview_diagnostics.take());
+        drop(self.performance_diagnostics.take());
         drop(self.preview_window.take());
         drop(self.input_diagnostics.take());
         drop(self.dwell_timer.take());
@@ -1340,6 +1368,7 @@ enum MessageLoopExit {
     Shutdown,
     InputDiagnostics(InputCoverageReport),
     PreviewDiagnostics(PreviewWindowDiagnosticReport),
+    PerformanceDiagnostics(performance::PerformanceDiagnosticReport),
 }
 
 struct ActivePreviewDiagnostics {

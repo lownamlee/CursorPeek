@@ -84,7 +84,12 @@ jobs:
             - name: Build release executable
               run: cargo build --locked --release
 
-            - name: Soak worker and Explorer recovery
+            - name: Enforce release performance budgets
+              run: >
+                  ./tools/Test-PerformanceBudget.ps1
+                  -Executable target/release/CursorPeek.exe
+
+            - name: Soak worker lifecycle recovery
               run: >
                   ./tools/Test-RecoverySoak.ps1
                   -Executable target/release/CursorPeek.exe

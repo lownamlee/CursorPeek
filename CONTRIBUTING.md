@@ -33,6 +33,7 @@ cargo build --locked --release
 Changes to Windows resources or the release executable should also run:
 
 ```powershell
+.\tools\Test-PerformanceBudget.ps1
 .\tools\Test-RecoverySoak.ps1
 .\tools\Test-WindowsQuality.ps1
 ```
