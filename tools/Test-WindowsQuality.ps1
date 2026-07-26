@@ -36,6 +36,31 @@ function Get-Sha256Hex {
     }
 }
 
+function Get-PeDataDirectory {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string[]] $Headers,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Name
+    )
+
+    $pattern = '^\s+([0-9A-Fa-f]+)\s+\[\s*([0-9A-Fa-f]+)\]\s+RVA \[size\] of ' +
+        [Regex]::Escape($Name) + '\s*$'
+    $line = $Headers |
+        Where-Object { $_ -match $pattern } |
+        Select-Object -First 1
+    if ($null -eq $line -or $line -notmatch $pattern) {
+        throw "Could not read the PE $Name."
+    }
+
+    return [PSCustomObject] @{
+        Rva = [Convert]::ToUInt32($Matches[1], 16)
+        Bytes = [Convert]::ToUInt32($Matches[2], 16)
+    }
+}
+
 $resolvedExecutable = (Resolve-Path -LiteralPath $Executable).Path
 $artifact = Get-Item -LiteralPath $resolvedExecutable
 if ($artifact.Length -gt $MaximumBytes) {
@@ -75,6 +100,10 @@ if ($LASTEXITCODE -ne 0) {
 $headersOutput = & $dumpbin.FullName /nologo /headers $resolvedExecutable
 if ($LASTEXITCODE -ne 0) {
     throw "dumpbin.exe header inspection failed with exit code $LASTEXITCODE."
+}
+$loadConfigOutput = & $dumpbin.FullName /nologo /loadconfig $resolvedExecutable
+if ($LASTEXITCODE -ne 0) {
+    throw "dumpbin.exe load-configuration inspection failed with exit code $LASTEXITCODE."
 }
 
 $imports = @(
@@ -123,21 +152,99 @@ if ($subsystem -ne 2 -or $subsystemName -cne 'Windows GUI') {
     throw "Expected PE subsystem 2 (Windows GUI); found $subsystem ($subsystemName)."
 }
 
-$resourceLine = $headersOutput |
-    Where-Object {
-        $_ -match '^\s+([0-9A-Fa-f]+)\s+\[\s*([0-9A-Fa-f]+)\]\s+RVA \[size\] of Resource Directory\s*$'
-    } |
+$dllCharacteristicsLine = $headersOutput |
+    Where-Object { $_ -match '^\s+([0-9A-Fa-f]+)\s+DLL characteristics\s*$' } |
     Select-Object -First 1
 if (
-    $null -eq $resourceLine -or
-    $resourceLine -notmatch '^\s+([0-9A-Fa-f]+)\s+\[\s*([0-9A-Fa-f]+)\]\s+RVA \[size\] of Resource Directory\s*$'
+    $null -eq $dllCharacteristicsLine -or
+    $dllCharacteristicsLine -notmatch '^\s+([0-9A-Fa-f]+)\s+DLL characteristics\s*$'
 ) {
-    throw 'Could not read the PE resource directory.'
+    throw 'Could not read the PE DLL characteristics.'
 }
-$resourceRva = [Convert]::ToUInt32($Matches[1], 16)
-$resourceBytes = [Convert]::ToUInt32($Matches[2], 16)
-if ($resourceRva -eq 0 -or $resourceBytes -eq 0) {
+$dllCharacteristics = [Convert]::ToUInt32($Matches[1], 16)
+$requiredDllCharacteristics = @(
+    [PSCustomObject] @{ Name = 'high-entropy ASLR'; Mask = 0x0020 }
+    [PSCustomObject] @{ Name = 'dynamic-base ASLR'; Mask = 0x0040 }
+    [PSCustomObject] @{ Name = 'NX compatibility'; Mask = 0x0100 }
+    [PSCustomObject] @{ Name = 'Control Flow Guard'; Mask = 0x4000 }
+)
+foreach ($characteristic in $requiredDllCharacteristics) {
+    if (($dllCharacteristics -band $characteristic.Mask) -ne $characteristic.Mask) {
+        throw "The PE is missing the $($characteristic.Name) DLL characteristic."
+    }
+}
+
+$resourceDirectory = Get-PeDataDirectory $headersOutput 'Resource Directory'
+if ($resourceDirectory.Rva -eq 0 -or $resourceDirectory.Bytes -eq 0) {
     throw 'The PE resource directory is empty.'
+}
+
+$relocationDirectory = Get-PeDataDirectory $headersOutput 'Base Relocation Directory'
+if ($relocationDirectory.Rva -eq 0 -or $relocationDirectory.Bytes -eq 0) {
+    throw 'The PE base-relocation directory is empty.'
+}
+
+$loadConfigDirectory = Get-PeDataDirectory $headersOutput 'Load Configuration Directory'
+if ($loadConfigDirectory.Rva -eq 0 -or $loadConfigDirectory.Bytes -eq 0) {
+    throw 'The PE load-configuration directory is empty.'
+}
+
+$guardCfTableLine = $loadConfigOutput |
+    Where-Object { $_ -match '^\s+([0-9A-Fa-f]+)\s+Guard CF function table\s*$' } |
+    Select-Object -First 1
+if (
+    $null -eq $guardCfTableLine -or
+    $guardCfTableLine -notmatch '^\s+([0-9A-Fa-f]+)\s+Guard CF function table\s*$'
+) {
+    throw 'Could not read the Guard CF function table.'
+}
+$guardCfFunctionTable = [Convert]::ToUInt64($Matches[1], 16)
+if ($guardCfFunctionTable -eq 0) {
+    throw 'The Guard CF function table is empty.'
+}
+
+$guardCfCountLine = $loadConfigOutput |
+    Where-Object { $_ -match '^\s+([0-9A-Fa-f]+)\s+Guard CF function count\s*$' } |
+    Select-Object -First 1
+if (
+    $null -eq $guardCfCountLine -or
+    $guardCfCountLine -notmatch '^\s+([0-9A-Fa-f]+)\s+Guard CF function count\s*$'
+) {
+    throw 'Could not read the Guard CF function count.'
+}
+$guardCfFunctionCount = [Convert]::ToUInt64($Matches[1], 16)
+if ($guardCfFunctionCount -eq 0) {
+    throw 'The Guard CF function table does not contain any functions.'
+}
+
+$guardCfInstrumented = @(
+    $loadConfigOutput |
+        Where-Object { $_.Trim() -ceq 'CF instrumented' }
+).Count -gt 0
+$guardCfFidTablePresent = @(
+    $loadConfigOutput |
+        Where-Object { $_.Trim() -ceq 'FID table present' }
+).Count -gt 0
+if (-not $guardCfInstrumented -or -not $guardCfFidTablePresent) {
+    throw 'The PE load configuration does not prove complete Control Flow Guard instrumentation.'
+}
+
+$extendedDllCharacteristicsLine = $headersOutput |
+    Where-Object { $_ -match '^\s+([0-9A-Fa-f]+)\s+extended DLL characteristics\s*$' } |
+    Select-Object -First 1
+if (
+    $null -eq $extendedDllCharacteristicsLine -or
+    $extendedDllCharacteristicsLine -notmatch '^\s+([0-9A-Fa-f]+)\s+extended DLL characteristics\s*$'
+) {
+    throw 'Could not read the PE extended DLL characteristics.'
+}
+$extendedDllCharacteristics = [Convert]::ToUInt32($Matches[1], 16)
+$cetCompatible = @(
+    $headersOutput |
+        Where-Object { $_.Trim() -ceq 'CET compatible' }
+).Count -gt 0
+if (($extendedDllCharacteristics -band 0x0001) -ne 0x0001 -or -not $cetCompatible) {
+    throw 'The PE is not marked as CET shadow-stack compatible.'
 }
 
 $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
@@ -207,7 +314,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $evidence = [ordered] @{
-    schema_version = 1
+    schema_version = 2
     source_revision = $sourceRevision
     target = 'x86_64-pc-windows-msvc'
     rust = $rustVersion
@@ -221,8 +328,26 @@ $evidence = [ordered] @{
     pe = [ordered] @{
         subsystem = $subsystem
         subsystem_name = $subsystemName
-        resource_rva = $resourceRva
-        resource_bytes = $resourceBytes
+        dll_characteristics = ('0x{0:X4}' -f $dllCharacteristics)
+        high_entropy_virtual_addresses = $true
+        dynamic_base = $true
+        nx_compatible = $true
+        resource_rva = $resourceDirectory.Rva
+        resource_bytes = $resourceDirectory.Bytes
+        base_relocation_rva = $relocationDirectory.Rva
+        base_relocation_bytes = $relocationDirectory.Bytes
+        load_configuration_rva = $loadConfigDirectory.Rva
+        load_configuration_bytes = $loadConfigDirectory.Bytes
+        control_flow_guard = [ordered] @{
+            enabled = $true
+            function_table = ('0x{0:X16}' -f $guardCfFunctionTable)
+            function_count = $guardCfFunctionCount
+            cf_instrumented = $guardCfInstrumented
+            fid_table_present = $guardCfFidTablePresent
+        }
+        extended_dll_characteristics = ('0x{0:X8}' -f $extendedDllCharacteristics)
+        cet_compatible = $cetCompatible
+        static_crt_import_boundary = $true
     }
     version_info = $expectedVersionFields
     application_icon = [ordered] @{
@@ -254,7 +379,8 @@ $summary = @"
 | Size | $($artifact.Length) bytes |
 | SHA-256 | ``$hash`` |
 | PE subsystem | ``$subsystem ($subsystemName)`` |
-| Resources | $resourceBytes bytes; application icon $($iconWidth)x$iconHeight |
+| PE hardening | ASLR, NX, CFG ($guardCfFunctionCount guarded functions), CET |
+| Resources | $($resourceDirectory.Bytes) bytes; application icon $($iconWidth)x$iconHeight |
 | Direct imports | $($imports.Count) approved system DLL families |
 | Rust | ``$rustVersion`` |
 "@
