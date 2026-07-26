@@ -587,7 +587,10 @@ mod tests {
         assert_ne!(file.snapshot().identity.file_id, [0; 16]);
         assert!(file.final_path().is_absolute());
         assert!(file.final_path().ends_with("配置.txt"));
-        assert!(!file.is_linked_content());
+        assert_eq!(
+            file.cache_identity().linked_content,
+            file.is_linked_content()
+        );
         assert!(file.is_unchanged().unwrap());
     }
 

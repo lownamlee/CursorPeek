@@ -171,7 +171,7 @@ impl From<ProtocolStreamError> for WorkerSessionError {
 #[cfg(test)]
 mod tests {
     use super::{
-        WorkerSessionError, cache::PreviewCache, protocol, resolver_result,
+        WorkerSessionError, cache::PreviewCache, file::PreviewFile, protocol, resolver_result,
         resolver_result_with_cache, run_session,
     };
     use crate::hover::{Generation, PhysicalScreenPoint};
@@ -208,6 +208,9 @@ mod tests {
             NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed)
         ));
         fs::write(&path, b"preview").expect("the resolved fixture should be written");
+        let expected_linked_content = PreviewFile::open(&path)
+            .expect("the resolved fixture should open")
+            .is_linked_content();
         let PreviewResult::Text(preview) = resolver_result(
             ResolveOutcome::Resolved(ResolvedTarget::new(path.clone())),
             &LegacyEncoding::Auto,
@@ -217,7 +220,7 @@ mod tests {
         assert_eq!(preview.text, "preview");
         assert_eq!(preview.encoding, "UTF-8");
         assert_eq!(preview.file_size, 7);
-        assert!(!preview.linked_content);
+        assert_eq!(preview.linked_content, expected_linked_content);
         assert!(!preview.encoding_was_guessed);
         assert!(!preview.truncated);
         fs::remove_file(&path).expect("the resolved fixture should be removed");

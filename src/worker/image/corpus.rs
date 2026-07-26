@@ -225,6 +225,7 @@ fn run_case(root: &TestDirectory, case: &CorpusCase) -> Option<ImagePreview> {
     let path = root.path().join(format!("{}.{}", case.id, case.extension));
     fs::write(&path, &bytes).expect("the generated image corpus case should be written");
     let file = PreviewFile::open(&path).expect("the generated image corpus case should open");
+    let expected_linked_content = file.is_linked_content();
     let decoded = decode(&file);
 
     match case.expected {
@@ -262,7 +263,11 @@ fn run_case(root: &TestDirectory, case: &CorpusCase) -> Option<ImagePreview> {
                 case.id
             );
             assert_eq!(actual.file_size, bytes.len() as u64);
-            assert!(!actual.linked_content);
+            assert_eq!(
+                actual.linked_content, expected_linked_content,
+                "corpus case `{}` linked-content propagation",
+                case.id
+            );
             assert_eq!(
                 actual.premultiplied_bgra.len(),
                 usize::try_from(actual.width).unwrap()

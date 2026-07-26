@@ -22,6 +22,26 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+function Get-Sha256Hex {
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
+
+    $stream = [System.IO.File]::OpenRead($LiteralPath)
+    try {
+        $algorithm = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            return [System.BitConverter]::ToString(
+                $algorithm.ComputeHash($stream)
+            ).Replace("-", "")
+        }
+        finally {
+            $algorithm.Dispose()
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
 if ([string]::IsNullOrWhiteSpace($ScenarioMatrix)) {
     $ScenarioMatrix = Join-Path $PSScriptRoot "..\corpus\scenarios.tsv"
 }
@@ -467,7 +487,7 @@ function Read-WindowEvidence {
 function Get-SourceDescription {
     param([string]$Path)
 
-    $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash
+    $hash = Get-Sha256Hex -LiteralPath $Path
     return "- ``$([System.IO.Path]::GetFileName($Path))`` - SHA-256 ``$hash``"
 }
 
