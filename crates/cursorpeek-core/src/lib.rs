@@ -2,6 +2,7 @@
 
 mod types;
 
+pub mod harness;
 pub mod layout;
 pub mod payload;
 pub mod protocol;

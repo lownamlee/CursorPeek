@@ -1,0 +1,79 @@
+name: Parser fuzzing
+
+on:
+    push:
+        branches:
+            - main
+    pull_request:
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    fuzz:
+        name: Bounded libFuzzer smoke
+        runs-on: ubuntu-24.04
+        timeout-minutes: 20
+
+        env:
+            CARGO_FUZZ_VERSION: 0.13.2
+            CARGO_INCREMENTAL: "0"
+            CARGO_TERM_COLOR: always
+
+        steps:
+            - name: Check out source
+              uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+              with:
+                  persist-credentials: false
+
+            - name: Install pinned fuzz toolchain
+              working-directory: fuzz
+              run: |
+                  toolchain="$(
+                    sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+                      rust-toolchain.toml
+                  )"
+                  test -n "$toolchain"
+                  rustup toolchain install "$toolchain" \
+                    --profile minimal \
+                    --no-self-update
+                  rustup run "$toolchain" rustc --version --verbose
+
+            - name: Install pinned cargo-fuzz
+              run: >
+                  cargo install cargo-fuzz
+                  --version "$CARGO_FUZZ_VERSION"
+                  --locked
+
+            - name: Build every fuzz target
+              working-directory: fuzz
+              run: |
+                  for target in protocol payload content_sniff layout; do
+                    cargo fuzz build "$target"
+                  done
+
+            - name: Run bounded fuzz smoke
+              working-directory: fuzz
+              run: |
+                  cargo fuzz run protocol -- \
+                    -runs=10000 -seed=424242 -max_len=4194328 -timeout=5 -rss_limit_mb=768
+                  cargo fuzz run payload -- \
+                    -runs=10000 -seed=424242 -max_len=4194304 -timeout=5 -rss_limit_mb=768
+                  cargo fuzz run content_sniff -- \
+                    -runs=10000 -seed=424242 -max_len=65537 -timeout=5 -rss_limit_mb=768
+                  cargo fuzz run layout -- \
+                    -runs=10000 -seed=424242 -max_len=16 -timeout=5 -rss_limit_mb=768
+
+            - name: Upload fuzz artifacts
+              if: failure()
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+              with:
+                  name: fuzz-artifacts-${{ github.sha }}
+                  path: fuzz/artifacts
+                  if-no-files-found: ignore
+                  retention-days: 14
