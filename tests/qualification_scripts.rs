@@ -275,6 +275,28 @@ fn release_workflow_uses_a_draft_aware_asset_query() {
 }
 
 #[test]
+fn release_sbom_has_a_deterministic_attestation_identity() {
+    let generator = fs::read_to_string(repository_path("tools/New-ReleaseSbom.ps1"))
+        .expect("the release SBOM generator should be readable");
+
+    assert!(
+        generator.contains("function New-DeterministicUuidV5"),
+        "the SBOM identity must be deterministic across exact-source rebuilds"
+    );
+    assert!(
+        generator.contains("'CursorPeek release SBOM'")
+            && generator.contains("\"lock-sha256=$($lockHashBefore.ToLowerInvariant())\""),
+        "the SBOM identity must be scoped to the product and locked release graph"
+    );
+    assert!(
+        generator.contains("Add-Member -NotePropertyName serialNumber")
+            && generator.contains("^urn:uuid:")
+            && generator.contains("-5[0-9a-f]{3}-[89ab]"),
+        "the generated CycloneDX document must carry the UUIDv5 serial required for attestation"
+    );
+}
+
+#[test]
 fn release_checksums_cover_only_the_canonical_asset_set() {
     let version = env!("CARGO_PKG_VERSION");
     let directory = repository_path(&format!(

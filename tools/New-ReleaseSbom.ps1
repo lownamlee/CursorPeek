@@ -36,6 +36,55 @@ function Get-Sha256Hex {
     }
 }
 
+function New-DeterministicUuidV5 {
+    param([Parameter(Mandatory = $true)][string] $Name)
+
+    # RFC 4122 URL namespace, encoded in network byte order.
+    $namespaceBytes = [byte[]] @(
+        0x6b, 0xa7, 0xb8, 0x11,
+        0x9d, 0xad,
+        0x11, 0xd1,
+        0x80, 0xb4,
+        0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8
+    )
+    $nameBytes = [System.Text.Encoding]::UTF8.GetBytes($Name)
+    $inputBytes = [byte[]]::new($namespaceBytes.Length + $nameBytes.Length)
+    [System.Array]::Copy(
+        $namespaceBytes,
+        0,
+        $inputBytes,
+        0,
+        $namespaceBytes.Length
+    )
+    [System.Array]::Copy(
+        $nameBytes,
+        0,
+        $inputBytes,
+        $namespaceBytes.Length,
+        $nameBytes.Length
+    )
+
+    $algorithm = [System.Security.Cryptography.SHA1]::Create()
+    try {
+        $hash = $algorithm.ComputeHash($inputBytes)
+    }
+    finally {
+        $algorithm.Dispose()
+    }
+    $hash[6] = [byte](($hash[6] -band 0x0f) -bor 0x50)
+    $hash[8] = [byte](($hash[8] -band 0x3f) -bor 0x80)
+
+    $hex = [System.BitConverter]::ToString($hash[0..15]).
+        Replace('-', '').
+        ToLowerInvariant()
+    return '{0}-{1}-{2}-{3}-{4}' -f
+        $hex.Substring(0, 8),
+        $hex.Substring(8, 4),
+        $hex.Substring(12, 4),
+        $hex.Substring(16, 4),
+        $hex.Substring(20, 12)
+}
+
 function Get-CanonicalPackageUrl {
     param([Parameter(Mandatory = $true)][string] $PackageUrl)
 
@@ -262,6 +311,33 @@ try {
                 }
             }
         }
+    }
+
+    $serialIdentity = @(
+        'CursorPeek release SBOM'
+        'target=x86_64-pc-windows-msvc'
+        'features=default'
+        "lock-sha256=$($lockHashBefore.ToLowerInvariant())"
+        @(
+            $workspacePackageUrls |
+                Sort-Object |
+                ForEach-Object { "package=$_" }
+        )
+    ) -join "`n"
+    $serialNumber = "urn:uuid:$(
+        New-DeterministicUuidV5 -Name $serialIdentity
+    )"
+    $serialProperty = $document.PSObject.Properties['serialNumber']
+    if ($null -eq $serialProperty) {
+        $document |
+            Add-Member -NotePropertyName serialNumber -NotePropertyValue $serialNumber
+    }
+    else {
+        $serialProperty.Value = $serialNumber
+    }
+    if ([string] $document.serialNumber -cnotmatch
+        '^urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$') {
+        throw "Generated SBOM serial number '$($document.serialNumber)' is not UUIDv5."
     }
 
     $json = $document | ConvertTo-Json -Depth 100

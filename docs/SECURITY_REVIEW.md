@@ -32,7 +32,8 @@ duplicate-version skip, or source exception.
 `tools/New-ReleaseSbom.ps1` requires `cargo-cyclonedx 0.5.9` and emits CycloneDX 1.5 JSON for the
 actual default-feature Windows binary graph, including build dependencies. It fixes the source
 epoch, verifies that `Cargo.lock` does not change, and rewrites only workspace `path+file`
-references into canonical Cargo package URLs.
+references into canonical Cargo package URLs. Its UUIDv5 serial is derived from the locked graph,
+so exact-source rebuilds retain a stable attestation identity.
 
 The generator then rejects file URIs, drive paths, home-directory paths, duplicate component
 references, unresolved dependency references, an unexpected workspace package, tool-version
