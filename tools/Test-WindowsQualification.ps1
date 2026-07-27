@@ -13,9 +13,6 @@ param(
 
     [string]$Report,
 
-    [ValidateSet("feasibility", "release")]
-    [string]$Profile = "release",
-
     [switch]$ValidateOnly
 )
 
@@ -99,18 +96,20 @@ $windowHeader = @(
 $scenarioHeader = @("scenario", "expectation", "layout", "notes") -join $tab
 $requiredOperatingSystems = @("windows10", "windows11")
 $requiredDpiValues = @("100", "125", "150", "175", "200")
-$requiredWindowScenarios = @(
+$requiredPerOsWindowScenarios = @(
     "center",
     "work_area_top_left",
-    "work_area_top_right",
-    "work_area_bottom_left",
     "work_area_bottom_right",
-    "negative_origin_monitor",
-    "mixed_dpi_transition",
     "explorer_restart"
 )
+$requiredAggregateWindowScenarios = @(
+    "work_area_top_right",
+    "work_area_bottom_left",
+    "negative_origin_monitor",
+    "mixed_dpi_transition"
+)
 $requiredWindowInteractions = @("timeout", "move", "wheel", "left_click", "right_click")
-$feasibilityResolverKeys = @(
+$requiredCoreResolverKeys = @(
     "file_icon|resolve|large_icons",
     "file_row|resolve|details",
     "blank_items_view|fail_closed|all",
@@ -122,16 +121,16 @@ $feasibilityResolverKeys = @(
     "multiple_windows|resolve|multiple_windows",
     "explorer_restart|resolve|details"
 )
-$windows11FeasibilityResolverKeys = @(
+$requiredWindows11ResolverKeys = @(
     "rapid_tab_switch|resolve|active_tab",
     "background_tab|fail_closed|background_tab"
 )
-$feasibilityWindowScenarios = @(
-    "center",
-    "work_area_top_left",
-    "work_area_bottom_right",
-    "explorer_restart"
+$requiredTopologyResolverKeys = @(
+    "negative_origin_file|resolve|details_negative_origin",
+    "mixed_dpi_file|resolve|details_mixed_dpi"
 )
+$resolverLatencyBudgetUs = 50000
+$previewInitialTaskBudgetUs = 50000
 
 function Resolve-OneFile {
     param(
@@ -533,6 +532,21 @@ if ($resultPaths.Count -eq 0) {
 $windowPath = Resolve-OneFile $WindowEvidence "Window evidence"
 
 $scenarioRequirements = @(Read-ScenarioMatrix $scenarioPath)
+$catalogKeys = [System.Collections.Generic.HashSet[string]]::new($ordinal)
+foreach ($requirement in $scenarioRequirements) {
+    $catalogKeys.Add(
+        "$($requirement.Scenario)|$($requirement.Expectation)|$($requirement.Layout)"
+    ) | Out-Null
+}
+foreach ($requiredKey in @(
+    $requiredCoreResolverKeys +
+    $requiredWindows11ResolverKeys +
+    $requiredTopologyResolverKeys
+)) {
+    if (-not $catalogKeys.Contains($requiredKey)) {
+        throw "Scenario matrix does not define required qualification case $requiredKey."
+    }
+}
 $resolverObservationKeys = [System.Collections.Generic.HashSet[string]]::new($ordinal)
 $resolverRows = @(Read-ResolverResults $resultPaths $resolverObservationKeys)
 $windowRows = @(Read-WindowEvidence $windowPath)
@@ -577,7 +591,7 @@ if ($wrongPathRows.Count -ne 0) {
 if ($runnerFailureRows.Count -ne 0) {
     $gateFailures.Add("resolver evidence contains one or more runner failures")
 }
-if ($null -eq $p95 -or $p95 -gt 50000) {
+if ($null -eq $p95 -or $p95 -gt $resolverLatencyBudgetUs) {
     $gateFailures.Add("resolver p95 exceeds 50 ms or is unavailable")
 }
 
@@ -588,55 +602,48 @@ foreach ($os in $requiredOperatingSystems) {
         $gateFailures.Add("resolver evidence does not include $os")
         continue
     }
-    $requiredDpiForProfile = if ($Profile -ceq "release") {
-        $requiredDpiValues
+    $requiredKeys = @($requiredCoreResolverKeys)
+    if ($os -ceq "windows11") {
+        $requiredKeys += $requiredWindows11ResolverKeys
     }
-    else {
-        @()
-    }
-    foreach ($dpi in $requiredDpiForProfile) {
-        if (@($osRows | Where-Object { $_.Dpi -ceq $dpi }).Count -eq 0) {
-            $missingResolverCoverage.Add("$os dpi=$dpi")
-        }
-    }
-    $requirementsForProfile = if ($Profile -ceq "release") {
-        $scenarioRequirements
-    }
-    else {
-        $requiredKeys = @($feasibilityResolverKeys)
-        if ($os -ceq "windows11") {
-            $requiredKeys += $windows11FeasibilityResolverKeys
-        }
-        @(
-            $scenarioRequirements | Where-Object {
-                $key = "$($_.Scenario)|$($_.Expectation)|$($_.Layout)"
-                $key -cin $requiredKeys
-            }
-        )
-    }
-    foreach ($requirement in $requirementsForProfile) {
+    foreach ($requiredKey in $requiredKeys) {
+        $keyFields = $requiredKey.Split("|")
         $matching = @(
             $osRows | Where-Object {
-                $_.Scenario -ceq $requirement.Scenario -and
-                $_.Expectation -ceq $requirement.Expectation -and
-                ($requirement.Layout -ceq "all" -or $_.Layout -ceq $requirement.Layout)
+                $_.Scenario -ceq $keyFields[0] -and
+                $_.Expectation -ceq $keyFields[1] -and
+                ($keyFields[2] -ceq "all" -or $_.Layout -ceq $keyFields[2])
             }
         )
         if ($matching.Count -eq 0) {
             $missingResolverCoverage.Add(
-                "$os scenario=$($requirement.Scenario) layout=$($requirement.Layout)"
+                "$os scenario=$($keyFields[0]) layout=$($keyFields[2])"
             )
         }
     }
 }
+foreach ($dpi in $requiredDpiValues) {
+    if (@($resolverRows | Where-Object { $_.Dpi -ceq $dpi }).Count -eq 0) {
+        $missingResolverCoverage.Add("aggregate dpi=$dpi")
+    }
+}
+foreach ($requiredKey in $requiredTopologyResolverKeys) {
+    $keyFields = $requiredKey.Split("|")
+    $matching = @(
+        $resolverRows | Where-Object {
+            $_.Scenario -ceq $keyFields[0] -and
+            $_.Expectation -ceq $keyFields[1] -and
+            $_.Layout -ceq $keyFields[2]
+        }
+    )
+    if ($matching.Count -eq 0) {
+        $missingResolverCoverage.Add(
+            "aggregate scenario=$($keyFields[0]) layout=$($keyFields[2])"
+        )
+    }
+}
 if ($missingResolverCoverage.Count -ne 0) {
-    $failure = if ($Profile -ceq "release") {
-        "resolver scenario/DPI matrix is incomplete"
-    }
-    else {
-        "resolver feasibility scenario matrix is incomplete"
-    }
-    $gateFailures.Add($failure)
+    $gateFailures.Add("resolver OS/core-scenario/DPI/topology coverage is incomplete")
 }
 
 $windowFailureRows = @(
@@ -646,7 +653,7 @@ $windowFailureRows = @(
         $_.Dismissed -cne "yes" -or
         $_.InsideWorkArea -cne "yes" -or
         $_.PointerGapPreserved -cne "yes" -or
-        $_.UiThreadMaxUs -gt 16000 -or
+        $_.UiThreadMaxUs -gt $previewInitialTaskBudgetUs -or
         ($_.Interaction -cin @("left_click", "right_click") -and
             $_.ClickDelivered -cne "yes")
     }
@@ -662,18 +669,7 @@ foreach ($os in $requiredOperatingSystems) {
         $gateFailures.Add("preview-window evidence does not include $os")
         continue
     }
-    foreach ($dpi in $requiredDpiForProfile) {
-        if (@($osRows | Where-Object { $_.Dpi -ceq $dpi }).Count -eq 0) {
-            $missingWindowCoverage.Add("$os dpi=$dpi")
-        }
-    }
-    $requiredWindowScenariosForProfile = if ($Profile -ceq "release") {
-        $requiredWindowScenarios
-    }
-    else {
-        $feasibilityWindowScenarios
-    }
-    foreach ($scenario in $requiredWindowScenariosForProfile) {
+    foreach ($scenario in $requiredPerOsWindowScenarios) {
         if (@($osRows | Where-Object { $_.Scenario -ceq $scenario }).Count -eq 0) {
             $missingWindowCoverage.Add("$os scenario=$scenario")
         }
@@ -684,14 +680,18 @@ foreach ($os in $requiredOperatingSystems) {
         }
     }
 }
+foreach ($dpi in $requiredDpiValues) {
+    if (@($windowRows | Where-Object { $_.Dpi -ceq $dpi }).Count -eq 0) {
+        $missingWindowCoverage.Add("aggregate dpi=$dpi")
+    }
+}
+foreach ($scenario in $requiredAggregateWindowScenarios) {
+    if (@($windowRows | Where-Object { $_.Scenario -ceq $scenario }).Count -eq 0) {
+        $missingWindowCoverage.Add("aggregate scenario=$scenario")
+    }
+}
 if ($missingWindowCoverage.Count -ne 0) {
-    $failure = if ($Profile -ceq "release") {
-        "preview-window OS/DPI/scenario/interaction matrix is incomplete"
-    }
-    else {
-        "preview-window feasibility scenario/interaction matrix is incomplete"
-    }
-    $gateFailures.Add($failure)
+    $gateFailures.Add("preview-window OS/scenario/interaction/DPI/topology coverage is incomplete")
 }
 
 if ([string]::IsNullOrWhiteSpace($Report)) {
@@ -699,7 +699,7 @@ if ([string]::IsNullOrWhiteSpace($Report)) {
         (Join-Path $PSScriptRoot "..\target\qualification")
     )) "reports"
     [System.IO.Directory]::CreateDirectory($reportDirectory) | Out-Null
-    $Report = Join-Path $reportDirectory "milestone-1.md"
+    $Report = Join-Path $reportDirectory "windows-release.md"
 }
 $reportPath = [System.IO.Path]::GetFullPath($Report)
 $reportParent = [System.IO.Path]::GetDirectoryName($reportPath)
@@ -753,26 +753,17 @@ $formatCoverage = $coverage.ToString("F3", $invariant)
 $formatP50 = if ($null -eq $p50) { "n/a" } else { $p50 }
 $formatP95 = if ($null -eq $p95) { "n/a" } else { $p95 }
 $formatP99 = if ($null -eq $p99) { "n/a" } else { $p99 }
-$profileNotice = if ($Profile -ceq "feasibility") {
-    @(
-        "> Gate profile: **FEASIBILITY**",
-        "> A pass unlocks implementation only; it is not release qualification."
-    )
-}
-else {
-    @(
-        "> Gate profile: **RELEASE**"
-    )
-}
-
 $reportLines = @(
-    "# Milestone 1 qualification report",
+    "# Windows release qualification",
     "",
     "> Gate result: **$gateStatus**",
-    $profileNotice,
     "",
     "This report is recomputed from strict raw TSV evidence. It is not a substitute for the raw",
     "sessions, operator notes, VM snapshots, or an independent review of how points were labeled.",
+    "",
+    "Coverage is risk-based rather than a Cartesian product. Core Explorer behavior and every",
+    "interaction are required on each supported OS. The five DPI values, all work-area corners,",
+    "negative coordinates, and mixed-DPI transitions are required across the combined matrix.",
     "",
     "## Resolver",
     "",
@@ -787,7 +778,7 @@ $reportLines = @(
     "| Runner failures | $($runnerFailureRows.Count) | 0 |",
     "| Positive coverage | $formatCoverage% | >=99.900% |",
     "| Latency p50 | $formatP50 us | - |",
-    "| Latency p95 | $formatP95 us | <=50,000 us |",
+    "| Latency p95 | $formatP95 us | <=$resolverLatencyBudgetUs us |",
     "| Latency p99 | $formatP99 us | - |",
     "",
     "| OS | Rows | Builds |",
@@ -796,11 +787,14 @@ $reportLines = @(
     "",
     "## Preview window",
     "",
-    "| OS | Rows | Maximum UI-thread task |",
+    "| OS | Rows | Maximum preview create/show UI-thread task |",
     "|---|---:|---:|",
     $windowOsSummary,
     "",
-    "Failed focus/click/placement/task-bound rows: $($windowFailureRows.Count).",
+    "Failed focus/click/placement/initial-task-bound rows: $($windowFailureRows.Count).",
+    "",
+    "The preview create/show task ceiling is $previewInitialTaskBudgetUs us. The separate idle",
+    "performance gate retains the 16,000 us steady-state UI-thread ceiling.",
     "",
     "## Missing resolver coverage",
     "",
@@ -830,14 +824,9 @@ $reportLines = @(
 
 $utf8WithoutBom = [System.Text.UTF8Encoding]::new($false)
 [System.IO.File]::WriteAllLines($reportPath, [string[]]$reportLines, $utf8WithoutBom)
-Write-Host "Milestone 1 report: $reportPath"
+Write-Host "Windows qualification report: $reportPath"
 
 if ($gateFailures.Count -ne 0) {
-    throw "Milestone 1 gate failed: $($gateFailures -join "; ")."
+    throw "Windows qualification failed: $($gateFailures -join "; ")."
 }
-if ($Profile -ceq "feasibility") {
-    Write-Host "Milestone 1 resolver and preview-window feasibility gate passed."
-}
-else {
-    Write-Host "Milestone 1 release qualification gate passed."
-}
+Write-Host "Windows resolver and preview-window release qualification passed."

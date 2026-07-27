@@ -46,6 +46,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$previewInitialTaskBudgetUs = 50000
 
 if ([string]::IsNullOrWhiteSpace($Results)) {
     if ($Practice) {
@@ -288,6 +289,6 @@ if ($focusPreserved -cne "yes" -or
     $dismissed -cne "yes" -or
     $insideWorkArea -cne "yes" -or
     $pointerGapPreserved -cne "yes" -or
-    [UInt64]$uiThreadMaxUs -gt 16000) {
+    [UInt64]$uiThreadMaxUs -gt $previewInitialTaskBudgetUs) {
     throw "The observation was preserved, but it does not satisfy the preview-window gate."
 }

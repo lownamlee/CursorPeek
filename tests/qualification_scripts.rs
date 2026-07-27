@@ -20,7 +20,7 @@ fn run_gate(extra_arguments: &[&str]) -> Output {
             "Bypass",
             "-File",
         ])
-        .arg(repository_path("tools/Test-Milestone1Gate.ps1"))
+        .arg(repository_path("tools/Test-WindowsQualification.ps1"))
         .args(extra_arguments)
         .output()
         .expect("the qualification gate script should start")
@@ -829,6 +829,11 @@ fn qualification_gate_pass_path_aggregates_all_required_metrics() {
             } else {
                 "n/a"
             };
+            let ui_thread_max_us = if *scenario == "mixed_dpi_transition" {
+                "40004"
+            } else {
+                "10"
+            };
             let fields = [
                 case_id.to_string(),
                 os.to_owned(),
@@ -843,7 +848,7 @@ fn qualification_gate_pass_path_aggregates_all_required_metrics() {
                 "yes".to_owned(),
                 "yes".to_owned(),
                 "yes".to_owned(),
-                "10".to_owned(),
+                ui_thread_max_us.to_owned(),
                 "Synthetic parser pass-path test only; not evidence.".to_owned(),
             ];
             window_contents.push_str(&fields.join("\t"));
@@ -877,10 +882,13 @@ fn qualification_gate_pass_path_aggregates_all_required_metrics() {
     assert!(report.contains("| Positive coverage | 100.000% |"));
     assert!(report.contains("| Wrong paths | 0 |"));
     assert!(report.contains("| Latency p95 | 10 us |"));
-    assert!(report.contains("Failed focus/click/placement/task-bound rows: 0."));
+    assert!(report.contains("Failed focus/click/placement/initial-task-bound rows: 0."));
+    assert!(report.contains("risk-based rather than a Cartesian product"));
+    assert!(report.contains("16,000 us steady-state UI-thread ceiling"));
+    assert!(report.contains("| windows11 | 8 | 40004 |"));
 
-    let feasibility_window_path = temporary_directory.join("window-feasibility.tsv");
-    let feasibility_window_contents = window_contents
+    let incomplete_window_path = temporary_directory.join("window-without-topology.tsv");
+    let incomplete_window_contents = window_contents
         .lines()
         .filter(|line| {
             !line.contains("\tnegative_origin_monitor\t")
@@ -889,52 +897,54 @@ fn qualification_gate_pass_path_aggregates_all_required_metrics() {
         .collect::<Vec<_>>()
         .join("\n")
         + "\n";
-    fs::write(&feasibility_window_path, feasibility_window_contents)
-        .expect("the feasibility-only window evidence should be written");
-
-    let feasibility_report = temporary_directory.join("feasibility-report.md");
-    let feasibility_arguments = vec![
-        "-ResolverResultsDirectory".into(),
-        temporary_directory.to_string_lossy().into_owned(),
-        "-WindowEvidence".into(),
-        feasibility_window_path.to_string_lossy().into_owned(),
-        "-Profile".into(),
-        "feasibility".into(),
-        "-Report".into(),
-        feasibility_report.to_string_lossy().into_owned(),
-    ];
-    let feasibility = run_owned_arguments(&feasibility_arguments);
-    assert!(
-        feasibility.status.success(),
-        "representative feasibility profile failed: {}",
-        String::from_utf8_lossy(&feasibility.stderr)
-    );
-    let feasibility_text =
-        fs::read_to_string(&feasibility_report).expect("the feasibility report should be readable");
-    assert!(feasibility_text.contains("> Gate result: **PASS**"));
-    assert!(feasibility_text.contains("> Gate profile: **FEASIBILITY**"));
-    assert!(feasibility_text.contains("it is not release qualification"));
+    fs::write(&incomplete_window_path, incomplete_window_contents)
+        .expect("the topology-incomplete window evidence should be written");
 
     let incomplete_release_report = temporary_directory.join("incomplete-release-report.md");
     let incomplete_release_arguments = vec![
         "-ResolverResultsDirectory".into(),
         temporary_directory.to_string_lossy().into_owned(),
         "-WindowEvidence".into(),
-        feasibility_window_path.to_string_lossy().into_owned(),
+        incomplete_window_path.to_string_lossy().into_owned(),
         "-Report".into(),
         incomplete_release_report.to_string_lossy().into_owned(),
     ];
     let incomplete_release = run_owned_arguments(&incomplete_release_arguments);
     assert!(
         !incomplete_release.status.success(),
-        "the release profile unexpectedly accepted a feasibility-only window matrix"
+        "the release gate unexpectedly accepted window evidence without topology cases"
     );
     let incomplete_release_text = fs::read_to_string(&incomplete_release_report)
         .expect("the incomplete release report should be readable");
     assert!(incomplete_release_text.contains("> Gate result: **FAIL**"));
-    assert!(incomplete_release_text.contains("> Gate profile: **RELEASE**"));
-    assert!(incomplete_release_text.contains("negative_origin_monitor"));
-    assert!(incomplete_release_text.contains("mixed_dpi_transition"));
+    assert!(incomplete_release_text.contains("`aggregate scenario=negative_origin_monitor`"));
+    assert!(incomplete_release_text.contains("`aggregate scenario=mixed_dpi_transition`"));
+
+    let over_budget_window_path = temporary_directory.join("window-over-budget.tsv");
+    let over_budget_window_contents = window_contents.replacen("\t40004\t", "\t50001\t", 1);
+    assert_ne!(
+        over_budget_window_contents, window_contents,
+        "the synthetic matrix should contain a realistic create/show observation"
+    );
+    fs::write(&over_budget_window_path, over_budget_window_contents)
+        .expect("the over-budget window evidence should be written");
+    let over_budget_report = temporary_directory.join("over-budget-report.md");
+    let over_budget_arguments = vec![
+        "-ResolverResultsDirectory".into(),
+        temporary_directory.to_string_lossy().into_owned(),
+        "-WindowEvidence".into(),
+        over_budget_window_path.to_string_lossy().into_owned(),
+        "-Report".into(),
+        over_budget_report.to_string_lossy().into_owned(),
+    ];
+    let over_budget = run_owned_arguments(&over_budget_arguments);
+    assert!(
+        !over_budget.status.success(),
+        "the release gate accepted a preview create/show task above 50 ms"
+    );
+    let over_budget_text =
+        fs::read_to_string(&over_budget_report).expect("the over-budget report should be readable");
+    assert!(over_budget_text.contains("Failed focus/click/placement/initial-task-bound rows: 1."));
 
     fs::remove_dir_all(&temporary_directory)
         .expect("the synthetic qualification directory should be removable");
