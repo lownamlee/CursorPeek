@@ -104,7 +104,7 @@ jobs:
                   -Executable target/release/CursorPeek.exe
                   -OutputPath target/windows-quality/release-evidence.json
 
-            - name: Build and relocate portable package
+            - name: Build and qualify portable relocation
               run: |
                   ./tools/New-PortablePackage.ps1 `
                     -Executable target/release/CursorPeek.exe `
@@ -141,9 +141,11 @@ jobs:
                   }
 
                   ./tools/Test-PortablePackage.ps1 `
-                    -PackagePath $first.FullName
+                    -PackagePath $first.FullName |
+                    Tee-Object `
+                      -FilePath target/windows-quality/portable-lifecycle.txt
 
-            - name: Build and exercise per-user installer
+            - name: Build and qualify installer lifecycle
               run: |
                   $portableArchives = @(
                     Get-ChildItem `
@@ -193,7 +195,9 @@ jobs:
 
                   ./tools/Test-InstallerPackage.ps1 `
                     -InstallerPath $firstInstallers[0].FullName `
-                    -ExerciseInstall
+                    -ExerciseInstall |
+                    Tee-Object `
+                      -FilePath target/windows-quality/installer-lifecycle.txt
 
             - name: Upload release evidence
               uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
@@ -202,6 +206,8 @@ jobs:
                   path: |
                       target/release/CursorPeek.exe
                       target/windows-quality/cargo-features.txt
+                      target/windows-quality/installer-lifecycle.txt
+                      target/windows-quality/portable-lifecycle.txt
                       target/windows-quality/release-evidence.json
                   if-no-files-found: error
                   retention-days: 14

@@ -19,6 +19,7 @@ Add-Type -AssemblyName System.IO.Compression
 $resolvedPackage = (Resolve-Path -LiteralPath $PackagePath).Path
 $sidecarPath = "$resolvedPackage.sha256"
 $utf8Strict = [System.Text.UTF8Encoding]::new($false, $true)
+$utf8WithoutBom = [System.Text.UTF8Encoding]::new($false)
 $fixedTimestamp = [System.DateTime]::new(1980, 1, 1, 0, 0, 0)
 $testRoot = ''
 
@@ -146,6 +147,49 @@ function Assert-SameSnapshot {
     if ($Before.Exists -ne $After.Exists -or
         $Before.Length -ne $After.Length -or
         [string] $Before.Hash -cne [string] $After.Hash) {
+        throw "$Label changed during the portable smoke test."
+    }
+}
+
+function Get-OptionalRegistryValueSnapshot {
+    param(
+        [Parameter(Mandatory = $true)][string] $LiteralPath,
+        [Parameter(Mandatory = $true)][string] $Name
+    )
+
+    try {
+        $value = Get-ItemPropertyValue `
+            -LiteralPath $LiteralPath `
+            -Name $Name `
+            -ErrorAction Stop
+        return [PSCustomObject] @{
+            Exists = $true
+            Value = [string] $value
+        }
+    }
+    catch [System.Management.Automation.ItemNotFoundException] {
+        return [PSCustomObject] @{
+            Exists = $false
+            Value = ''
+        }
+    }
+    catch [System.Management.Automation.PSArgumentException] {
+        return [PSCustomObject] @{
+            Exists = $false
+            Value = ''
+        }
+    }
+}
+
+function Assert-SameRegistrySnapshot {
+    param(
+        [Parameter(Mandatory = $true)][object] $Before,
+        [Parameter(Mandatory = $true)][object] $After,
+        [Parameter(Mandatory = $true)][string] $Label
+    )
+
+    if ($Before.Exists -ne $After.Exists -or
+        [string] $Before.Value -cne [string] $After.Value) {
         throw "$Label changed during the portable smoke test."
     }
 }
@@ -461,15 +505,62 @@ try {
     $localAppData = [Environment]::GetFolderPath(
         [Environment+SpecialFolder]::LocalApplicationData
     )
-    if ([string]::IsNullOrWhiteSpace($localAppData)) {
-        throw 'Could not resolve Local AppData for the storage-isolation check.'
+    $startMenu = [Environment]::GetFolderPath(
+        [Environment+SpecialFolder]::StartMenu
+    )
+    $desktop = [Environment]::GetFolderPath(
+        [Environment+SpecialFolder]::DesktopDirectory
+    )
+    if ([string]::IsNullOrWhiteSpace($localAppData) -or
+        [string]::IsNullOrWhiteSpace($startMenu) -or
+        [string]::IsNullOrWhiteSpace($desktop)) {
+        throw 'Could not resolve current-user shell folders for the isolation check.'
     }
     $installedConfig = Join-Path $localAppData 'CursorPeek/config.ini'
+    $uninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CursorPeek'
+    $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    $startMenuShortcut = Join-Path $startMenu 'Programs\CursorPeek\CursorPeek.lnk'
+    $startMenuUninstall = Join-Path $startMenu 'Programs\CursorPeek\Uninstall CursorPeek.lnk'
+    $desktopShortcut = Join-Path $desktop 'CursorPeek.lnk'
     $installedBefore = Get-OptionalFileSnapshot $installedConfig
+    $startMenuBefore = Get-OptionalFileSnapshot $startMenuShortcut
+    $startMenuUninstallBefore = Get-OptionalFileSnapshot $startMenuUninstall
+    $desktopBefore = Get-OptionalFileSnapshot $desktopShortcut
+    $startupBefore = Get-OptionalRegistryValueSnapshot $runKey 'CursorPeek'
+    $registrationBefore = Get-OptionalRegistryValueSnapshot $uninstallKey 'DisplayVersion'
+
+    $initialExecutable = Join-Path $extractedRoot 'CursorPeek.exe'
+    $settingsOutput = Invoke-CursorPeek `
+        $initialExecutable `
+        '--settings-diagnostics' `
+        $extractedRoot
+    if ($settingsOutput -cne (
+        'Settings storage diagnostic completed: mode=portable, configuration_created=yes'
+    )) {
+        throw "Portable storage diagnostic returned an unexpected result: '$settingsOutput'."
+    }
+    $portableConfig = Join-Path $extractedRoot 'config.ini'
+    $configText = Read-StrictUtf8 $portableConfig
+    if (-not $configText.StartsWith("# CursorPeek settings`n") -or
+        -not $configText.Contains("dwell_delay_ms=400`n") -or
+        -not $configText.Contains("start_with_windows=false`n")) {
+        throw 'Portable configuration does not contain canonical defaults.'
+    }
+    $preservedConfig = $configText.Replace(
+        "dwell_delay_ms=400`n",
+        "dwell_delay_ms=700`n"
+    ) + "future_portable_test=preserved`n"
+    [System.IO.File]::WriteAllText(
+        $portableConfig,
+        $preservedConfig,
+        $utf8WithoutBom
+    )
+    $configBeforeRelocation = Get-OptionalFileSnapshot $portableConfig
 
     $relocatedRoot = Join-Path $testRoot 'Relocated CursorPeek'
     [System.IO.Directory]::Move($extractedRoot, $relocatedRoot)
     $relocatedExecutable = Join-Path $relocatedRoot 'CursorPeek.exe'
+    $relocatedConfig = Join-Path $relocatedRoot 'config.ini'
 
     $versionOutput = Invoke-CursorPeek `
         $relocatedExecutable `
@@ -479,22 +570,22 @@ try {
         throw "Relocated executable returned an unexpected version: '$versionOutput'."
     }
 
-    $settingsOutput = Invoke-CursorPeek `
+    $relocatedSettingsOutput = Invoke-CursorPeek `
         $relocatedExecutable `
         '--settings-diagnostics' `
         $relocatedRoot
-    if ($settingsOutput -cne (
+    if ($relocatedSettingsOutput -cne (
         'Settings storage diagnostic completed: mode=portable, configuration_created=yes'
     )) {
-        throw "Portable storage diagnostic returned an unexpected result: '$settingsOutput'."
+        throw (
+            'Relocated portable storage diagnostic returned an unexpected result: ' +
+            "'$relocatedSettingsOutput'."
+        )
     }
-    $portableConfig = Join-Path $relocatedRoot 'config.ini'
-    $configText = Read-StrictUtf8 $portableConfig
-    if (-not $configText.StartsWith("# CursorPeek settings`n") -or
-        -not $configText.Contains("dwell_delay_ms=") -or
-        -not $configText.Contains("start_with_windows=false")) {
-        throw 'Relocated portable configuration does not contain canonical defaults.'
-    }
+    Assert-SameSnapshot `
+        $configBeforeRelocation `
+        (Get-OptionalFileSnapshot $relocatedConfig) `
+        'Portable configuration'
 
     $workerOutput = Invoke-CursorPeek `
         $relocatedExecutable `
@@ -516,6 +607,26 @@ try {
         $installedBefore `
         $installedAfter `
         'Installed-mode configuration'
+    Assert-SameSnapshot `
+        $startMenuBefore `
+        (Get-OptionalFileSnapshot $startMenuShortcut) `
+        'Installed Start Menu shortcut'
+    Assert-SameSnapshot `
+        $startMenuUninstallBefore `
+        (Get-OptionalFileSnapshot $startMenuUninstall) `
+        'Installed uninstall shortcut'
+    Assert-SameSnapshot `
+        $desktopBefore `
+        (Get-OptionalFileSnapshot $desktopShortcut) `
+        'Installed desktop shortcut'
+    Assert-SameRegistrySnapshot `
+        $startupBefore `
+        (Get-OptionalRegistryValueSnapshot $runKey 'CursorPeek') `
+        'Installed startup registration'
+    Assert-SameRegistrySnapshot `
+        $registrationBefore `
+        (Get-OptionalRegistryValueSnapshot $uninstallKey 'DisplayVersion') `
+        'Installed uninstall registration'
 
     Start-Sleep -Milliseconds 100
     $residual = @(
@@ -536,7 +647,8 @@ try {
     Write-Output (
         (
             "Portable package smoke passed: version={0}, entries={1}, dependencies={2}, " +
-            "relocation=yes, portable_settings=yes, worker_recovery=yes, sha256={3}"
+            "configured_relocation=yes, installed_state_unchanged=yes, " +
+            "worker_recovery=yes, sha256={3}"
         ) -f
         $version,
         $entryNames.Count,

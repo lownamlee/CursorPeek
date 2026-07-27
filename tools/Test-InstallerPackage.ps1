@@ -370,6 +370,8 @@ try {
     }
 
     $checksumPath = Join-Path $installRoot 'SHA256SUMS.txt'
+    $readmePath = Join-Path $installRoot 'README.txt'
+    $packagedReadmeHash = Get-Sha256Hex $readmePath
     $checksumPaths = [System.Collections.Generic.HashSet[string]]::new(
         [System.StringComparer]::Ordinal
     )
@@ -466,10 +468,24 @@ try {
     ) + "future_installer_test=preserved`n"
     [System.IO.File]::WriteAllText($configPath, $preservedConfig, $utf8WithoutBom)
 
+    $predecessorVersion = '0.0.0-test'
+    Set-ItemProperty `
+        -LiteralPath $uninstallKey `
+        -Name 'DisplayVersion' `
+        -Value $predecessorVersion
+    [System.IO.File]::WriteAllText(
+        $readmePath,
+        "CursorPeek predecessor payload fixture`n",
+        $utf8WithoutBom
+    )
+    if ((Get-Sha256Hex $readmePath) -ceq $packagedReadmeHash) {
+        throw 'Predecessor fixture did not replace the installed payload.'
+    }
+
     $running = Start-Process -FilePath $executable -PassThru
     Start-Sleep -Milliseconds 750
     if ($running.HasExited) {
-        throw 'CursorPeek exited before repair could exercise graceful shutdown.'
+        throw 'CursorPeek exited before upgrade could exercise graceful shutdown.'
     }
 
     Invoke-NativeProcess `
@@ -477,29 +493,33 @@ try {
         "/S /STARTMENU=1 /DESKTOP=1 /STARTUP=1 /D=$installRoot"
     Wait-Until `
         { $running.HasExited } `
-        'Repair did not gracefully stop the running CursorPeek instance.'
+        'Upgrade did not gracefully stop the running CursorPeek instance.'
     $running.Dispose()
 
     if (-not [System.IO.File]::Exists($sentinelPath) -or
         (Read-StrictUtf8 $configPath) -notmatch '(?m)^dwell_delay_ms=700$' -or
         (Read-StrictUtf8 $configPath) -notmatch '(?m)^future_installer_test=preserved$' -or
         (Read-StrictUtf8 $configPath) -notmatch '(?m)^start_with_windows=true$') {
-        throw 'Repair did not preserve user files and settings while applying startup.'
+        throw 'Upgrade did not preserve user files and settings while applying startup.'
+    }
+    if ((Get-Sha256Hex $readmePath) -cne $packagedReadmeHash) {
+        throw 'Upgrade did not replace the predecessor payload.'
     }
     if (-not (Test-Path -LiteralPath $desktopShortcut) -or
         -not (Test-Path -LiteralPath $startMenuShortcut)) {
-        throw 'Repair did not apply the requested shortcut selections.'
+        throw 'Upgrade did not apply the requested shortcut selections.'
     }
     $expectedRunCommand = '"' + $executable + '"'
     $runValue = Get-ItemPropertyValue -LiteralPath $runKey -Name 'CursorPeek'
     if ([string] $runValue -cne $expectedRunCommand) {
-        throw "Repair wrote an unexpected startup command '$runValue'."
+        throw "Upgrade wrote an unexpected startup command '$runValue'."
     }
     $registration = Get-ItemProperty -LiteralPath $uninstallKey
-    if ([int] $registration.StartMenuShortcut -ne 1 -or
+    if ($registration.DisplayVersion -cne $version -or
+        [int] $registration.StartMenuShortcut -ne 1 -or
         [int] $registration.DesktopShortcut -ne 1 -or
         [int] $registration.StartWithWindows -ne 1) {
-        throw 'Repair did not persist component selections.'
+        throw 'Upgrade did not restore the current version and component selections.'
     }
 
     Invoke-NativeProcess $uninstaller '/S'
@@ -549,11 +569,50 @@ try {
 
     [System.IO.File]::Delete($sentinelPath)
     [System.IO.Directory]::Delete($installRoot)
+
+    Invoke-NativeProcess `
+        $resolvedInstaller `
+        "/S /STARTMENU=0 /DESKTOP=0 /STARTUP=0 /D=$installRoot"
+    $uninstaller = Join-Path $installRoot 'Uninstall.exe'
+    Invoke-NativeProcess $uninstaller '/S'
+    Wait-Until `
+        {
+            -not (Test-Path -LiteralPath $installRoot) -and
+            -not (Test-Path -LiteralPath $uninstallKey)
+        } `
+        'Clean uninstall left its installation directory or registration.'
+    foreach ($residue in @(
+        $configDirectory,
+        $startMenuDirectory,
+        $desktopShortcut
+    )) {
+        if (Test-Path -LiteralPath $residue) {
+            throw "Clean uninstall left product state '$residue'."
+        }
+    }
+    $remainingRunValue = $null
+    try {
+        $remainingRunValue = Get-ItemPropertyValue `
+            -LiteralPath $runKey `
+            -Name 'CursorPeek' `
+            -ErrorAction Stop
+    }
+    catch [System.Management.Automation.ItemNotFoundException] {
+    }
+    catch [System.Management.Automation.PSArgumentException] {
+    }
+    if (-not [string]::IsNullOrEmpty([string] $remainingRunValue)) {
+        throw 'Clean uninstall left the CursorPeek startup value.'
+    }
+    if (@(Get-Process -Name CursorPeek -ErrorAction SilentlyContinue).Count -ne 0) {
+        throw 'Clean uninstall left CursorPeek running.'
+    }
+
     Write-Output (
         (
-            "Installer lifecycle passed: version={0}, default_install=yes, repair=yes, " +
+            "Installer lifecycle passed: version={0}, default_install=yes, upgrade=yes, " +
             "settings_preserved=yes, running_app_shutdown=yes, uninstall=yes, " +
-            "user_file_preserved=yes, sha256={1}"
+            "user_file_preserved=yes, zero_residue=yes, sha256={1}"
         ) -f
         $version,
         $installerHash
