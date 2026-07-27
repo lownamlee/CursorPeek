@@ -48,7 +48,8 @@ The release executable is written to `target\release\CursorPeek.exe`.
 cargo fmt --all -- --check
 cargo test --locked
 cargo test --locked --all-features
-cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo clippy --locked --all-targets --all-features -- `
+    -D warnings -D clippy::undocumented_unsafe_blocks
 cargo build --locked --release
 .\tools\Test-WindowsQuality.ps1
 ```

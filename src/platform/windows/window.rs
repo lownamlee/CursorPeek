@@ -1711,15 +1711,16 @@ mod tests {
             // SAFETY: `first_handle` belongs to the live window on this test thread.
             assert!(unsafe { IsWindow(Some(first_handle)).as_bool() });
             // SAFETY: The exact class is process-private. The null-parent search finds the hidden
-            // top-level coordinator; HWND_MESSAGE must not find it.
-            assert_eq!(
-                unsafe { FindWindowExW(None, None, CLASS_NAME, PCWSTR::null()) }
-                    .expect("the top-level coordinator should be discoverable"),
-                first_handle
-            );
+            // top-level coordinator.
+            let top_level = unsafe { FindWindowExW(None, None, CLASS_NAME, PCWSTR::null()) }
+                .expect("the top-level coordinator should be discoverable");
+            assert_eq!(top_level, first_handle);
+            // SAFETY: The same exact class lookup is read-only; searching HWND_MESSAGE verifies the
+            // coordinator was not created in the message-only hierarchy.
+            let message_only =
+                unsafe { FindWindowExW(Some(HWND_MESSAGE), None, CLASS_NAME, PCWSTR::null()) };
             assert!(
-                unsafe { FindWindowExW(Some(HWND_MESSAGE), None, CLASS_NAME, PCWSTR::null()) }
-                    .is_err(),
+                message_only.is_err(),
                 "the coordinator must not remain message-only because broadcasts would be lost"
             );
             assert!(
@@ -1769,18 +1770,16 @@ mod tests {
                 let mut queued = MSG::default();
                 // SAFETY: queued is writable storage; the exact private-message filter removes
                 // only CursorPeek's reduced lifecycle event from this owning thread's queue.
-                assert!(
-                    unsafe {
-                        PeekMessageW(
-                            &mut queued,
-                            Some(first_handle),
-                            SYSTEM_LIFECYCLE_CHANGED_MESSAGE,
-                            SYSTEM_LIFECYCLE_CHANGED_MESSAGE,
-                            PM_REMOVE,
-                        )
-                    }
-                    .as_bool()
-                );
+                let found = unsafe {
+                    PeekMessageW(
+                        &mut queued,
+                        Some(first_handle),
+                        SYSTEM_LIFECYCLE_CHANGED_MESSAGE,
+                        SYSTEM_LIFECYCLE_CHANGED_MESSAGE,
+                        PM_REMOVE,
+                    )
+                };
+                assert!(found.as_bool());
                 assert_eq!(
                     SystemLifecycleChange::from_message_parameter(queued.wParam.0),
                     Some(expected)
@@ -1789,23 +1788,27 @@ mod tests {
 
             // Unrelated settings broadcasts still receive default processing and do not cancel
             // product state through the private lifecycle path.
+            // SAFETY: This synchronous pointer-free message targets the live coordinator owned by
+            // the current test thread.
             unsafe { SendMessageW(first_handle, WM_SETTINGCHANGE, Some(WPARAM(0)), None) };
             let mut unrelated = MSG::default();
-            assert!(
-                !unsafe {
-                    PeekMessageW(
-                        &mut unrelated,
-                        Some(first_handle),
-                        SYSTEM_LIFECYCLE_CHANGED_MESSAGE,
-                        SYSTEM_LIFECYCLE_CHANGED_MESSAGE,
-                        PM_REMOVE,
-                    )
-                }
-                .as_bool()
-            );
+            // SAFETY: `unrelated` is writable and the exact private filter only inspects this
+            // thread's live coordinator queue.
+            let found = unsafe {
+                PeekMessageW(
+                    &mut unrelated,
+                    Some(first_handle),
+                    SYSTEM_LIFECYCLE_CHANGED_MESSAGE,
+                    SYSTEM_LIFECYCLE_CHANGED_MESSAGE,
+                    PM_REMOVE,
+                )
+            };
+            assert!(!found.as_bool());
 
             // Unknown or pointer-bearing power events stay with DefWindowProc and are never
             // copied into CursorPeek's scalar lifecycle queue.
+            // SAFETY: The deliberately unknown scalar parameter carries no pointer and is sent
+            // synchronously to the live coordinator on this test thread.
             unsafe {
                 SendMessageW(
                     first_handle,
@@ -1814,18 +1817,18 @@ mod tests {
                     None,
                 )
             };
-            assert!(
-                !unsafe {
-                    PeekMessageW(
-                        &mut unrelated,
-                        Some(first_handle),
-                        SYSTEM_LIFECYCLE_CHANGED_MESSAGE,
-                        SYSTEM_LIFECYCLE_CHANGED_MESSAGE,
-                        PM_REMOVE,
-                    )
-                }
-                .as_bool()
-            );
+            // SAFETY: `unrelated` remains writable and the private-message filter only reads this
+            // thread's live coordinator queue.
+            let found = unsafe {
+                PeekMessageW(
+                    &mut unrelated,
+                    Some(first_handle),
+                    SYSTEM_LIFECYCLE_CHANGED_MESSAGE,
+                    SYSTEM_LIFECYCLE_CHANGED_MESSAGE,
+                    PM_REMOVE,
+                )
+            };
+            assert!(!found.as_bool());
 
             first.restart_dwell(PhysicalScreenPoint::new(-10, 20), Instant::now());
             assert!(first.dwell_timer_is_armed());

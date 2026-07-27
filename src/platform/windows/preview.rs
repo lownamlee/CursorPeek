@@ -340,6 +340,8 @@ impl PreviewWindow {
         let length =
             unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowTextLengthW(self.hwnd) };
         let mut units = vec![0_u16; usize::try_from(length).unwrap_or(0) + 1];
+        // SAFETY: `units` is writable for the advertised length plus its terminator, and the live
+        // HWND is used synchronously on its owning thread.
         let copied = unsafe {
             windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(self.hwnd, &mut units)
         };
@@ -421,6 +423,8 @@ impl PreviewWindowState {
         // reference counting.
         let d2d_factory: ID2D1Factory =
             unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None) }?;
+        // SAFETY: The current UI thread has a live COM apartment and the call returns an owned,
+        // reference-counted factory interface without borrowing caller storage.
         let dwrite_factory: IDWriteFactory =
             unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }?;
 
@@ -527,14 +531,18 @@ impl PreviewWindowState {
             )?
         };
         let body = match content {
-            RetainedContent::Text(content) if !content.body.is_empty() => Some(unsafe {
-                self.dwrite_factory.CreateTextLayout(
-                    &content.body,
-                    &self.formats.body,
-                    layout_width,
-                    body_height,
-                )?
-            }),
+            RetainedContent::Text(content) if !content.body.is_empty() => {
+                // SAFETY: The bounded UTF-16 body and retained format remain valid for this
+                // synchronous call; DirectWrite returns an independently owned layout.
+                Some(unsafe {
+                    self.dwrite_factory.CreateTextLayout(
+                        &content.body,
+                        &self.formats.body,
+                        layout_width,
+                        body_height,
+                    )?
+                })
+            }
             RetainedContent::Text(_) | RetainedContent::Image(_) => None,
         };
         Ok(ContentLayouts {
@@ -674,7 +682,11 @@ impl PreviewWindowState {
             self.d2d_factory
                 .CreateHwndRenderTarget(&target_properties, &hwnd_properties)?
         };
+        // SAFETY: `target` is a live render target and the color value is fully initialized; the
+        // call returns an owned COM brush without retaining the Rust reference.
         let body_brush = unsafe { target.CreateSolidColorBrush(&self.colors.body, None) }?;
+        // SAFETY: The same live target synchronously copies the initialized metadata color and
+        // returns a separate owned COM brush.
         let metadata_brush = unsafe { target.CreateSolidColorBrush(&self.colors.metadata, None) }?;
         Ok(DeviceResources {
             target,
@@ -768,6 +780,8 @@ impl TextFormats {
                 w!("en-US"),
             )?
         };
+        // SAFETY: The terminated family buffer remains live for this synchronous call, the
+        // factory is valid, and DirectWrite retains its own format state.
         let body = unsafe {
             factory.CreateTextFormat(
                 family,
@@ -1174,6 +1188,8 @@ fn dispatch_preview_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
         // SAFETY: WM_NCCREATE supplies a valid CREATESTRUCTW whose lpCreateParams is the stable
         // RefCell pointer passed to CreateWindowExW.
         let state = unsafe { &*(lparam.0 as *const CREATESTRUCTW) }.lpCreateParams;
+        // SAFETY: `hwnd` is being initialized and `state` is the stable non-owning pointer supplied
+        // by this process. Storing the integer value does not dereference or transfer it.
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
         }
@@ -1297,7 +1313,13 @@ fn preview_state(hwnd: HWND) -> Option<&'static RefCell<PreviewWindowState>> {
     // SAFETY: PreviewWindow stores a stable Box pointer at WM_NCCREATE and clears it before either
     // HWND or Box teardown. This helper is called only synchronously on the owning UI thread.
     let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) };
-    (pointer != 0).then(|| unsafe { &*(pointer as *const RefCell<PreviewWindowState>) })
+    if pointer == 0 {
+        None
+    } else {
+        // SAFETY: The nonzero value is exactly the stable Box pointer described above; access is
+        // confined to the owning UI thread and ends before either the HWND or Box can be destroyed.
+        Some(unsafe { &*(pointer as *const RefCell<PreviewWindowState>) })
+    }
 }
 
 #[cfg(test)]

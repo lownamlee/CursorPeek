@@ -33,8 +33,8 @@ impl SingleInstance {
         // SAFETY: Default security is appropriate for this per-session user application, the
         // handle is non-inheritable, initial ownership is not requested, and `name` is terminated.
         let handle = unsafe { CreateMutexW(None, false, name)? };
-        // GetLastError must be sampled immediately after successful CreateMutexW: it distinguishes
-        // an atomic first creation from opening the already-live named object.
+        // SAFETY: GetLastError only reads the calling thread's last-error slot. It is sampled
+        // immediately after successful CreateMutexW so no intervening Win32 call can replace it.
         let already_exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
         // SAFETY: CreateMutexW returned a live owned HANDLE. OwnedHandle closes it exactly once;
         // ReleaseMutex is unnecessary because initial ownership was never requested.
@@ -74,6 +74,8 @@ pub(crate) fn activate_existing_instance() -> Result<()> {
     // If this second launch owns foreground permission, transfer it to the existing process so
     // its native menu can satisfy SetForegroundWindow. The activation message remains useful even
     // when policy rejects this optional transfer.
+    // SAFETY: `process_id` came from the live coordinator HWND. This call grants a Windows
+    // foreground-policy permission and neither transfers ownership nor dereferences a pointer.
     let _ = unsafe { AllowSetForegroundWindow(process_id) };
 
     // SAFETY: The private message carries no pointers and targets the exact live coordinator.

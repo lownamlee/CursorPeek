@@ -62,8 +62,11 @@ impl ExplorerResolver {
         // COM class whose default interface is IUIAutomation2; no aggregation is requested.
         let automation: IUIAutomation2 =
             unsafe { CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER)? };
+        // SAFETY: The same live MTA owns this in-process, non-aggregated registrar interface.
         let registrar: IUIAutomationRegistrar =
             unsafe { CoCreateInstance(&CUIAutomationRegistrar, None, CLSCTX_INPROC_SERVER)? };
+        // SAFETY: The registrar is live on its owning MTA and synchronously copies the fully
+        // initialized property description and static programmatic-name string.
         let item_index_property = UIA_PROPERTY_ID(unsafe {
             registrar.RegisterProperty(&UIAutomationPropertyInfo {
                 guid: ItemIndex_Property_GUID,
@@ -311,6 +314,8 @@ impl ExplorerResolver {
             })
         }
         .map_err(|error| shell::ShellRejection::CandidateRevalidationFailed(error.code().0))?;
+        // SAFETY: `hit`, the walker, and cache request are live COM interfaces on their owning MTA;
+        // the synchronous call returns an owned normalized element.
         let updated = unsafe {
             self.item_walker
                 .NormalizeElementBuildCache(&hit, &self.cache_request)

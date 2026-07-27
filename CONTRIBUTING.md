@@ -26,8 +26,10 @@ cargo fmt --all -- --check
 cargo fmt --manifest-path fuzz/Cargo.toml --all -- --check
 cargo test --locked --workspace
 cargo test --locked --workspace --all-features
-cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo clippy --locked --workspace --all-targets --all-features -- `
+    -D warnings -D clippy::undocumented_unsafe_blocks
 cargo build --locked --release
+cargo deny --locked --workspace check
 ```
 
 Changes to Windows resources or the release executable should also run:
@@ -36,6 +38,7 @@ Changes to Windows resources or the release executable should also run:
 .\tools\Test-PerformanceBudget.ps1
 .\tools\Test-RecoverySoak.ps1
 .\tools\Test-WindowsQuality.ps1
+.\tools\New-ReleaseSbom.ps1
 ```
 
 Tests that exercise shared qualification paths must run sequentially. Real Explorer behavior,

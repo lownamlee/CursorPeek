@@ -314,9 +314,8 @@ struct PopupMenu {
 impl PopupMenu {
     fn new() -> Result<Self> {
         // SAFETY: CreatePopupMenu has no preconditions and transfers ownership on success.
-        Ok(Self {
-            handle: unsafe { CreatePopupMenu()? },
-        })
+        let handle = unsafe { CreatePopupMenu()? };
+        Ok(Self { handle })
     }
 
     fn create(state: TrayMenuState) -> Result<Self> {
@@ -602,6 +601,7 @@ mod tests {
         assert!(!settings.0.is_null());
         // SAFETY: `settings` is the live submenu returned above and its first two items are menus.
         let dwell = unsafe { GetSubMenu(settings, 0) };
+        // SAFETY: `settings` remains live and its second item is the preview-size submenu.
         let preview = unsafe { GetSubMenu(settings, 1) };
         assert!(!dwell.0.is_null());
         assert!(!preview.0.is_null());
@@ -680,10 +680,8 @@ mod tests {
             NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP
         );
         // SAFETY: The successful helper initialized the uVersion union member before returning.
-        assert_eq!(
-            unsafe { recovered.Anonymous.uVersion },
-            NOTIFYICON_VERSION_4
-        );
+        let recovered_version = unsafe { recovered.Anonymous.uVersion };
+        assert_eq!(recovered_version, NOTIFYICON_VERSION_4);
 
         let mut rejected = NOTIFYICONDATAW::default();
         let mut rejected_state = false;

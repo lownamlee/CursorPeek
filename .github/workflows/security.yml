@@ -1,0 +1,102 @@
+name: Supply-chain security
+
+on:
+    push:
+        branches:
+            - main
+    pull_request:
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    audit:
+        name: Dependencies, licenses, and SBOM
+        runs-on: ubuntu-24.04
+        timeout-minutes: 20
+
+        defaults:
+            run:
+                shell: pwsh
+
+        env:
+            CARGO_DENY_VERSION: 0.20.2
+            CARGO_CYCLONEDX_VERSION: 0.5.9
+            CARGO_INCREMENTAL: "0"
+            CARGO_TERM_COLOR: always
+
+        steps:
+            - name: Check out source
+              uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+              with:
+                  persist-credentials: false
+
+            - name: Install pinned Rust toolchain
+              run: |
+                  $match = Select-String `
+                    -LiteralPath rust-toolchain.toml `
+                    -Pattern '^\s*channel\s*=\s*"([^"]+)"\s*$'
+                  if ($match.Count -ne 1) {
+                      throw "rust-toolchain.toml must declare exactly one channel."
+                  }
+                  $toolchain = $match.Matches[0].Groups[1].Value
+                  rustup toolchain install $toolchain `
+                    --profile minimal `
+                    --no-self-update
+                  rustup override set $toolchain
+                  rustc --version --verbose
+                  cargo --version --verbose
+
+            - name: Install pinned audit tools
+              run: |
+                  cargo install cargo-deny `
+                    --version $env:CARGO_DENY_VERSION `
+                    --locked
+                  cargo install cargo-cyclonedx `
+                    --version $env:CARGO_CYCLONEDX_VERSION `
+                    --locked
+
+            - name: Audit release dependencies
+              run: cargo deny --locked --workspace check
+
+            - name: Audit fuzz-tool dependencies
+              run: >
+                  cargo deny
+                  --manifest-path fuzz/Cargo.toml
+                  --config deny.toml
+                  --locked
+                  --target x86_64-unknown-linux-gnu
+                  --all-features
+                  check
+
+            - name: Generate reproducible release SBOM
+              run: |
+                  ./tools/New-ReleaseSbom.ps1 `
+                    -OutputPath target/security/CursorPeek.cdx.json
+                  ./tools/New-ReleaseSbom.ps1 `
+                    -OutputPath target/security/CursorPeek.repeated.cdx.json
+                  $first = (Get-FileHash `
+                    -Algorithm SHA256 `
+                    -LiteralPath target/security/CursorPeek.cdx.json).Hash
+                  $second = (Get-FileHash `
+                    -Algorithm SHA256 `
+                    -LiteralPath target/security/CursorPeek.repeated.cdx.json).Hash
+                  if ($first -cne $second) {
+                      throw "Repeated SBOM generation was not deterministic."
+                  }
+                  Remove-Item `
+                    -LiteralPath target/security/CursorPeek.repeated.cdx.json `
+                    -Force
+
+            - name: Upload release SBOM
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+              with:
+                  name: cursorpeek-sbom-${{ github.sha }}
+                  path: target/security/CursorPeek.cdx.json
+                  if-no-files-found: error
+                  retention-days: 14

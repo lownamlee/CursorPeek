@@ -198,6 +198,8 @@ impl PreviewFile {
 }
 
 fn require_disk_file(file: &File) -> Result<(), PreviewFileError> {
+    // SAFETY: `file_handle` borrows a live `File`; GetFileType only inspects that handle and does
+    // not retain or close it.
     let file_type = unsafe { GetFileType(file_handle(file)) };
     if file_type == FILE_TYPE_DISK {
         Ok(())
@@ -716,6 +718,8 @@ mod tests {
         let path = root.path().join("offline.txt");
         fs::write(&path, b"must not be read").unwrap();
         let units = null_terminated_path(&path).unwrap();
+        // SAFETY: `units` is a terminated path to this test-owned disposable file and remains live
+        // for the synchronous attribute update.
         unsafe { SetFileAttributesW(PCWSTR(units.as_ptr()), FILE_ATTRIBUTE_OFFLINE) }
             .expect("the disposable fixture should accept the offline attribute");
 
