@@ -274,15 +274,29 @@ catch [System.Management.Automation.PSArgumentException] {
 }
 
 $preexisting = @(
-    [PSCustomObject] @{ Label = 'uninstall registration'; Exists = Test-Path $uninstallKey },
-    [PSCustomObject] @{ Label = 'installed configuration'; Exists = Test-Path $configDirectory },
-    [PSCustomObject] @{ Label = 'Start Menu shortcuts'; Exists = Test-Path $startMenuDirectory },
-    [PSCustomObject] @{ Label = 'desktop shortcut'; Exists = Test-Path $desktopShortcut },
-    [PSCustomObject] @{
-        Label = 'startup registration'
-        Exists = -not [string]::IsNullOrEmpty([string] $existingRunValue)
-    }
-) | Where-Object { $_.Exists }
+    @(
+        [PSCustomObject] @{
+            Label = 'uninstall registration'
+            Exists = Test-Path $uninstallKey
+        },
+        [PSCustomObject] @{
+            Label = 'installed configuration'
+            Exists = Test-Path $configDirectory
+        },
+        [PSCustomObject] @{
+            Label = 'Start Menu shortcuts'
+            Exists = Test-Path $startMenuDirectory
+        },
+        [PSCustomObject] @{
+            Label = 'desktop shortcut'
+            Exists = Test-Path $desktopShortcut
+        },
+        [PSCustomObject] @{
+            Label = 'startup registration'
+            Exists = -not [string]::IsNullOrEmpty([string] $existingRunValue)
+        }
+    ) | Where-Object { $_.Exists }
+)
 if ($preexisting.Count -ne 0) {
     throw (
         'Installer lifecycle test requires a clean current-user CursorPeek state; found ' +
