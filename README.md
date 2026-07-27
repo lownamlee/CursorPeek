@@ -6,10 +6,13 @@ files when you hover over them in File Explorer.
 It stays in the notification area, keeps Explorer focused, works offline, and does not require an
 account, cloud service, background server, or external runtime.
 
-> CursorPeek is preparing its first release. Until packaged downloads are published, build it from
-> source or use a test build supplied for qualification. Candidate packages are unsigned; review
-> the [0.1 changelog](CHANGELOG.md) and [known limitations](docs/KNOWN_LIMITATIONS.md) before
-> testing them.
+> CursorPeek 0.1.0 is available as a
+> [per-user installer](https://github.com/lownamlee/CursorPeek/releases/latest/download/CursorPeek-0.1.0-windows-x64-setup.exe)
+> or a
+> [portable ZIP](https://github.com/lownamlee/CursorPeek/releases/latest/download/CursorPeek-0.1.0-windows-x64-portable.zip).
+> The packages are unsigned; review the [0.1 changelog](CHANGELOG.md), verify the
+> [published checksums](https://github.com/lownamlee/CursorPeek/releases/latest/download/SHA256SUMS.txt),
+> and read the [known limitations](docs/KNOWN_LIMITATIONS.md) before running them.
 
 ## What it previews
 
@@ -32,6 +35,15 @@ settings, limits, diagnostics, and troubleshooting. The
 - File Explorer
 
 Packaged builds are self-contained and do not require Rust or the Visual C++ Redistributable.
+
+## Install or run
+
+The per-user installer requests no administrator elevation and supports Start Menu, desktop, and
+startup options. For a portable copy, extract the complete ZIP and run `CursorPeek.exe`; keep
+`CursorPeek.portable` beside it so settings remain in that folder.
+
+Both packages, their checksums, the CycloneDX SBOM, and build provenance are published on the
+[CursorPeek 0.1.0 release](https://github.com/lownamlee/CursorPeek/releases/tag/v0.1.0).
 
 ## Build from source
 

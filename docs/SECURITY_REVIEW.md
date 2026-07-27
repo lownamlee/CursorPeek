@@ -81,6 +81,7 @@ distribution lifecycle relocates an already configured portable copy without cha
 state, upgrades an older registered install with settings and user files preserved, stops a running
 instance, and finishes a separate uninstall with zero product residue. The per-user installer uses
 a hash-pinned NSIS compiler, carries the distribution's exact multi-license `COPYING` notice, and
-removes only its explicit owned-file list. Candidate documentation discloses the unsigned status
-and remaining scope limits. Exact-source release-candidate rebuild and maintainer acceptance remain
-later gates. This review does not authorize publishing `v0.1.0`.
+removes only its explicit owned-file list. Release documentation discloses the unsigned status and
+remaining scope limits. The maintainer accepted the manually tested 0.1 packages. The tag-only
+workflow must still rebuild the exact source, repeat the security and package gates, verify the
+draft asset digests, create provenance and SBOM attestations, and publish only as its final action.

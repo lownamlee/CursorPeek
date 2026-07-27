@@ -128,8 +128,8 @@ the installation directory.
 - Advisory and license automation depends on published metadata and known databases; it is not a
   legal opinion or a malicious-source-code detector.
 - Explorer or a sync provider may hydrate content before CursorPeek observes the final attributes.
-- Version 0.1 candidates are unsigned unless the release notes explicitly say otherwise.
-- Touchpad, pen, and RDP behavior remains a manual release-candidate check when those environments
-  are available; it is not used as a claimed isolation control.
+- Version 0.1 packages are unsigned unless the release notes explicitly say otherwise.
+- Touchpad, pen, and RDP behavior can vary with the specific device, driver, or session; it is not
+  used as a claimed isolation control.
 
 Security reports should follow [SECURITY.md](SECURITY.md).

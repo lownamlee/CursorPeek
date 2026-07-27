@@ -1,8 +1,8 @@
 # CursorPeek 0.1 known limitations
 
-This document describes deliberate scope boundaries and release-candidate limitations. A file that
-does not preview is not necessarily an application failure: CursorPeek normally shows nothing when
-identity, locality, format, or resource checks cannot be satisfied safely.
+This document describes the deliberate scope boundaries of CursorPeek 0.1. A file that does not
+preview is not necessarily an application failure: CursorPeek normally shows nothing when identity,
+locality, format, or resource checks cannot be satisfied safely.
 
 ## Platform and Explorer
 
@@ -32,17 +32,17 @@ identity, locality, format, or resource checks cannot be satisfied safely.
 
 ## Input and session coverage
 
-- The retained release evidence primarily exercises ordinary mouse input in an interactive local
-  session. Touchpad, pen, and Remote Desktop input paths need hands-on candidate testing on the
-  specific device or session; device-specific Raw Input gaps should be reported.
+- The retained automated evidence primarily exercises ordinary mouse input in an interactive local
+  session. Touchpad, pen, and Remote Desktop behavior can depend on the specific device, driver, or
+  session; device-specific Raw Input gaps should be reported.
 - CursorPeek runs one coordinator per local interactive session. It is not designed as a service
   or for non-interactive/server sessions.
 
 ## Distribution and updates
 
-- The 0.1 candidate packages are not Authenticode-signed. Windows SmartScreen or security software
-  may show an unknown-publisher warning. Verify the package with the published `SHA256SUMS.txt` and
-  GitHub artifact attestation before running it.
+- The 0.1 packages are not Authenticode-signed. Windows SmartScreen or security software may show
+  an unknown-publisher warning. Verify the package with the published `SHA256SUMS.txt` and GitHub
+  artifact attestation before running it.
 - CursorPeek has no automatic updater or update notification. Updating requires downloading and
   installing or replacing a newer package manually.
 - Moving a portable folder after enabling **Start with Windows** leaves the old executable path in

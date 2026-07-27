@@ -5,7 +5,7 @@ corresponding version is published.
 
 ## Unreleased
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-07-27
 
 ### Added
 
@@ -34,4 +34,6 @@ corresponding version is published.
 ### Known limitations
 
 Version 0.1 is intentionally narrow. See
-[Known limitations](docs/KNOWN_LIMITATIONS.md) before installing or testing a candidate build.
+[Known limitations](docs/KNOWN_LIMITATIONS.md) before installing or running this release.
+
+[0.1.0]: https://github.com/lownamlee/CursorPeek/releases/tag/v0.1.0
