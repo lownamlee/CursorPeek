@@ -265,7 +265,7 @@ FunctionEnd
     "Start CursorPeek automatically when the current user signs in."
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
-Section "!Remove CursorPeek" un.SecUninstall
+Section "un.Remove CursorPeek" un.SecUninstall
   SectionIn RO
   SetShellVarContext current
   SetRegView 64
@@ -300,7 +300,7 @@ startup_removed:
   DeleteRegKey HKCU "${UNINSTALL_KEY}"
 SectionEnd
 
-Section "Remove user settings" un.SecRemoveSettings
+Section "un.Remove user settings" un.SecRemoveSettings
   Delete "$LOCALAPPDATA\CursorPeek\config.ini"
   RMDir "$LOCALAPPDATA\CursorPeek"
 SectionEnd

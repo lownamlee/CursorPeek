@@ -203,6 +203,21 @@ fn windows_icon_generator_emits_required_rgba_frames() {
 }
 
 #[test]
+fn nsis_cleanup_sections_are_uninstaller_only() {
+    let script = fs::read_to_string(repository_path("packaging/CursorPeek.nsi"))
+        .expect("the NSIS installer script should be readable");
+
+    assert!(
+        script.contains(r#"Section "un.Remove CursorPeek" un.SecUninstall"#),
+        "the required cleanup section name must use NSIS's uninstaller prefix"
+    );
+    assert!(
+        script.contains(r#"Section "un.Remove user settings" un.SecRemoveSettings"#),
+        "the optional settings cleanup section name must use NSIS's uninstaller prefix"
+    );
+}
+
+#[test]
 fn qualification_schema_examples_validate_but_do_not_pass_the_gate() {
     let mut validation_arguments = example_arguments();
     validation_arguments.push("-ValidateOnly".into());
