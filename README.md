@@ -7,7 +7,9 @@ It stays in the notification area, keeps Explorer focused, works offline, and do
 account, cloud service, background server, or external runtime.
 
 > CursorPeek is preparing its first release. Until packaged downloads are published, build it from
-> source or use a test build supplied for qualification.
+> source or use a test build supplied for qualification. Candidate packages are unsigned; review
+> the [0.1 changelog](CHANGELOG.md) and [known limitations](docs/KNOWN_LIMITATIONS.md) before
+> testing them.
 
 ## What it previews
 
@@ -20,8 +22,9 @@ placeholders that require download. Text is displayed as inert plain text; marku
 never executed.
 
 See the [user guide](docs/USER_GUIDE.md) for the complete format list, portable mode, tray
-settings, limits, diagnostics, and troubleshooting. See [PRIVACY.md](PRIVACY.md) for the local-only
-data policy and containment boundary.
+settings, limits, diagnostics, and troubleshooting. The
+[known limitations](docs/KNOWN_LIMITATIONS.md) describe the deliberate 0.1 scope. See
+[PRIVACY.md](PRIVACY.md) for the local-only data policy and containment boundary.
 
 ## Requirements
 
@@ -50,9 +53,9 @@ To create and validate a local portable package from a clean source tree:
     -PackagePath .\target\packages\CursorPeek-0.1.0-windows-x64-portable.zip
 ```
 
-The ZIP contains the portable marker, user and security documentation, project licenses, exact
-third-party license files, release metadata, and internal checksums. Its adjacent `.sha256` file
-verifies the complete archive.
+The ZIP contains the portable marker, changelog, known limitations, user and security
+documentation, project licenses, exact third-party license files, release metadata, and internal
+checksums. Its adjacent `.sha256` file verifies the complete archive.
 
 To build the per-user installer from that qualified portable archive:
 

@@ -320,10 +320,12 @@ for ($index = 0; $index -lt $sortedEntryNames.Count; $index++) {
 $requiredEntries = @(
     "$packageRootName/CursorPeek.exe",
     "$packageRootName/CursorPeek.portable",
+    "$packageRootName/CHANGELOG.md",
     "$packageRootName/README.txt",
     "$packageRootName/RELEASE-METADATA.json",
     "$packageRootName/SHA256SUMS.txt",
     "$packageRootName/THIRD-PARTY-NOTICES.txt",
+    "$packageRootName/docs/KNOWN_LIMITATIONS.md",
     "$packageRootName/docs/PRIVACY.md",
     "$packageRootName/docs/SECURITY.md",
     "$packageRootName/docs/THREAT_MODEL.md",

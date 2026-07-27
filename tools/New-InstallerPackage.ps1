@@ -357,10 +357,12 @@ try {
     foreach ($requiredRelativePath in @(
         'CursorPeek.exe',
         'CursorPeek.portable',
+        'CHANGELOG.md',
         'README.txt',
         'RELEASE-METADATA.json',
         'SHA256SUMS.txt',
         'THIRD-PARTY-NOTICES.txt',
+        'docs/KNOWN_LIMITATIONS.md',
         'docs/PRIVACY.md',
         'docs/SECURITY.md',
         'docs/THREAT_MODEL.md',
@@ -476,8 +478,8 @@ No administrator rights or separate runtime is required. User settings are
 stored in %LOCALAPPDATA%\CursorPeek\config.ini. The uninstaller can either
 remove that configuration or preserve it for a later reinstall.
 
-The binary may be unsigned. Read docs\USER_GUIDE.md for supported formats,
-privacy, limits, and troubleshooting.
+The binary may be unsigned. Read docs\KNOWN_LIMITATIONS.md before testing and
+docs\USER_GUIDE.md for supported formats, privacy, limits, and troubleshooting.
 "@
     Write-CanonicalText (Join-Path $payloadRoot 'README.txt') "$installedReadme`n"
 

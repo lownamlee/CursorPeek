@@ -4,6 +4,9 @@ CursorPeek shows a temporary preview after the pointer rests over a supported lo
 Windows File Explorer. It runs as a notification-area application and does not replace Explorer,
 install a shell extension, or open a network service.
 
+Read the [0.1 known limitations](KNOWN_LIMITATIONS.md) before installing or testing a candidate
+build.
+
 ## Start and exit
 
 Run `CursorPeek.exe`. Its icon appears in the notification area. Windows may place the icon behind

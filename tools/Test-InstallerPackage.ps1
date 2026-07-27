@@ -324,10 +324,12 @@ try {
     foreach ($required in @(
         $executable,
         $uninstaller,
+        (Join-Path $installRoot 'CHANGELOG.md'),
         (Join-Path $installRoot 'README.txt'),
         (Join-Path $installRoot 'RELEASE-METADATA.json'),
         (Join-Path $installRoot 'SHA256SUMS.txt'),
         (Join-Path $installRoot 'THIRD-PARTY-NOTICES.txt'),
+        (Join-Path $installRoot 'docs\KNOWN_LIMITATIONS.md'),
         (Join-Path $installRoot 'docs\USER_GUIDE.md'),
         (Join-Path $installRoot 'licenses\LICENSE-MIT'),
         (Join-Path $installRoot 'licenses\LICENSE-APACHE'),

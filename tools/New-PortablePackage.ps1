@@ -441,12 +441,15 @@ CursorPeek does not require installation or administrator rights. It does not ad
 itself to PATH. Start with Windows is changed only when you explicitly enable that
 tray setting.
 
-The binary may be unsigned. Verify the archive with its adjacent .sha256 file and
-read docs/USER_GUIDE.md for supported formats, limits, privacy, and troubleshooting.
+The binary may be unsigned. Verify the archive with its adjacent .sha256 file.
+Read docs/KNOWN_LIMITATIONS.md before testing and docs/USER_GUIDE.md for supported
+formats, limits, privacy, and troubleshooting.
 "@
     Write-CanonicalText (Join-Path $contentRoot 'README.txt') "$portableReadme`n"
 
     $projectFiles = [ordered] @{
+        'CHANGELOG.md' = Join-Path $repoRoot 'CHANGELOG.md'
+        'docs/KNOWN_LIMITATIONS.md' = Join-Path $repoRoot 'docs/KNOWN_LIMITATIONS.md'
         'docs/USER_GUIDE.md' = Join-Path $repoRoot 'docs/USER_GUIDE.md'
         'docs/PRIVACY.md' = Join-Path $repoRoot 'PRIVACY.md'
         'docs/SECURITY.md' = Join-Path $repoRoot 'SECURITY.md'
