@@ -1,0 +1,348 @@
+name: Publish release
+
+on:
+    push:
+        tags:
+            - "v*.*.*"
+
+permissions:
+    contents: write
+    id-token: write
+    attestations: write
+    artifact-metadata: write
+
+concurrency:
+    group: release-${{ github.ref }}
+    cancel-in-progress: false
+
+jobs:
+    publish:
+        name: Rebuild, attest, and publish
+        runs-on: windows-2025
+        timeout-minutes: 45
+
+        defaults:
+            run:
+                shell: >-
+                    pwsh -NoLogo -NoProfile -NonInteractive -Command
+                    "$ErrorActionPreference = 'Stop';
+                    $PSNativeCommandUseErrorActionPreference = $true;
+                    . '{0}'"
+
+        env:
+            CARGO_CYCLONEDX_VERSION: 0.5.9
+            CARGO_DENY_VERSION: 0.20.2
+            CARGO_INCREMENTAL: "0"
+            CARGO_TERM_COLOR: always
+            GH_TOKEN: ${{ github.token }}
+
+        steps:
+            - name: Check out tagged source
+              uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+              with:
+                  fetch-depth: 0
+                  persist-credentials: false
+
+            - name: Install pinned Rust toolchain
+              run: |
+                  $match = Select-String `
+                    -LiteralPath rust-toolchain.toml `
+                    -Pattern '^\s*channel\s*=\s*"([^"]+)"\s*$'
+                  if ($match.Count -ne 1) {
+                      throw 'rust-toolchain.toml must declare exactly one channel.'
+                  }
+                  $toolchain = $match.Matches[0].Groups[1].Value
+                  rustup toolchain install $toolchain `
+                    --profile minimal `
+                    --component clippy,rustfmt `
+                    --target x86_64-pc-windows-msvc `
+                    --no-self-update
+                  rustup override set $toolchain
+                  rustc --version --verbose
+                  cargo --version --verbose
+
+            - name: Validate tag and exact source
+              run: |
+                  if ($env:GITHUB_REF_TYPE -cne 'tag' -or
+                      $env:GITHUB_REF_NAME -notmatch
+                        '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+                      throw "Release ref is not a stable version tag: '$env:GITHUB_REF_NAME'."
+                  }
+                  $version = $env:GITHUB_REF_NAME.Substring(1)
+                  $metadata = cargo metadata --locked --format-version 1 --no-deps |
+                    ConvertFrom-Json
+                  if ($LASTEXITCODE -ne 0) {
+                      throw 'Could not read locked Cargo metadata.'
+                  }
+                  $package = @(
+                      $metadata.packages |
+                        Where-Object { [string] $_.name -ceq 'windows-cursorpeek' }
+                  )
+                  if ($package.Count -ne 1 -or
+                      [string] $package[0].version -cne $version) {
+                      throw "Tag '$env:GITHUB_REF_NAME' does not match the Cargo package version."
+                  }
+                  $tagRevision = (git rev-list -n 1 --verify "refs/tags/$env:GITHUB_REF_NAME").Trim()
+                  if ($LASTEXITCODE -ne 0 -or $tagRevision -cne $env:GITHUB_SHA) {
+                      throw 'The checked-out revision is not the tagged revision.'
+                  }
+                  $changes = @(git status --porcelain=v1 --untracked-files=all)
+                  if ($LASTEXITCODE -ne 0 -or $changes.Count -ne 0) {
+                      $changes
+                      throw 'The tagged source checkout is not clean.'
+                  }
+                  "CURSORPEEK_VERSION=$version" >> $env:GITHUB_ENV
+
+            - name: Install pinned release audit tools
+              run: |
+                  cargo install cargo-deny `
+                    --version $env:CARGO_DENY_VERSION `
+                    --locked
+                  cargo install cargo-cyclonedx `
+                    --version $env:CARGO_CYCLONEDX_VERSION `
+                    --locked
+
+            - name: Qualify tagged source
+              run: |
+                  cargo fmt --all -- --check
+                  cargo fmt --manifest-path fuzz/Cargo.toml --all -- --check
+                  ./tools/New-FuzzCorpus.ps1 | Out-Null
+                  $changes = git status --short -- fuzz/corpus
+                  if ($changes) {
+                      $changes
+                      throw 'The retained fuzz corpus is not deterministic.'
+                  }
+                  cargo test --locked --workspace
+                  cargo test --locked --workspace --all-features
+                  cargo clippy --locked --workspace --all-targets --all-features -- `
+                    -D warnings `
+                    -D clippy::undocumented_unsafe_blocks
+                  cargo deny --locked --workspace check
+
+            - name: Build and inspect release executable
+              run: |
+                  cargo build --locked --release
+                  ./tools/Test-PerformanceBudget.ps1 `
+                    -Executable target/release/CursorPeek.exe
+                  ./tools/Test-RecoverySoak.ps1 `
+                    -Executable target/release/CursorPeek.exe `
+                    -Runs 2
+                  ./tools/Test-WindowsQuality.ps1 `
+                    -Executable target/release/CursorPeek.exe `
+                    -OutputPath target/release-evidence.json
+
+            - name: Build reproducible portable package
+              run: |
+                  ./tools/New-PortablePackage.ps1 `
+                    -Executable target/release/CursorPeek.exe `
+                    -OutputDirectory target/release-portable
+                  ./tools/New-PortablePackage.ps1 `
+                    -Executable target/release/CursorPeek.exe `
+                    -OutputDirectory target/release-portable-repeated
+                  $first = @(
+                      Get-ChildItem -LiteralPath target/release-portable -Filter '*.zip' -File
+                  )
+                  $repeated = @(
+                      Get-ChildItem `
+                        -LiteralPath target/release-portable-repeated `
+                        -Filter '*.zip' `
+                        -File
+                  )
+                  if ($first.Count -ne 1 -or $repeated.Count -ne 1) {
+                      throw 'Portable packaging did not produce one archive per build.'
+                  }
+                  $firstHash = (Get-FileHash -Algorithm SHA256 $first[0].FullName).Hash
+                  $repeatedHash = (Get-FileHash -Algorithm SHA256 $repeated[0].FullName).Hash
+                  if ($firstHash -cne $repeatedHash) {
+                      throw 'Repeated portable package generation was not deterministic.'
+                  }
+                  ./tools/Test-PortablePackage.ps1 -PackagePath $first[0].FullName
+
+            - name: Build reproducible per-user installer
+              run: |
+                  $portable = @(
+                      Get-ChildItem -LiteralPath target/release-portable -Filter '*.zip' -File
+                  )
+                  if ($portable.Count -ne 1) {
+                      throw 'Installer packaging requires one qualified portable archive.'
+                  }
+                  $nsis = ./tools/Get-Nsis.ps1
+                  ./tools/New-InstallerPackage.ps1 `
+                    -PortablePackage $portable[0].FullName `
+                    -NsisCompiler $nsis `
+                    -OutputDirectory target/release-installer
+                  ./tools/New-InstallerPackage.ps1 `
+                    -PortablePackage $portable[0].FullName `
+                    -NsisCompiler $nsis `
+                    -OutputDirectory target/release-installer-repeated
+                  $first = @(
+                      Get-ChildItem `
+                        -LiteralPath target/release-installer `
+                        -Filter '*-setup.exe' `
+                        -File
+                  )
+                  $repeated = @(
+                      Get-ChildItem `
+                        -LiteralPath target/release-installer-repeated `
+                        -Filter '*-setup.exe' `
+                        -File
+                  )
+                  if ($first.Count -ne 1 -or $repeated.Count -ne 1) {
+                      throw 'Installer packaging did not produce one executable per build.'
+                  }
+                  $firstHash = (Get-FileHash -Algorithm SHA256 $first[0].FullName).Hash
+                  $repeatedHash = (Get-FileHash -Algorithm SHA256 $repeated[0].FullName).Hash
+                  if ($firstHash -cne $repeatedHash) {
+                      throw 'Repeated installer generation was not deterministic.'
+                  }
+                  ./tools/Test-InstallerPackage.ps1 `
+                    -InstallerPath $first[0].FullName `
+                    -ExerciseInstall
+
+            - name: Generate reproducible CycloneDX SBOM
+              run: |
+                  ./tools/New-ReleaseSbom.ps1 `
+                    -OutputPath target/CursorPeek.cdx.json
+                  ./tools/New-ReleaseSbom.ps1 `
+                    -OutputPath target/CursorPeek.repeated.cdx.json
+                  $first = (Get-FileHash `
+                    -Algorithm SHA256 `
+                    -LiteralPath target/CursorPeek.cdx.json).Hash
+                  $repeated = (Get-FileHash `
+                    -Algorithm SHA256 `
+                    -LiteralPath target/CursorPeek.repeated.cdx.json).Hash
+                  if ($first -cne $repeated) {
+                      throw 'Repeated SBOM generation was not deterministic.'
+                  }
+
+            - name: Stage exact release assets
+              run: |
+                  New-Item -ItemType Directory target/release-assets | Out-Null
+                  $portable = @(
+                      Get-ChildItem -LiteralPath target/release-portable -Filter '*.zip' -File
+                  )
+                  $installer = @(
+                      Get-ChildItem `
+                        -LiteralPath target/release-installer `
+                        -Filter '*-setup.exe' `
+                        -File
+                  )
+                  if ($portable.Count -ne 1 -or $installer.Count -ne 1) {
+                      throw 'Qualified release packages are missing.'
+                  }
+                  Copy-Item -LiteralPath $portable[0].FullName -Destination target/release-assets
+                  Copy-Item -LiteralPath $installer[0].FullName -Destination target/release-assets
+                  Copy-Item `
+                    -LiteralPath target/CursorPeek.cdx.json `
+                    -Destination "target/release-assets/CursorPeek-$env:CURSORPEEK_VERSION.cdx.json"
+                  ./tools/New-ReleaseChecksums.ps1 `
+                    -ArtifactsDirectory target/release-assets `
+                    -OutputPath target/release-assets/SHA256SUMS.txt
+
+            - name: Create draft and upload release assets
+              run: |
+                  $tag = $env:GITHUB_REF_NAME
+                  $existing = $null
+                  try {
+                      $existing = gh release view $tag --json 'isDraft,isPrerelease' |
+                        ConvertFrom-Json
+                  }
+                  catch {
+                      if ($LASTEXITCODE -ne 1) {
+                          throw
+                      }
+                  }
+                  if ($null -eq $existing) {
+                      gh release create $tag `
+                        --draft `
+                        --verify-tag `
+                        --title "CursorPeek $env:CURSORPEEK_VERSION" `
+                        --generate-notes
+                  }
+                  elseif (-not [bool] $existing.isDraft -or
+                      [bool] $existing.isPrerelease) {
+                      throw "Refusing to replace an existing published or prerelease '$tag'."
+                  }
+                  $assets = @(
+                      Get-ChildItem -LiteralPath target/release-assets -File |
+                        Sort-Object Name |
+                        ForEach-Object FullName
+                  )
+                  gh release upload $tag @assets --clobber
+
+            - name: Verify uploaded release assets
+              run: |
+                  $local = @(
+                      Get-ChildItem -LiteralPath target/release-assets -File |
+                        Sort-Object Name
+                  )
+                  if ($local.Count -ne 4) {
+                      throw 'The canonical local release set must contain four assets.'
+                  }
+                  $failure = ''
+                  for ($attempt = 1; $attempt -le 10; $attempt++) {
+                      $release = gh api `
+                        -H 'Accept: application/vnd.github+json' `
+                        "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:GITHUB_REF_NAME" |
+                        ConvertFrom-Json
+                      if (-not [bool] $release.draft -or [bool] $release.prerelease) {
+                          throw 'Release must remain a normal draft until verification passes.'
+                      }
+                      $remote = @($release.assets | Sort-Object name)
+                      $failure = ''
+                      if ($remote.Count -ne $local.Count) {
+                          $failure = 'Release asset count differs from the canonical local set.'
+                      }
+                      else {
+                          for ($index = 0; $index -lt $local.Count; $index++) {
+                              $expectedDigest = 'sha256:' + (
+                                  Get-FileHash `
+                                    -Algorithm SHA256 `
+                                    -LiteralPath $local[$index].FullName
+                              ).Hash.ToLowerInvariant()
+                              if ([string] $remote[$index].name -cne $local[$index].Name -or
+                                  [string] $remote[$index].state -cne 'uploaded' -or
+                                  [long] $remote[$index].size -ne $local[$index].Length -or
+                                  [string] $remote[$index].digest -cne $expectedDigest) {
+                                  $failure = (
+                                      "Uploaded asset verification failed for " +
+                                      "'$($local[$index].Name)'."
+                                  )
+                                  break
+                              }
+                          }
+                      }
+                      if ([string]::IsNullOrEmpty($failure)) {
+                          break
+                      }
+                      if ($attempt -lt 10) {
+                          Start-Sleep -Seconds 2
+                      }
+                  }
+                  if (-not [string]::IsNullOrEmpty($failure)) {
+                      throw $failure
+                  }
+
+            - name: Attest release provenance
+              uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+              with:
+                  subject-path: |
+                      target/release-assets/*.zip
+                      target/release-assets/*-setup.exe
+                      target/release-assets/*.cdx.json
+                      target/release-assets/SHA256SUMS.txt
+
+            - name: Attest release SBOM
+              uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+              with:
+                  subject-path: |
+                      target/release-assets/*.zip
+                      target/release-assets/*-setup.exe
+                  sbom-path: target/release-assets/CursorPeek-${{ env.CURSORPEEK_VERSION }}.cdx.json
+
+            - name: Publish verified release
+              run: |
+                  gh release edit $env:GITHUB_REF_NAME `
+                    --draft=false `
+                    --latest `
+                    --verify-tag

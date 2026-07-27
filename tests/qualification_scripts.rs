@@ -86,6 +86,21 @@ fn run_icon_generator(extra_arguments: &[&str]) -> Output {
         .expect("the Windows icon generator should start")
 }
 
+fn run_release_checksums(extra_arguments: &[&str]) -> Output {
+    Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(repository_path("tools/New-ReleaseChecksums.ps1"))
+        .args(extra_arguments)
+        .output()
+        .expect("the release checksum generator should start")
+}
+
 fn example_arguments() -> Vec<String> {
     vec![
         "-ResolverResults".into(),
@@ -215,6 +230,80 @@ fn nsis_cleanup_sections_are_uninstaller_only() {
         script.contains(r#"Section "un.Remove user settings" un.SecRemoveSettings"#),
         "the optional settings cleanup section name must use NSIS's uninstaller prefix"
     );
+}
+
+#[test]
+fn release_checksums_cover_only_the_canonical_asset_set() {
+    let version = env!("CARGO_PKG_VERSION");
+    let directory = repository_path(&format!(
+        "target/qualification-tests/release-checksums-{}",
+        std::process::id()
+    ));
+    if directory.exists() {
+        fs::remove_dir_all(&directory).expect("the prior checksum fixture should be removable");
+    }
+    fs::create_dir_all(&directory).expect("the checksum fixture directory should be creatable");
+
+    let names = [
+        format!("CursorPeek-{version}.cdx.json"),
+        format!("CursorPeek-{version}-windows-x64-portable.zip"),
+        format!("CursorPeek-{version}-windows-x64-setup.exe"),
+    ];
+    for (index, name) in names.iter().enumerate() {
+        fs::write(directory.join(name), format!("fixture-{index}\n"))
+            .expect("the checksum fixture should be writable");
+    }
+
+    let output_path = directory.join("SHA256SUMS.txt");
+    let successful = run_release_checksums(&[
+        "-ArtifactsDirectory",
+        directory
+            .to_str()
+            .expect("the fixture path should be Unicode"),
+        "-OutputPath",
+        output_path
+            .to_str()
+            .expect("the checksum output path should be Unicode"),
+    ]);
+    assert!(
+        successful.status.success(),
+        "checksum generation failed: {}",
+        String::from_utf8_lossy(&successful.stderr)
+    );
+
+    let checksums =
+        fs::read_to_string(&output_path).expect("the checksum manifest should be readable");
+    let lines = checksums.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), names.len());
+    let mut sorted_names = names;
+    sorted_names.sort();
+    for (line, expected_name) in lines.iter().zip(sorted_names) {
+        let (digest, name) = line
+            .split_once("  ")
+            .expect("each checksum line should contain two spaces");
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(name, expected_name);
+    }
+
+    fs::write(directory.join("unexpected.txt"), b"unexpected\n")
+        .expect("the unexpected fixture should be writable");
+    let rejected = run_release_checksums(&[
+        "-ArtifactsDirectory",
+        directory
+            .to_str()
+            .expect("the fixture path should be Unicode"),
+        "-OutputPath",
+        output_path
+            .to_str()
+            .expect("the checksum output path should be Unicode"),
+    ]);
+    assert!(
+        !rejected.status.success(),
+        "an unexpected release asset was accepted"
+    );
+
+    fs::remove_dir_all(directory).expect("the checksum fixture should be removable");
 }
 
 #[test]
