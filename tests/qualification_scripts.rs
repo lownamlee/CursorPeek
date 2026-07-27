@@ -101,6 +101,21 @@ fn run_release_checksums(extra_arguments: &[&str]) -> Output {
         .expect("the release checksum generator should start")
 }
 
+fn run_release_notes(extra_arguments: &[&str]) -> Output {
+    Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(repository_path("tools/New-ReleaseNotes.ps1"))
+        .args(extra_arguments)
+        .output()
+        .expect("the release notes generator should start")
+}
+
 fn example_arguments() -> Vec<String> {
     vec![
         "-ResolverResults".into(),
@@ -272,6 +287,145 @@ fn release_workflow_uses_a_draft_aware_asset_query() {
         !workflow.contains(r#""repos/$env:GITHUB_REPOSITORY/releases/tags/$env:GITHUB_REF_NAME""#,),
         "the release-by-tag REST endpoint does not return draft releases"
     );
+}
+
+#[test]
+fn release_workflow_uses_structured_hash_and_changelog_notes() {
+    let workflow = fs::read_to_string(repository_path(".github/workflows/release.yml"))
+        .expect("the release workflow should be readable");
+    let generator = fs::read_to_string(repository_path("tools/New-ReleaseNotes.ps1"))
+        .expect("the release notes generator should be readable");
+
+    assert!(
+        workflow.contains("- name: Write structured release notes")
+            && workflow.contains("./tools/New-ReleaseNotes.ps1 `"),
+        "the release workflow must generate its designed notes from the tagged source"
+    );
+    assert!(
+        generator.contains("'## Downloads and hashes'")
+            && generator.contains("'## Highlights'")
+            && generator.contains("'## Verification'")
+            && generator.contains("Get-Sha256Hex")
+            && generator.contains("Get-Content -Raw -LiteralPath $resolvedChangelog"),
+        "release notes must derive hashes from exact assets and highlights from the changelog"
+    );
+    assert_eq!(
+        workflow
+            .matches("--notes-file target/release-notes.md")
+            .count(),
+        2,
+        "new and resumed draft releases must use the same checked notes file"
+    );
+    assert!(
+        !workflow.contains("--generate-notes"),
+        "generic generated notes must not replace the designed release page"
+    );
+}
+
+#[test]
+fn release_notes_render_downloads_highlights_and_verification() {
+    let version = env!("CARGO_PKG_VERSION");
+    let fixture_root = repository_path(&format!(
+        "target/qualification-tests/release-notes-{}",
+        std::process::id()
+    ));
+    if fixture_root.exists() {
+        fs::remove_dir_all(&fixture_root)
+            .expect("the prior release notes fixture should be removable");
+    }
+    let artifacts = fixture_root.join("assets");
+    fs::create_dir_all(&artifacts).expect("the release notes fixture should be creatable");
+
+    let names = [
+        format!("CursorPeek-{version}.cdx.json"),
+        format!("CursorPeek-{version}-windows-x64-portable.zip"),
+        format!("CursorPeek-{version}-windows-x64-setup.exe"),
+    ];
+    for (index, name) in names.iter().enumerate() {
+        fs::write(
+            artifacts.join(name),
+            format!("release-note-fixture-{index}\n"),
+        )
+        .expect("the release notes fixture should be writable");
+    }
+
+    let checksums_path = artifacts.join("SHA256SUMS.txt");
+    let checksum_arguments = [
+        "-ArtifactsDirectory",
+        artifacts
+            .to_str()
+            .expect("the fixture path should be Unicode"),
+        "-OutputPath",
+        checksums_path
+            .to_str()
+            .expect("the checksum path should be Unicode"),
+    ];
+    let checksums = run_release_checksums(&checksum_arguments);
+    assert!(
+        checksums.status.success(),
+        "checksum generation failed: {}",
+        String::from_utf8_lossy(&checksums.stderr)
+    );
+
+    let output_path = fixture_root.join("release-notes.md");
+    let changelog_path = repository_path("CHANGELOG.md");
+    let tag = format!("v{version}");
+    let arguments = [
+        "-Version",
+        version,
+        "-Tag",
+        tag.as_str(),
+        "-Repository",
+        "lownamlee/CursorPeek",
+        "-ArtifactsDirectory",
+        artifacts
+            .to_str()
+            .expect("the fixture path should be Unicode"),
+        "-ChangelogPath",
+        changelog_path
+            .to_str()
+            .expect("the changelog path should be Unicode"),
+        "-OutputPath",
+        output_path
+            .to_str()
+            .expect("the output path should be Unicode"),
+        "-PreviousTag",
+        "v0.1.0",
+    ];
+    let rendered = run_release_notes(&arguments);
+    assert!(
+        rendered.status.success(),
+        "release notes generation failed: {}",
+        String::from_utf8_lossy(&rendered.stderr)
+    );
+
+    let notes = fs::read_to_string(output_path).expect("release notes should be readable");
+    assert!(notes.contains("## Downloads and hashes"));
+    assert!(notes.contains("| Description | Filename | SHA256 hash |"));
+    assert!(notes.contains(&format!("[CursorPeek-{version}-windows-x64-setup.exe]")));
+    assert!(notes.contains(&format!("[CursorPeek-{version}-windows-x64-portable.zip]")));
+    assert!(notes.contains("## Highlights"));
+    assert!(notes.contains("This patch release restores the notification-area menu"));
+    assert!(notes.contains("### Fixed"));
+    assert!(notes.contains("## Verification"));
+    assert!(notes.contains("[SHA256SUMS.txt]"));
+    assert!(notes.contains("[CycloneDX SBOM]"));
+    assert!(notes.contains(&format!(
+        "https://github.com/lownamlee/CursorPeek/compare/v0.1.0...v{version}"
+    )));
+    assert!(
+        notes
+            .lines()
+            .filter(|line| line.starts_with("| Per-user") || line.starts_with("| Portable"))
+            .all(|line| {
+                line.split('`').nth(1).is_some_and(|digest| {
+                    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            }),
+        "each package row must contain its exact SHA256 hash"
+    );
+
+    fs::remove_dir_all(fixture_root).expect("the release notes fixture should be removable");
 }
 
 #[test]

@@ -243,6 +243,15 @@ jobs:
                     -ArtifactsDirectory target/release-assets `
                     -OutputPath target/release-assets/SHA256SUMS.txt
 
+            - name: Write structured release notes
+              run: |
+                  ./tools/New-ReleaseNotes.ps1 `
+                    -Version $env:CURSORPEEK_VERSION `
+                    -Tag $env:GITHUB_REF_NAME `
+                    -Repository $env:GITHUB_REPOSITORY `
+                    -ArtifactsDirectory target/release-assets `
+                    -OutputPath target/release-notes.md
+
             - name: Create draft and upload release assets
               run: |
                   $tag = $env:GITHUB_REF_NAME
@@ -260,12 +269,18 @@ jobs:
                       gh release create $tag `
                         --draft `
                         --verify-tag `
-                        --title "CursorPeek $env:CURSORPEEK_VERSION" `
-                        --generate-notes
+                        --title "CursorPeek v$env:CURSORPEEK_VERSION" `
+                        --notes-file target/release-notes.md
                   }
                   elseif (-not [bool] $existing.isDraft -or
                       [bool] $existing.isPrerelease) {
                       throw "Refusing to replace an existing published or prerelease '$tag'."
+                  }
+                  else {
+                      gh release edit $tag `
+                        --verify-tag `
+                        --title "CursorPeek v$env:CURSORPEEK_VERSION" `
+                        --notes-file target/release-notes.md
                   }
                   $assets = @(
                       Get-ChildItem -LiteralPath target/release-assets -File |

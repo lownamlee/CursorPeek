@@ -7,6 +7,8 @@ corresponding version is published.
 
 ## [0.1.1] - 2026-07-27
 
+This patch release restores the notification-area menu when CursorPeek is right-clicked.
+
 ### Fixed
 
 - Routed notification-area callbacks through CursorPeek's event loop so the tray menu opens when
