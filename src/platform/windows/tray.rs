@@ -9,8 +9,8 @@ use windows::{
         UI::{
             Shell::{
                 NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-                NIM_SETVERSION, NIN_SELECT, NOTIFY_ICON_MESSAGE, NOTIFYICON_VERSION_4,
-                NOTIFYICONDATAW, NOTIFYICONDATAW_0, Shell_NotifyIconW,
+                NIM_SETFOCUS, NIM_SETVERSION, NIN_SELECT, NOTIFY_ICON_MESSAGE,
+                NOTIFYICON_VERSION_4, NOTIFYICONDATAW, NOTIFYICONDATAW_0, Shell_NotifyIconW,
             },
             WindowsAndMessaging::{
                 AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
@@ -140,15 +140,17 @@ impl TrayIcon {
             return Ok(None);
         };
 
-        self.menu_owner.show_menu(anchor, state)
+        let command = self.menu_owner.show_menu(anchor.resolve()?, state);
+        self.return_focus_to_notification_area();
+        command
     }
 
     pub(crate) fn command_at_cursor(&self, state: TrayMenuState) -> Result<Option<TrayCommand>> {
-        let mut anchor = POINT::default();
-        // SAFETY: The output points to a valid initialized POINT and the process is Per-Monitor V2
-        // aware, so the screen coordinate is suitable for the native popup-menu API.
-        unsafe { GetCursorPos(&mut anchor)? };
-        self.menu_owner.show_menu(anchor, state)
+        let command = self
+            .menu_owner
+            .show_menu(CallbackAnchor::Cursor.resolve()?, state);
+        self.return_focus_to_notification_area();
+        command
     }
 
     pub(crate) fn show_about(&self) {
@@ -185,6 +187,13 @@ impl TrayIcon {
                 MB_OK | MB_ICONERROR,
             );
         }
+    }
+
+    fn return_focus_to_notification_area(&self) {
+        // Microsoft recommends NIM_SETFOCUS after notification-area UI completes so keyboard
+        // focus returns to the tray whether the user selected a command or cancelled the menu.
+        // SAFETY: `self.data` still identifies the live icon owned by this TrayIcon.
+        let _ = unsafe { Shell_NotifyIconW(NIM_SETFOCUS, &self.data) };
     }
 }
 
@@ -432,7 +441,29 @@ impl Drop for PopupMenu {
     }
 }
 
-fn callback_anchor(wparam: WPARAM, lparam: LPARAM) -> Option<POINT> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CallbackAnchor {
+    Cursor,
+    Point(i32, i32),
+}
+
+impl CallbackAnchor {
+    fn resolve(self) -> Result<POINT> {
+        match self {
+            Self::Cursor => {
+                let mut point = POINT::default();
+                // SAFETY: The output points to a valid initialized POINT and the process is
+                // Per-Monitor V2 aware, so the physical screen coordinate is suitable for the
+                // native popup-menu API.
+                unsafe { GetCursorPos(&mut point)? };
+                Ok(point)
+            }
+            Self::Point(x, y) => Ok(POINT { x, y }),
+        }
+    }
+}
+
+fn callback_anchor(wparam: WPARAM, lparam: LPARAM) -> Option<CallbackAnchor> {
     let packed_event = lparam.0 as u32;
     let event = packed_event & 0xffff;
     let icon_id = packed_event >> 16;
@@ -440,11 +471,18 @@ fn callback_anchor(wparam: WPARAM, lparam: LPARAM) -> Option<POINT> {
         return None;
     }
 
+    // NOTIFYICON_VERSION_4 defines wParam coordinates for NIN_SELECT and NIN_KEYSELECT, but not
+    // for WM_CONTEXTMENU. In particular, Windows 11's overflow tray can leave the latter
+    // undefined, so resolve a right-click from the live cursor position instead.
+    if event == WM_CONTEXTMENU {
+        return Some(CallbackAnchor::Cursor);
+    }
+
     let packed_point = wparam.0 as u32;
-    Some(POINT {
-        x: i32::from(packed_point as u16 as i16),
-        y: i32::from((packed_point >> 16) as u16 as i16),
-    })
+    Some(CallbackAnchor::Point(
+        i32::from(packed_point as u16 as i16),
+        i32::from((packed_point >> 16) as u16 as i16),
+    ))
 }
 
 fn command_from_id(id: usize) -> Option<TrayCommand> {
@@ -491,12 +529,12 @@ fn write_wide_z<const N: usize>(target: &mut [u16; N], value: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ABOUT_COMMAND, DWELL_FAST_COMMAND, DWELL_RELAXED_COMMAND, DWELL_STANDARD_COMMAND,
-        EXIT_COMMAND, ICON_ID, NIN_KEYSELECT, NIN_SELECT, PREVIEW_COMPACT_COMMAND,
-        PREVIEW_LARGE_COMMAND, PREVIEW_STANDARD_COMMAND, PopupMenu, THEME_DARK_COMMAND,
-        THEME_LIGHT_COMMAND, THEME_SYSTEM_COMMAND, TOGGLE_PAUSE_COMMAND, TOGGLE_STARTUP_COMMAND,
-        TrayCommand, TrayMenuState, TrayStatus, callback_anchor, command_from_id,
-        establish_notification_area_registration, write_wide_z,
+        ABOUT_COMMAND, CallbackAnchor, DWELL_FAST_COMMAND, DWELL_RELAXED_COMMAND,
+        DWELL_STANDARD_COMMAND, EXIT_COMMAND, ICON_ID, NIN_KEYSELECT, NIN_SELECT,
+        PREVIEW_COMPACT_COMMAND, PREVIEW_LARGE_COMMAND, PREVIEW_STANDARD_COMMAND, PopupMenu,
+        THEME_DARK_COMMAND, THEME_LIGHT_COMMAND, THEME_SYSTEM_COMMAND, TOGGLE_PAUSE_COMMAND,
+        TOGGLE_STARTUP_COMMAND, TrayCommand, TrayMenuState, TrayStatus, callback_anchor,
+        command_from_id, establish_notification_area_registration, write_wide_z,
     };
     use crate::settings::Theme;
     use windows::Win32::{
@@ -513,14 +551,23 @@ mod tests {
     };
 
     #[test]
-    fn version_four_callback_decoding_checks_icon_event_and_signed_coordinates() {
+    fn version_four_callback_decoding_checks_icon_event_and_anchor_contract() {
         let point = WPARAM(u32::from(0xfff0_u16) as usize | ((25_u32 as usize) << 16));
 
-        for event in [WM_CONTEXTMENU, NIN_SELECT, NIN_KEYSELECT] {
+        for event in [NIN_SELECT, NIN_KEYSELECT] {
             let callback = LPARAM(((ICON_ID << 16) | event) as isize);
-            let anchor = callback_anchor(point, callback).expect("the callback should open a menu");
-            assert_eq!((anchor.x, anchor.y), (-16, 25));
+            assert_eq!(
+                callback_anchor(point, callback),
+                Some(CallbackAnchor::Point(-16, 25))
+            );
         }
+
+        let context = LPARAM(((ICON_ID << 16) | WM_CONTEXTMENU) as isize);
+        assert_eq!(
+            callback_anchor(WPARAM(usize::MAX), context),
+            Some(CallbackAnchor::Cursor),
+            "WM_CONTEXTMENU must not consume its undefined wParam as a coordinate"
+        );
 
         assert!(callback_anchor(point, LPARAM(WM_CONTEXTMENU as isize)).is_none());
         assert!(
