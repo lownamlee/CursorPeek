@@ -6,10 +6,10 @@ files when you hover over them in File Explorer.
 It stays in the notification area, keeps Explorer focused, works offline, and does not require an
 account, cloud service, background server, or external runtime.
 
-> CursorPeek 0.1.0 is available as a
-> [per-user installer](https://github.com/lownamlee/CursorPeek/releases/latest/download/CursorPeek-0.1.0-windows-x64-setup.exe)
+> CursorPeek 0.1.1 is available as a
+> [per-user installer](https://github.com/lownamlee/CursorPeek/releases/latest/download/CursorPeek-0.1.1-windows-x64-setup.exe)
 > or a
-> [portable ZIP](https://github.com/lownamlee/CursorPeek/releases/latest/download/CursorPeek-0.1.0-windows-x64-portable.zip).
+> [portable ZIP](https://github.com/lownamlee/CursorPeek/releases/latest/download/CursorPeek-0.1.1-windows-x64-portable.zip).
 > The packages are unsigned; review the [0.1 changelog](CHANGELOG.md), verify the
 > [published checksums](https://github.com/lownamlee/CursorPeek/releases/latest/download/SHA256SUMS.txt),
 > and read the [known limitations](docs/KNOWN_LIMITATIONS.md) before running them.
@@ -43,7 +43,7 @@ startup options. For a portable copy, extract the complete ZIP and run `CursorPe
 `CursorPeek.portable` beside it so settings remain in that folder.
 
 Both packages, their checksums, the CycloneDX SBOM, and build provenance are published on the
-[CursorPeek 0.1.0 release](https://github.com/lownamlee/CursorPeek/releases/tag/v0.1.0).
+[CursorPeek 0.1.1 release](https://github.com/lownamlee/CursorPeek/releases/tag/v0.1.1).
 
 ## Build from source
 
@@ -62,7 +62,7 @@ To create and validate a local portable package from a clean source tree:
 ```powershell
 .\tools\New-PortablePackage.ps1
 .\tools\Test-PortablePackage.ps1 `
-    -PackagePath .\target\packages\CursorPeek-0.1.0-windows-x64-portable.zip
+    -PackagePath .\target\packages\CursorPeek-0.1.1-windows-x64-portable.zip
 ```
 
 The ZIP contains the portable marker, changelog, known limitations, user and security
@@ -78,7 +78,7 @@ $nsis = .\tools\Get-Nsis.ps1
     -PortablePackage $portable.FullName `
     -NsisCompiler $nsis
 .\tools\Test-InstallerPackage.ps1 `
-    -InstallerPath .\target\packages\CursorPeek-0.1.0-windows-x64-setup.exe
+    -InstallerPath .\target\packages\CursorPeek-0.1.1-windows-x64-setup.exe
 ```
 
 The NSIS compiler is downloaded from its official distribution and accepted only when its pinned

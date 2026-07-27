@@ -5,6 +5,15 @@ corresponding version is published.
 
 ## Unreleased
 
+## [0.1.1] - 2026-07-27
+
+### Fixed
+
+- Routed notification-area callbacks through CursorPeek's event loop so the tray menu opens when
+  the icon is right-clicked.
+- Used the correct mouse, keyboard, and cursor-position contracts when placing the tray menu, and
+  returned focus to the notification area after the menu closes.
+
 ## [0.1.0] - 2026-07-27
 
 ### Added
@@ -36,4 +45,5 @@ corresponding version is published.
 Version 0.1 is intentionally narrow. See
 [Known limitations](docs/KNOWN_LIMITATIONS.md) before installing or running this release.
 
+[0.1.1]: https://github.com/lownamlee/CursorPeek/releases/tag/v0.1.1
 [0.1.0]: https://github.com/lownamlee/CursorPeek/releases/tag/v0.1.0
