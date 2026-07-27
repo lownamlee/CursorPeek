@@ -17,7 +17,7 @@ use windows::{
                 GetCursorPos, HMENU, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MENU_ITEM_FLAGS,
                 MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MessageBoxW, PostMessageW,
                 SetForegroundWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
-                WM_CONTEXTMENU, WM_NULL, WS_EX_TOOLWINDOW, WS_POPUP,
+                WM_CONTEXTMENU, WM_NULL, WM_RBUTTONUP, WS_EX_TOOLWINDOW, WS_POPUP,
             },
         },
     },
@@ -467,13 +467,18 @@ fn callback_anchor(wparam: WPARAM, lparam: LPARAM) -> Option<CallbackAnchor> {
     let packed_event = lparam.0 as u32;
     let event = packed_event & 0xffff;
     let icon_id = packed_event >> 16;
-    if icon_id != ICON_ID || !matches!(event, WM_CONTEXTMENU | NIN_SELECT | NIN_KEYSELECT) {
+    if icon_id != ICON_ID
+        || !matches!(
+            event,
+            WM_RBUTTONUP | WM_CONTEXTMENU | NIN_SELECT | NIN_KEYSELECT
+        )
+    {
         return None;
     }
 
     // NOTIFYICON_VERSION_4 defines wParam coordinates for NIN_SELECT and NIN_KEYSELECT, but not
-    // for WM_CONTEXTMENU. In particular, Windows 11's overflow tray can leave the latter
-    // undefined, so resolve a right-click from the live cursor position instead.
+    // for the keyboard-generated WM_CONTEXTMENU notification. Mouse right-click arrives as
+    // WM_RBUTTONUP and follows the documented packed-point contract.
     if event == WM_CONTEXTMENU {
         return Some(CallbackAnchor::Cursor);
     }
@@ -546,6 +551,7 @@ mod tests {
             },
             WindowsAndMessaging::{
                 GetMenuState, GetSubMenu, HMENU, MF_BYCOMMAND, MF_CHECKED, WM_CONTEXTMENU,
+                WM_RBUTTONUP,
             },
         },
     };
@@ -554,7 +560,7 @@ mod tests {
     fn version_four_callback_decoding_checks_icon_event_and_anchor_contract() {
         let point = WPARAM(u32::from(0xfff0_u16) as usize | ((25_u32 as usize) << 16));
 
-        for event in [NIN_SELECT, NIN_KEYSELECT] {
+        for event in [WM_RBUTTONUP, NIN_SELECT, NIN_KEYSELECT] {
             let callback = LPARAM(((ICON_ID << 16) | event) as isize);
             assert_eq!(
                 callback_anchor(point, callback),
