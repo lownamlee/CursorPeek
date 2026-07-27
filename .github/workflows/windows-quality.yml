@@ -104,6 +104,45 @@ jobs:
                   -Executable target/release/CursorPeek.exe
                   -OutputPath target/windows-quality/release-evidence.json
 
+            - name: Build and relocate portable package
+              run: |
+                  ./tools/New-PortablePackage.ps1 `
+                    -Executable target/release/CursorPeek.exe `
+                    -OutputDirectory target/portable-first
+                  ./tools/New-PortablePackage.ps1 `
+                    -Executable target/release/CursorPeek.exe `
+                    -OutputDirectory target/portable-repeated
+
+                  $firstArchives = @(
+                    Get-ChildItem `
+                    -LiteralPath target/portable-first `
+                    -Filter '*.zip' |
+                    Where-Object { -not $_.PSIsContainer }
+                  )
+                  $repeatedArchives = @(
+                    Get-ChildItem `
+                    -LiteralPath target/portable-repeated `
+                    -Filter '*.zip' |
+                    Where-Object { -not $_.PSIsContainer }
+                  )
+                  if ($firstArchives.Count -ne 1 -or $repeatedArchives.Count -ne 1) {
+                      throw 'Portable packaging did not create exactly one archive per run.'
+                  }
+                  $first = $firstArchives[0]
+                  $repeated = $repeatedArchives[0]
+                  $firstHash = (Get-FileHash `
+                    -Algorithm SHA256 `
+                    -LiteralPath $first.FullName).Hash
+                  $repeatedHash = (Get-FileHash `
+                    -Algorithm SHA256 `
+                    -LiteralPath $repeated.FullName).Hash
+                  if ($firstHash -cne $repeatedHash) {
+                      throw 'Repeated portable package generation was not deterministic.'
+                  }
+
+                  ./tools/Test-PortablePackage.ps1 `
+                    -PackagePath $first.FullName
+
             - name: Upload release evidence
               uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
               with:

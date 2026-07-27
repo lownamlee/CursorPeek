@@ -39,7 +39,14 @@ Changes to Windows resources or the release executable should also run:
 .\tools\Test-RecoverySoak.ps1
 .\tools\Test-WindowsQuality.ps1
 .\tools\New-ReleaseSbom.ps1
+.\tools\New-PortablePackage.ps1 -AllowDirty
+.\tools\Test-PortablePackage.ps1 `
+    -PackagePath .\target\packages\CursorPeek-0.1.0-windows-x64-portable.zip `
+    -AllowDirtyMetadata
 ```
+
+The two `AllowDirty` switches are only for testing packaging changes before commit. They mark the
+package as non-release metadata; a candidate intended for distribution must come from a clean tree.
 
 Tests that exercise shared qualification paths must run sequentially. Real Explorer behavior,
 focus, DPI, input, sleep, and packaging changes need reviewable Windows evidence in addition to

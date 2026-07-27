@@ -75,6 +75,8 @@ the fuzz harness.
 ## Release decision
 
 No unresolved security-policy exception is open for 0.1; the sole scoped license allowance is the
-fuzz-only NCSA entry described above. Packaging, clean-VM distribution tests, unsigned artifact
-disclosure, exact-source rebuild, and maintainer acceptance remain later release gates. This
-review does not authorize publishing `v0.1.0`.
+fuzz-only NCSA entry described above. Portable packaging includes the exact locked third-party
+license files, internal and archive checksums, clean-source metadata, and a relocated storage and
+worker smoke test. Installer and clean-VM distribution tests, unsigned artifact disclosure,
+exact-source rebuild, and maintainer acceptance remain later release gates. This review does not
+authorize publishing `v0.1.0`.

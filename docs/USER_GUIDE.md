@@ -147,9 +147,10 @@ not require administrator rights.
 
 ### Portable mode
 
-Create a regular file named `CursorPeek.portable` beside `CursorPeek.exe` before starting it.
-CursorPeek then stores `config.ini` beside the executable. The marker may be empty. A directory
-with that name is rejected.
+The portable ZIP already contains an empty `CursorPeek.portable` file beside `CursorPeek.exe`.
+Extract the complete folder before starting CursorPeek; its adjacent `.sha256` file verifies the
+downloaded archive. A manually assembled copy can enable the same mode by creating a regular file
+with that name. A directory with that name is rejected.
 
 Portable mode does not copy files, modify PATH, or write the registry merely by starting. Choosing
 **Start with Windows** is an explicit request to add the current portable executable to the

@@ -42,6 +42,18 @@ cargo build --locked --release
 
 The release executable is written to `target\release\CursorPeek.exe`.
 
+To create and validate a local portable package from a clean source tree:
+
+```powershell
+.\tools\New-PortablePackage.ps1
+.\tools\Test-PortablePackage.ps1 `
+    -PackagePath .\target\packages\CursorPeek-0.1.0-windows-x64-portable.zip
+```
+
+The ZIP contains the portable marker, user and security documentation, project licenses, exact
+third-party license files, release metadata, and internal checksums. Its adjacent `.sha256` file
+verifies the complete archive.
+
 ## Development checks
 
 ```powershell

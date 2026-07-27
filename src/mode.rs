@@ -31,6 +31,7 @@ pub(crate) enum ProcessMode {
     WorkerTimeoutDiagnostics,
     RecoverySoakDiagnostics,
     PerformanceDiagnostics,
+    SettingsDiagnostics,
     PreviewWorker,
     #[cfg(feature = "resolver-corpus")]
     ResolverCorpusProbe,
@@ -71,6 +72,7 @@ impl Command {
             }
             Some("--recovery-soak-diagnostics") => Self::Run(ProcessMode::RecoverySoakDiagnostics),
             Some("--performance-diagnostics") => Self::Run(ProcessMode::PerformanceDiagnostics),
+            Some("--settings-diagnostics") => Self::Run(ProcessMode::SettingsDiagnostics),
             Some("--preview-worker") => Self::Run(ProcessMode::PreviewWorker),
             #[cfg(feature = "resolver-corpus")]
             Some("--resolver-corpus-probe") => Self::Run(ProcessMode::ResolverCorpusProbe),
@@ -189,6 +191,14 @@ mod tests {
         assert_eq!(
             Command::parse(["--performance-diagnostics"]),
             Ok(Command::Run(ProcessMode::PerformanceDiagnostics))
+        );
+    }
+
+    #[test]
+    fn private_settings_diagnostic_is_accepted() {
+        assert_eq!(
+            Command::parse(["--settings-diagnostics"]),
+            Ok(Command::Run(ProcessMode::SettingsDiagnostics))
         );
     }
 

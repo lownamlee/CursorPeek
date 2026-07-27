@@ -44,7 +44,9 @@ pub(crate) fn run(process_mode: ProcessMode) -> Result<(), AppError> {
         | ProcessMode::PerformanceDiagnostics => {
             Some(ComApartment::initialize(ApartmentKind::SingleThreaded)?)
         }
-        ProcessMode::DpiDiagnostics | ProcessMode::PreviewWorker => None,
+        ProcessMode::DpiDiagnostics
+        | ProcessMode::SettingsDiagnostics
+        | ProcessMode::PreviewWorker => None,
         #[cfg(feature = "resolver-corpus")]
         ProcessMode::ResolverCorpusProbe => None,
     };
@@ -119,6 +121,15 @@ pub(crate) fn run(process_mode: ProcessMode) -> Result<(), AppError> {
                 startup_started,
             )?;
             println!("{report}");
+        }
+        ProcessMode::SettingsDiagnostics => {
+            let settings_file = SettingsFile::discover()?;
+            let mode = settings_file.mode();
+            settings_file.load_or_create()?;
+            println!(
+                "Settings storage diagnostic completed: mode={}, configuration_created=yes",
+                mode.as_str()
+            );
         }
         ProcessMode::PreviewWorker => {
             let stdin = io::stdin();

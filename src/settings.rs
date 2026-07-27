@@ -46,6 +46,15 @@ pub(crate) enum SettingsMode {
     Portable,
 }
 
+impl SettingsMode {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Installed => "installed",
+            Self::Portable => "portable",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Theme {
     System,
@@ -505,8 +514,7 @@ impl SettingsFile {
         Ok(())
     }
 
-    #[cfg(test)]
-    const fn mode(&self) -> SettingsMode {
+    pub(crate) const fn mode(&self) -> SettingsMode {
         self.mode
     }
 
