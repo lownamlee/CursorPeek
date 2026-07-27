@@ -69,6 +69,7 @@ const TRAY_CALLBACK_MESSAGE: u32 = WM_APP + 3;
 pub(super) const ACTIVATE_MESSAGE: u32 = WM_APP + 4;
 const PREVIEW_CONTEXT_INVALIDATED_MESSAGE: u32 = WM_APP + 6;
 const SYSTEM_LIFECYCLE_CHANGED_MESSAGE: u32 = WM_APP + 7;
+const TRAY_EVENT_MESSAGE: u32 = WM_APP + 8;
 const DWELL_TIMER_ID: usize = 1;
 const INPUT_SAMPLE_TIMER_ID: usize = 2;
 const INPUT_DIAGNOSTIC_DEADLINE_TIMER_ID: usize = 3;
@@ -449,7 +450,7 @@ impl MessageWindow {
                 continue;
             }
 
-            if message.hwnd == self.hwnd && message.message == TRAY_CALLBACK_MESSAGE {
+            if message.hwnd == self.hwnd && message.message == TRAY_EVENT_MESSAGE {
                 if self.handle_tray_callback(message.wParam, message.lParam)? {
                     return Ok(MessageLoopExit::Shutdown);
                 }
@@ -1577,6 +1578,16 @@ fn dispatch_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) ->
         panic!("intentional callback panic for containment testing");
     }
 
+    if message == TRAY_CALLBACK_MESSAGE {
+        // Shell notification callbacks can enter WNDPROC synchronously instead of appearing as
+        // removable queue entries. Copy the scalar version-4 callback into the product event
+        // queue so menu creation and settings mutation remain inside MessageWindow::run_loop.
+        // SAFETY: The target is the live window currently executing this procedure, and the
+        // version-4 callback parameters are scalar values with no borrowed pointer lifetime.
+        let _ = unsafe { PostMessageW(Some(hwnd), TRAY_EVENT_MESSAGE, wparam, lparam) };
+        return LRESULT(0);
+    }
+
     if let Some(change) = system_lifecycle_change_for_message(message, wparam) {
         // SAFETY: Broadcasts and registered Shell messages enter WNDPROC synchronously. This
         // pointer-free private message targets the same live HWND and defers all product state
@@ -1633,9 +1644,10 @@ mod tests {
         ActivePreview, CLASS_NAME, DWELL_TIMER_ID, IsWindow, LPARAM, MessageWindow,
         PREVIEW_WINDOW_DIAGNOSTIC_DURATION, PREVIEW_WINDOW_PRACTICE_DURATION,
         SYSTEM_LIFECYCLE_CHANGED_MESSAGE, SystemLifecycleChange, TASKBAR_CREATED_MESSAGE,
-        TEST_PANIC_MESSAGE, WPARAM, accept_worker_completion, post_worker_result,
-        preview_context_generation_matches, preview_context_is_current,
-        preview_input_requires_dismissal, registered_raw_devices, timer_interval_ms, tray_status,
+        TEST_PANIC_MESSAGE, TRAY_CALLBACK_MESSAGE, TRAY_EVENT_MESSAGE, WPARAM,
+        accept_worker_completion, post_worker_result, preview_context_generation_matches,
+        preview_context_is_current, preview_input_requires_dismissal, registered_raw_devices,
+        timer_interval_ms, tray_status,
     };
     use crate::hover::{Generation, PhysicalScreenPoint};
     use crate::platform::windows::TrayStatus;
@@ -1728,6 +1740,35 @@ mod tests {
                 "the private coordinator must fail the Explorer candidate gate"
             );
             assert_raw_input_registrations(first_handle);
+
+            let tray_wparam = WPARAM(0x0123_4567);
+            let tray_lparam = LPARAM(0x7654_0321);
+            // SAFETY: The synthetic notification carries only the same scalar values used by the
+            // Shell's version-4 callback contract and targets the live coordinator directly.
+            let result = unsafe {
+                SendMessageW(
+                    first_handle,
+                    TRAY_CALLBACK_MESSAGE,
+                    Some(tray_wparam),
+                    Some(tray_lparam),
+                )
+            };
+            assert_eq!(result.0, 0);
+            let mut tray_event = MSG::default();
+            // SAFETY: `tray_event` is writable storage and the exact private filter removes only
+            // the callback copy posted by CursorPeek's own WNDPROC.
+            let found = unsafe {
+                PeekMessageW(
+                    &mut tray_event,
+                    Some(first_handle),
+                    TRAY_EVENT_MESSAGE,
+                    TRAY_EVENT_MESSAGE,
+                    PM_REMOVE,
+                )
+            };
+            assert!(found.as_bool());
+            assert_eq!(tray_event.wParam, tray_wparam);
+            assert_eq!(tray_event.lParam, tray_lparam);
 
             let taskbar_created = TASKBAR_CREATED_MESSAGE.load(Ordering::Acquire);
             assert_ne!(taskbar_created, 0);
