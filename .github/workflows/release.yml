@@ -285,11 +285,10 @@ jobs:
                   }
                   $failure = ''
                   for ($attempt = 1; $attempt -le 10; $attempt++) {
-                      $release = gh api `
-                        -H 'Accept: application/vnd.github+json' `
-                        "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:GITHUB_REF_NAME" |
+                      $release = gh release view $env:GITHUB_REF_NAME `
+                        --json 'isDraft,isPrerelease,assets' |
                         ConvertFrom-Json
-                      if (-not [bool] $release.draft -or [bool] $release.prerelease) {
+                      if (-not [bool] $release.isDraft -or [bool] $release.isPrerelease) {
                           throw 'Release must remain a normal draft until verification passes.'
                       }
                       $remote = @($release.assets | Sort-Object name)

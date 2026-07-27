@@ -252,6 +252,29 @@ fn release_workflow_resolves_an_annotated_tag_to_its_commit() {
 }
 
 #[test]
+fn release_workflow_uses_a_draft_aware_asset_query() {
+    let workflow = fs::read_to_string(repository_path(".github/workflows/release.yml"))
+        .expect("the release workflow should be readable");
+
+    assert!(
+        workflow.contains("gh release view $env:GITHUB_REF_NAME `"),
+        "draft verification must use the release command that can resolve unpublished releases"
+    );
+    assert!(
+        workflow.contains("--json 'isDraft,isPrerelease,assets'"),
+        "draft verification must request state and asset digests"
+    );
+    assert!(
+        workflow.contains("$release.isDraft") && workflow.contains("$release.isPrerelease"),
+        "draft verification must check the field names returned by gh release view"
+    );
+    assert!(
+        !workflow.contains(r#""repos/$env:GITHUB_REPOSITORY/releases/tags/$env:GITHUB_REF_NAME""#,),
+        "the release-by-tag REST endpoint does not return draft releases"
+    );
+}
+
+#[test]
 fn release_checksums_cover_only_the_canonical_asset_set() {
     let version = env!("CARGO_PKG_VERSION");
     let directory = repository_path(&format!(
