@@ -47,9 +47,21 @@ function Resolve-RepositoryPath {
 function Get-Sha256Hex {
     param([Parameter(Mandatory = $true)][string] $LiteralPath)
 
-    return (
-        Get-FileHash -Algorithm SHA256 -LiteralPath $LiteralPath
-    ).Hash.ToUpperInvariant()
+    $stream = [System.IO.File]::OpenRead($LiteralPath)
+    try {
+        $algorithm = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            return [System.BitConverter]::ToString(
+                $algorithm.ComputeHash($stream)
+            ).Replace('-', '')
+        }
+        finally {
+            $algorithm.Dispose()
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
 }
 
 if ($Tag -cne "v$Version") {
