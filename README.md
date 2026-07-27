@@ -1,117 +1,150 @@
-# CursorPeek
+<p align="center">
+  <picture>
+    <source
+      media="(prefers-color-scheme: dark)"
+      srcset="./assets/readme/CursorPeek_banner_dark.png"
+    />
+    <source
+      media="(prefers-color-scheme: light)"
+      srcset="./assets/readme/CursorPeek_banner_white.png"
+    />
+    <img
+      alt="Windows CursorPeek — quick file previews in File Explorer"
+      src="./assets/readme/CursorPeek_banner_white.png"
+    />
+  </picture>
+</p>
 
-CursorPeek is a lightweight native Windows utility that previews supported local image and text
-files when you hover over them in File Explorer.
+<p align="center">
+  <strong>Native</strong> · <strong>Offline</strong> · <strong>No account</strong> ·
+  <strong>No shell extension</strong>
+</p>
 
-It stays in the notification area, keeps Explorer focused, works offline, and does not require an
-account, cloud service, background server, or external runtime.
+<p align="center">
+  <picture>
+    <source
+      media="(prefers-color-scheme: dark)"
+      srcset="./assets/readme/CursorPeek_divider_dark.svg"
+    />
+    <source
+      media="(prefers-color-scheme: light)"
+      srcset="./assets/readme/CursorPeek_divider_light.svg"
+    />
+    <img
+      alt=""
+      src="./assets/readme/CursorPeek_divider_light.svg"
+      width="100%"
+      height="1"
+    />
+  </picture>
+</p>
 
-> CursorPeek 0.1.1 is available as a
-> [per-user installer](https://github.com/lownamlee/CursorPeek/releases/latest/download/CursorPeek-0.1.1-windows-x64-setup.exe)
-> or a
-> [portable ZIP](https://github.com/lownamlee/CursorPeek/releases/latest/download/CursorPeek-0.1.1-windows-x64-portable.zip).
-> The packages are unsigned; review the [0.1 changelog](CHANGELOG.md), verify the
-> [published checksums](https://github.com/lownamlee/CursorPeek/releases/latest/download/SHA256SUMS.txt),
-> and read the [known limitations](docs/KNOWN_LIMITATIONS.md) before running them.
+<h3 align="center">
+  <a href="#-installation">Installation</a>
+  <span> · </span>
+  <a href="docs/USER_GUIDE.md">Documentation</a>
+  <span> · </span>
+  <a href="https://github.com/lownamlee/CursorPeek/releases">Release notes</a>
+  <span> · </span>
+  <a href="https://github.com/lownamlee/CursorPeek/issues">Issues</a>
+</h3>
 
-## What it previews
+<p align="center">
+  <a href="https://github.com/lownamlee/CursorPeek/releases/latest">
+    <img
+      alt="Latest release"
+      src="https://img.shields.io/github/v/release/lownamlee/CursorPeek?display_name=tag&sort=semver"
+    />
+  </a>
+  <a href="https://github.com/lownamlee/CursorPeek/actions/workflows/windows-quality.yml">
+    <img
+      alt="Windows quality"
+      src="https://github.com/lownamlee/CursorPeek/actions/workflows/windows-quality.yml/badge.svg?branch=main"
+    />
+  </a>
+  <a href="#-license">
+    <img
+      alt="License: MIT OR Apache-2.0"
+      src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-2563eb"
+    />
+  </a>
+</p>
 
-- Images: JPEG, PNG, GIF, WebP, BMP/DIB, ICO, and TIFF
-- Text: common plain-text, source-code, script, markup, data, and configuration files
-- Extensionless project files such as `README`, `LICENSE`, `Makefile`, and `Dockerfile`
+## 📦 Installation
 
-CursorPeek intentionally does not preview folders, network paths, virtual Shell items, or cloud
-placeholders that require download. Text is displayed as inert plain text; markup and scripts are
-never executed.
+Requires Windows 10 22H2 x64 or supported Windows 11 x64 with Windows File Explorer.
 
-See the [user guide](docs/USER_GUIDE.md) for the complete format list, portable mode, tray
-settings, limits, diagnostics, and troubleshooting. The
-[known limitations](docs/KNOWN_LIMITATIONS.md) describe the deliberate 0.1 scope. See
-[PRIVACY.md](PRIVACY.md) for the local-only data policy and containment boundary.
+| Package | Download | Use |
+| --- | --- | --- |
+| **Per-user installer** | **[Download v0.1.1](https://github.com/lownamlee/CursorPeek/releases/latest/download/CursorPeek-0.1.1-windows-x64-setup.exe)** | Recommended; installs without administrator elevation |
+| **Portable ZIP** | **[Download v0.1.1](https://github.com/lownamlee/CursorPeek/releases/latest/download/CursorPeek-0.1.1-windows-x64-portable.zip)** | Extract the archive and run `CursorPeek.exe` |
 
-## Requirements
+> [!NOTE]
+> Packages are not code-signed yet. Windows may show an unknown-publisher warning. Check downloads
+> against the published [SHA256 hashes](https://github.com/lownamlee/CursorPeek/releases/latest/download/SHA256SUMS.txt).
 
-- Windows 10 22H2 x64 or Windows 11 x64
-- File Explorer
+See the [user guide](docs/USER_GUIDE.md#installed-and-portable-settings) for startup, portable
+settings, and uninstall details.
 
-Packaged builds are self-contained and do not require Rust or the Visual C++ Redistributable.
+## 🚀 Quick start
 
-## Install or run
+1. Run `CursorPeek.exe`.
+2. Rest the pointer over a supported file in File Explorer.
+3. Move the pointer to dismiss the preview; right-click the tray icon for controls.
 
-The per-user installer requests no administrator elevation and supports Start Menu, desktop, and
-startup options. For a portable copy, extract the complete ZIP and run `CursorPeek.exe`; keep
-`CursorPeek.portable` beside it so settings remain in that folder.
+## 🗂️ Supported files
 
-Both packages, their checksums, the CycloneDX SBOM, and build provenance are published on the
-[CursorPeek 0.1.1 release](https://github.com/lownamlee/CursorPeek/releases/tag/v0.1.1).
+| Type | Supported extensions or filenames |
+| --- | --- |
+| **Images** | `.jpg`, `.jpeg`, `.jpe`, `.jfif`, `.png`, `.gif`, `.webp`, `.bmp`, `.dib`, `.ico`, `.tif`, `.tiff` |
+| **Text, logs, and markup** | `.txt`, `.text`, `.log`, `.md` |
+| **Data and configuration** | `.csv`, `.tsv`, `.json`, `.jsonc`, `.xml`, `.yaml`, `.yml`, `.toml`, `.ini`, `.cfg`, `.conf`, `.properties` |
+| **C and C++** | `.c`, `.h`, `.cc`, `.cpp`, `.cxx`, `.hh`, `.hpp`, `.hxx`, `.ipp`, `.inl` |
+| **Other source code** | `.rs`, `.cs`, `.java`, `.kt`, `.kts`, `.go`, `.py`, `.pyw`, `.rb`, `.php` |
+| **Web, JavaScript, and TypeScript** | `.js`, `.mjs`, `.cjs`, `.jsx`, `.ts`, `.mts`, `.cts`, `.tsx`, `.html`, `.htm`, `.css` |
+| **Scripts and queries** | `.sql`, `.sh`, `.bash`, `.zsh`, `.ps1`, `.bat`, `.cmd` |
+| **Exact filenames** | `README`, `LICENSE`, `COPYING`, `NOTICE`, `Makefile`, `Dockerfile`, `Gemfile`, `.env`, `.editorconfig`, `.gitattributes`, `.gitignore`, `.dockerignore`, `.npmrc`, `.prettierrc`, `.prettierignore`, `.eslintrc`, `.eslintignore` |
 
-## Build from source
+Matching is case-insensitive. Images and text are validated before previewing. See the
+[format reference](docs/USER_GUIDE.md#supported-images) and
+[known limitations](docs/KNOWN_LIMITATIONS.md) for behavior and limits.
+
+## ⚙️ Settings
+
+Right-click the tray icon to pause previews or change the dwell delay, preview size, theme, and
+startup behavior. See [settings and configuration](docs/USER_GUIDE.md#tray-menu).
+
+## 🛡️ Privacy and security
+
+CursorPeek runs locally without accounts, telemetry, file uploads, or application networking.
+Read the [privacy policy](PRIVACY.md) and [security model](SECURITY.md) for details.
+
+## 📚 Documentation
+
+- [User guide](docs/USER_GUIDE.md)
+- [Known limitations](docs/KNOWN_LIMITATIONS.md)
+- [Privacy](PRIVACY.md)
+- [Security](SECURITY.md)
+- [Changelog](CHANGELOG.md)
+
+## 🛠️ Build from source
 
 Install the Rust version pinned in `rust-toolchain.toml` and Visual Studio Build Tools with the
-Desktop development with C++ workload. Then run:
+**Desktop development with C++** workload:
 
 ```powershell
 cargo build --locked --release
 .\target\release\CursorPeek.exe
 ```
 
-The release executable is written to `target\release\CursorPeek.exe`.
+See the [development setup](CONTRIBUTING.md#development-setup) for tests and packaging.
 
-To create and validate a local portable package from a clean source tree:
+## 🤝 Contributing
 
-```powershell
-.\tools\New-PortablePackage.ps1
-.\tools\Test-PortablePackage.ps1 `
-    -PackagePath .\target\packages\CursorPeek-0.1.1-windows-x64-portable.zip
-```
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Report vulnerabilities
+privately through [SECURITY.md](SECURITY.md).
 
-The ZIP contains the portable marker, changelog, known limitations, user and security
-documentation, project licenses, exact third-party license files, release metadata, and internal
-checksums. Its adjacent `.sha256` file verifies the complete archive.
-
-To build the per-user installer from that qualified portable archive:
-
-```powershell
-$portable = Get-ChildItem .\target\packages\*-portable.zip
-$nsis = .\tools\Get-Nsis.ps1
-.\tools\New-InstallerPackage.ps1 `
-    -PortablePackage $portable.FullName `
-    -NsisCompiler $nsis
-.\tools\Test-InstallerPackage.ps1 `
-    -InstallerPath .\target\packages\CursorPeek-0.1.1-windows-x64-setup.exe
-```
-
-The NSIS compiler is downloaded from its official distribution and accepted only when its pinned
-SHA-256 hash and version match. The installer targets the current user, requests no elevation, and
-supports repair, optional shortcuts, optional startup, and settings-aware uninstall. Its payload
-also includes the exact NSIS packaging license notice.
-
-## Development checks
-
-```powershell
-cargo fmt --all -- --check
-cargo test --locked
-cargo test --locked --all-features
-cargo clippy --locked --all-targets --all-features -- `
-    -D warnings -D clippy::undocumented_unsafe_blocks
-cargo build --locked --release
-.\tools\Test-WindowsQuality.ps1
-```
-
-Public diagnostic commands:
-
-```powershell
-.\target\release\CursorPeek.exe --input-diagnostics
-.\target\release\CursorPeek.exe --worker-diagnostics
-```
-
-## Contributing
-
-Bug reports, focused feature proposals, documentation improvements, and code contributions are
-welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Report security
-issues privately as described in [SECURITY.md](SECURITY.md).
-
-## License
+## 📜 License
 
 CursorPeek is available under your choice of the
 [Apache License 2.0](LICENSE-APACHE) or the [MIT License](LICENSE-MIT).
