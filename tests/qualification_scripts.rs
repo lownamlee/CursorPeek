@@ -233,6 +233,25 @@ fn nsis_cleanup_sections_are_uninstaller_only() {
 }
 
 #[test]
+fn release_workflow_resolves_an_annotated_tag_to_its_commit() {
+    let workflow = fs::read_to_string(repository_path(".github/workflows/release.yml"))
+        .expect("the release workflow should be readable");
+
+    assert!(
+        workflow.contains(r#""refs/tags/$($env:GITHUB_REF_NAME)^{commit}""#,),
+        "the release guard must peel an annotated tag to its commit"
+    );
+    assert!(
+        workflow.contains("git rev-parse `"),
+        "the release guard must use the Git revision verification command"
+    );
+    assert!(
+        !workflow.contains("git rev-list -n 1 --verify"),
+        "git rev-list does not support the --verify option"
+    );
+}
+
+#[test]
 fn release_checksums_cover_only_the_canonical_asset_set() {
     let version = env!("CARGO_PKG_VERSION");
     let directory = repository_path(&format!(

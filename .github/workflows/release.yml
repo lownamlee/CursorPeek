@@ -82,7 +82,11 @@ jobs:
                       [string] $package[0].version -cne $version) {
                       throw "Tag '$env:GITHUB_REF_NAME' does not match the Cargo package version."
                   }
-                  $tagRevision = (git rev-list -n 1 --verify "refs/tags/$env:GITHUB_REF_NAME").Trim()
+                  $tagRevision = (
+                      git rev-parse `
+                        --verify `
+                        "refs/tags/$($env:GITHUB_REF_NAME)^{commit}"
+                  ).Trim()
                   if ($LASTEXITCODE -ne 0 -or $tagRevision -cne $env:GITHUB_SHA) {
                       throw 'The checked-out revision is not the tagged revision.'
                   }
