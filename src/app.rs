@@ -8,12 +8,12 @@ use crate::{
     platform::{
         ApartmentKind, ApplicationRunError, ComApartment, DPI_DIAGNOSTIC_SUCCESS,
         DpiAwarenessError, MessageWindow, PREVIEW_WINDOW_DIAGNOSTIC_DURATION,
-        PREVIEW_WINDOW_PRACTICE_DURATION, SingleInstance, activate_existing_instance,
-        verify_per_monitor_v2,
+        PREVIEW_WINDOW_PRACTICE_DURATION, SingleInstance, StartupRegistration,
+        activate_existing_instance, shutdown_existing_instance, verify_per_monitor_v2,
     },
     preview::PreviewSize,
     resolver::{ExplorerResolver, ResolverError},
-    settings::{SettingsDocument, SettingsError, SettingsFile},
+    settings::{SettingsDocument, SettingsError, SettingsFile, SettingsMode},
     worker::{self, WorkerManagerError, WorkerSessionError},
 };
 
@@ -46,6 +46,9 @@ pub(crate) fn run(process_mode: ProcessMode) -> Result<(), AppError> {
         }
         ProcessMode::DpiDiagnostics
         | ProcessMode::SettingsDiagnostics
+        | ProcessMode::ShutdownExisting
+        | ProcessMode::SetStartupEnabled
+        | ProcessMode::SetStartupDisabled
         | ProcessMode::PreviewWorker => None,
         #[cfg(feature = "resolver-corpus")]
         ProcessMode::ResolverCorpusProbe => None,
@@ -131,6 +134,15 @@ pub(crate) fn run(process_mode: ProcessMode) -> Result<(), AppError> {
                 mode.as_str()
             );
         }
+        ProcessMode::ShutdownExisting => {
+            shutdown_existing_instance()?;
+        }
+        ProcessMode::SetStartupEnabled => {
+            set_installed_startup(true)?;
+        }
+        ProcessMode::SetStartupDisabled => {
+            set_installed_startup(false)?;
+        }
         ProcessMode::PreviewWorker => {
             let stdin = io::stdin();
             let stdout = io::stdout();
@@ -145,6 +157,36 @@ pub(crate) fn run(process_mode: ProcessMode) -> Result<(), AppError> {
         }
     }
 
+    Ok(())
+}
+
+fn set_installed_startup(enabled: bool) -> Result<(), AppError> {
+    let settings_file = SettingsFile::discover()?;
+    if settings_file.mode() != SettingsMode::Installed {
+        return Err(SettingsError::UnsupportedMode {
+            operation: "startup configuration",
+            mode: settings_file.mode(),
+        }
+        .into());
+    }
+
+    let registration = StartupRegistration::for_current_executable()?;
+    if !enabled {
+        registration.set_enabled(false)?;
+    }
+
+    let mut document = settings_file.load_or_create()?;
+    let previous = document.settings().start_with_windows();
+    if enabled {
+        registration.set_enabled(true)?;
+    }
+    document.set_start_with_windows(enabled);
+    if let Err(error) = settings_file.save(&document) {
+        if enabled {
+            let _ = registration.set_enabled(previous);
+        }
+        return Err(error.into());
+    }
     Ok(())
 }
 

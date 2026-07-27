@@ -1,13 +1,16 @@
 use std::{
-    os::windows::io::{FromRawHandle, OwnedHandle},
+    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     thread,
     time::{Duration, Instant},
 };
 
 use windows::{
     Win32::{
-        Foundation::{E_FAIL, ERROR_ALREADY_EXISTS, GetLastError},
-        System::Threading::CreateMutexW,
+        Foundation::{
+            E_FAIL, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, WAIT_FAILED, WAIT_OBJECT_0,
+            WAIT_TIMEOUT,
+        },
+        System::Threading::{CreateMutexW, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
         UI::WindowsAndMessaging::{
             AllowSetForegroundWindow, FindWindowExW, GetWindowThreadProcessId, PostMessageW,
         },
@@ -15,10 +18,11 @@ use windows::{
     core::{PCWSTR, Result, w},
 };
 
-use super::window::{ACTIVATE_MESSAGE, CLASS_NAME};
+use super::window::{ACTIVATE_MESSAGE, CLASS_NAME, SHUTDOWN_MESSAGE};
 
 const ACTIVATION_WAIT: Duration = Duration::from_secs(5);
 const ACTIVATION_RETRY: Duration = Duration::from_millis(25);
+const SHUTDOWN_WAIT_MS: u32 = 5_000;
 
 pub(crate) struct SingleInstance {
     _handle: OwnedHandle,
@@ -50,6 +54,60 @@ impl SingleInstance {
 }
 
 pub(crate) fn activate_existing_instance() -> Result<()> {
+    let (hwnd, process_id) = find_existing_instance()?;
+
+    // If this second launch owns foreground permission, transfer it to the existing process so
+    // its native menu can satisfy SetForegroundWindow. The activation message remains useful even
+    // when policy rejects this optional transfer.
+    // SAFETY: `process_id` came from the live coordinator HWND. This call grants a Windows
+    // foreground-policy permission and neither transfers ownership nor dereferences a pointer.
+    let _ = unsafe { AllowSetForegroundWindow(process_id) };
+
+    // SAFETY: The private message carries no pointers and targets the exact live coordinator.
+    unsafe {
+        PostMessageW(
+            Some(hwnd),
+            ACTIVATE_MESSAGE,
+            Default::default(),
+            Default::default(),
+        )
+    }
+}
+
+pub(crate) fn shutdown_existing_instance() -> Result<()> {
+    if let Some(instance) = SingleInstance::acquire()? {
+        drop(instance);
+        return Ok(());
+    }
+
+    let (hwnd, process_id) = find_existing_instance()?;
+    // SAFETY: The process ID came from the live coordinator window. Only synchronization access
+    // is requested, and the returned non-inheritable handle is immediately transferred to RAII.
+    let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, process_id)? };
+    // SAFETY: OpenProcess returned a fresh owned process handle. This is its only raw-to-owned
+    // transition and OwnedHandle closes it exactly once.
+    let process = unsafe { OwnedHandle::from_raw_handle(process.0) };
+
+    // SAFETY: The private message carries no pointers and targets the exact live coordinator.
+    unsafe {
+        PostMessageW(
+            Some(hwnd),
+            SHUTDOWN_MESSAGE,
+            Default::default(),
+            Default::default(),
+        )?;
+    }
+
+    // SAFETY: `process` owns a live synchronization handle and the wait is finite.
+    match unsafe { WaitForSingleObject(HANDLE(process.as_raw_handle()), SHUTDOWN_WAIT_MS) } {
+        WAIT_OBJECT_0 => Ok(()),
+        WAIT_FAILED => Err(windows::core::Error::from_thread()),
+        WAIT_TIMEOUT => Err(windows::core::Error::from_hresult(E_FAIL)),
+        _ => Err(windows::core::Error::from_hresult(E_FAIL)),
+    }
+}
+
+fn find_existing_instance() -> Result<(windows::Win32::Foundation::HWND, u32)> {
     let deadline = Instant::now() + ACTIVATION_WAIT;
     let hwnd = loop {
         // SAFETY: Two null traversal handles search top-level windows. The exact private class
@@ -70,23 +128,7 @@ pub(crate) fn activate_existing_instance() -> Result<()> {
     if thread_id == 0 || process_id == 0 {
         return Err(windows::core::Error::from_hresult(E_FAIL));
     }
-
-    // If this second launch owns foreground permission, transfer it to the existing process so
-    // its native menu can satisfy SetForegroundWindow. The activation message remains useful even
-    // when policy rejects this optional transfer.
-    // SAFETY: `process_id` came from the live coordinator HWND. This call grants a Windows
-    // foreground-policy permission and neither transfers ownership nor dereferences a pointer.
-    let _ = unsafe { AllowSetForegroundWindow(process_id) };
-
-    // SAFETY: The private message carries no pointers and targets the exact live coordinator.
-    unsafe {
-        PostMessageW(
-            Some(hwnd),
-            ACTIVATE_MESSAGE,
-            Default::default(),
-            Default::default(),
-        )
-    }
+    Ok((hwnd, process_id))
 }
 
 #[cfg(test)]

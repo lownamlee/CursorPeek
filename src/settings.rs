@@ -771,6 +771,10 @@ pub(crate) enum SettingsError {
         path: PathBuf,
         limit: usize,
     },
+    UnsupportedMode {
+        operation: &'static str,
+        mode: SettingsMode,
+    },
     InvalidPath(String),
     InvalidKnownFolderPath,
     TemporaryNameExhausted(PathBuf),
@@ -819,6 +823,13 @@ impl fmt::Display for SettingsError {
                 "configuration `{}` exceeds {limit} bytes",
                 path.display()
             ),
+            Self::UnsupportedMode { operation, mode } => {
+                write!(
+                    formatter,
+                    "{operation} is not supported in {} mode",
+                    mode.as_str()
+                )
+            }
             Self::InvalidPath(reason) => formatter.write_str(reason),
             Self::InvalidKnownFolderPath => {
                 formatter.write_str("Local AppData returned an invalid path")
@@ -840,6 +851,7 @@ impl Error for SettingsError {
             Self::InvalidConfiguration { source, .. } => Some(source),
             Self::InvalidUtf8 { source, .. } => Some(source),
             Self::TooLarge { .. }
+            | Self::UnsupportedMode { .. }
             | Self::InvalidPath(_)
             | Self::InvalidKnownFolderPath
             | Self::TemporaryNameExhausted(_) => None,

@@ -112,6 +112,11 @@ reference.
 
 The release PE must retain ASLR, NX, Control Flow Guard, CET compatibility, relocation/load
 configuration, the approved icon/version resources, and the approved system-DLL import boundary.
+Portable and installer packages are produced from the same checked payload with canonical
+metadata, exact license files, internal checksums, and adjacent SHA-256 records. The installer is
+current-user only, uses a hash-pinned NSIS compiler, synchronizes startup through CursorPeek's
+owned registry command, and uninstalls an explicit owned-file list rather than recursively deleting
+the installation directory.
 
 ## Residual risks and non-goals
 

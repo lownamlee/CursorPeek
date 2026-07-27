@@ -32,6 +32,9 @@ pub(crate) enum ProcessMode {
     RecoverySoakDiagnostics,
     PerformanceDiagnostics,
     SettingsDiagnostics,
+    ShutdownExisting,
+    SetStartupEnabled,
+    SetStartupDisabled,
     PreviewWorker,
     #[cfg(feature = "resolver-corpus")]
     ResolverCorpusProbe,
@@ -73,6 +76,9 @@ impl Command {
             Some("--recovery-soak-diagnostics") => Self::Run(ProcessMode::RecoverySoakDiagnostics),
             Some("--performance-diagnostics") => Self::Run(ProcessMode::PerformanceDiagnostics),
             Some("--settings-diagnostics") => Self::Run(ProcessMode::SettingsDiagnostics),
+            Some("--shutdown-existing") => Self::Run(ProcessMode::ShutdownExisting),
+            Some("--set-startup-enabled") => Self::Run(ProcessMode::SetStartupEnabled),
+            Some("--set-startup-disabled") => Self::Run(ProcessMode::SetStartupDisabled),
             Some("--preview-worker") => Self::Run(ProcessMode::PreviewWorker),
             #[cfg(feature = "resolver-corpus")]
             Some("--resolver-corpus-probe") => Self::Run(ProcessMode::ResolverCorpusProbe),
@@ -199,6 +205,22 @@ mod tests {
         assert_eq!(
             Command::parse(["--settings-diagnostics"]),
             Ok(Command::Run(ProcessMode::SettingsDiagnostics))
+        );
+    }
+
+    #[test]
+    fn private_installer_commands_are_accepted() {
+        assert_eq!(
+            Command::parse(["--shutdown-existing"]),
+            Ok(Command::Run(ProcessMode::ShutdownExisting))
+        );
+        assert_eq!(
+            Command::parse(["--set-startup-enabled"]),
+            Ok(Command::Run(ProcessMode::SetStartupEnabled))
+        );
+        assert_eq!(
+            Command::parse(["--set-startup-disabled"]),
+            Ok(Command::Run(ProcessMode::SetStartupDisabled))
         );
     }
 

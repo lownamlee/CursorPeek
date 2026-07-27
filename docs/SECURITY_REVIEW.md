@@ -75,8 +75,11 @@ the fuzz harness.
 ## Release decision
 
 No unresolved security-policy exception is open for 0.1; the sole scoped license allowance is the
-fuzz-only NCSA entry described above. Portable packaging includes the exact locked third-party
-license files, internal and archive checksums, clean-source metadata, and a relocated storage and
-worker smoke test. Installer and clean-VM distribution tests, unsigned artifact disclosure,
+fuzz-only NCSA entry described above. Portable and installer packaging include the exact locked
+third-party license files, internal and artifact checksums, and clean-source metadata. The portable
+smoke relocates the package and exercises storage and worker recovery. The per-user installer uses
+a hash-pinned NSIS compiler, carries the distribution's exact multi-license `COPYING` notice, and
+uses deterministic output, explicit owned-file removal, startup synchronization, and automated
+install/repair/uninstall checks. Clean-VM distribution tests, unsigned artifact disclosure,
 exact-source rebuild, and maintainer acceptance remain later release gates. This review does not
 authorize publishing `v0.1.0`.

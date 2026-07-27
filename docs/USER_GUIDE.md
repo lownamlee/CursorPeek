@@ -141,9 +141,20 @@ Without a portable marker, settings are stored at:
 %LOCALAPPDATA%\CursorPeek\config.ini
 ```
 
-The **Start with Windows** option writes the current executable command to the current user’s
+The **Start with Windows** option writes the current executable command to the current user's
 `Software\Microsoft\Windows\CurrentVersion\Run` registry key under the value `CursorPeek`. It does
 not require administrator rights.
+
+The per-user installer uses `%LOCALAPPDATA%\Programs\CursorPeek` by default and does not request
+administrator rights. Its component page can add Start Menu shortcuts, a desktop shortcut, and
+Start with Windows. Start Menu shortcuts are selected by default; the desktop and startup options
+are opt-in.
+
+Running the installer again repairs or upgrades the same current-user installation. Existing
+`config.ini` settings and files not owned by CursorPeek are preserved. Uninstall removes only
+CursorPeek's packaged files, shortcuts, startup registration, and empty directories. **Remove user
+settings** is selected on the uninstall component page; clear it before continuing if you want to
+keep `config.ini` for a later reinstall.
 
 ### Portable mode
 

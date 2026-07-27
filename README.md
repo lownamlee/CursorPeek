@@ -54,6 +54,23 @@ The ZIP contains the portable marker, user and security documentation, project l
 third-party license files, release metadata, and internal checksums. Its adjacent `.sha256` file
 verifies the complete archive.
 
+To build the per-user installer from that qualified portable archive:
+
+```powershell
+$portable = Get-ChildItem .\target\packages\*-portable.zip
+$nsis = .\tools\Get-Nsis.ps1
+.\tools\New-InstallerPackage.ps1 `
+    -PortablePackage $portable.FullName `
+    -NsisCompiler $nsis
+.\tools\Test-InstallerPackage.ps1 `
+    -InstallerPath .\target\packages\CursorPeek-0.1.0-windows-x64-setup.exe
+```
+
+The NSIS compiler is downloaded from its official distribution and accepted only when its pinned
+SHA-256 hash and version match. The installer targets the current user, requests no elevation, and
+supports repair, optional shortcuts, optional startup, and settings-aware uninstall. Its payload
+also includes the exact NSIS packaging license notice.
+
 ## Development checks
 
 ```powershell

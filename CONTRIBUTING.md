@@ -43,10 +43,21 @@ Changes to Windows resources or the release executable should also run:
 .\tools\Test-PortablePackage.ps1 `
     -PackagePath .\target\packages\CursorPeek-0.1.0-windows-x64-portable.zip `
     -AllowDirtyMetadata
+$nsis = .\tools\Get-Nsis.ps1
+.\tools\New-InstallerPackage.ps1 `
+    -PortablePackage .\target\packages\CursorPeek-0.1.0-windows-x64-portable.zip `
+    -NsisCompiler $nsis `
+    -AllowDirtyMetadata
+.\tools\Test-InstallerPackage.ps1 `
+    -InstallerPath .\target\packages\CursorPeek-0.1.0-windows-x64-setup.exe `
+    -AllowDirtyMetadata
 ```
 
-The two `AllowDirty` switches are only for testing packaging changes before commit. They mark the
-package as non-release metadata; a candidate intended for distribution must come from a clean tree.
+The dirty-metadata switches are only for testing packaging changes before commit. They preserve
+the non-release marker from the portable input; a candidate intended for distribution must come
+from a clean tree. `Test-InstallerPackage.ps1 -ExerciseInstall` changes the current user's
+installation, shortcuts, startup entry, and settings while exercising repair and uninstall, so run
+that lifecycle check only in a disposable clean Windows account or VM.
 
 Tests that exercise shared qualification paths must run sequentially. Real Explorer behavior,
 focus, DPI, input, sleep, and packaging changes need reviewable Windows evidence in addition to

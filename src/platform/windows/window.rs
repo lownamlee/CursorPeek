@@ -63,7 +63,7 @@ use windows::{
 use windows::Win32::UI::WindowsAndMessaging::IsWindow;
 
 pub(super) const CLASS_NAME: PCWSTR = w!("CursorPeek.MessageWindow");
-const SHUTDOWN_MESSAGE: u32 = WM_APP + 1;
+pub(super) const SHUTDOWN_MESSAGE: u32 = WM_APP + 1;
 const WORKER_RESULT_MESSAGE: u32 = WM_APP + 2;
 const TRAY_CALLBACK_MESSAGE: u32 = WM_APP + 3;
 pub(super) const ACTIVATE_MESSAGE: u32 = WM_APP + 4;

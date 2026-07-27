@@ -143,6 +143,58 @@ jobs:
                   ./tools/Test-PortablePackage.ps1 `
                     -PackagePath $first.FullName
 
+            - name: Build and exercise per-user installer
+              run: |
+                  $portableArchives = @(
+                    Get-ChildItem `
+                      -LiteralPath target/portable-first `
+                      -Filter '*.zip' |
+                    Where-Object { -not $_.PSIsContainer }
+                  )
+                  if ($portableArchives.Count -ne 1) {
+                      throw 'Installer packaging requires exactly one qualified portable archive.'
+                  }
+
+                  $nsisCompiler = ./tools/Get-Nsis.ps1
+                  ./tools/New-InstallerPackage.ps1 `
+                    -PortablePackage $portableArchives[0].FullName `
+                    -NsisCompiler $nsisCompiler `
+                    -OutputDirectory target/installer-first
+                  ./tools/New-InstallerPackage.ps1 `
+                    -PortablePackage $portableArchives[0].FullName `
+                    -NsisCompiler $nsisCompiler `
+                    -OutputDirectory target/installer-repeated
+
+                  $firstInstallers = @(
+                    Get-ChildItem `
+                      -LiteralPath target/installer-first `
+                      -Filter '*-setup.exe' |
+                    Where-Object { -not $_.PSIsContainer }
+                  )
+                  $repeatedInstallers = @(
+                    Get-ChildItem `
+                      -LiteralPath target/installer-repeated `
+                      -Filter '*-setup.exe' |
+                    Where-Object { -not $_.PSIsContainer }
+                  )
+                  if ($firstInstallers.Count -ne 1 -or
+                      $repeatedInstallers.Count -ne 1) {
+                      throw 'Installer packaging did not create exactly one setup executable per run.'
+                  }
+                  $firstHash = (Get-FileHash `
+                    -Algorithm SHA256 `
+                    -LiteralPath $firstInstallers[0].FullName).Hash
+                  $repeatedHash = (Get-FileHash `
+                    -Algorithm SHA256 `
+                    -LiteralPath $repeatedInstallers[0].FullName).Hash
+                  if ($firstHash -cne $repeatedHash) {
+                      throw 'Repeated installer generation was not deterministic.'
+                  }
+
+                  ./tools/Test-InstallerPackage.ps1 `
+                    -InstallerPath $firstInstallers[0].FullName `
+                    -ExerciseInstall
+
             - name: Upload release evidence
               uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
               with:
