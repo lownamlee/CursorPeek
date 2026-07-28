@@ -33,7 +33,9 @@ pub(crate) use manager::{
     CompletionNotifier, PendingWorkerPoll, PendingWorkerResolution, WorkerManager,
     WorkerManagerError, run_launch_diagnostic, run_timeout_diagnostic,
 };
-pub(crate) use payload::{ImageFormat, ImagePreview, PreviewResult, TextPreview};
+#[cfg(test)]
+pub(crate) use payload::ImageFormat;
+pub(crate) use payload::{ImagePreview, PreviewResult, TextPreview};
 
 pub(crate) fn run_session<R, W>(
     reader: &mut R,
@@ -99,7 +101,11 @@ fn preview_file_result(
         Ok(true) => {}
         Ok(false) | Err(_) => return PreviewResult::Status(ResolverStatus::Unavailable),
     }
-    if let Some(result) = cache.get(&key) {
+    if let Some(mut result) = cache.get(&key) {
+        if let PreviewResult::Image(preview) = &mut result {
+            preview.display_name = file.display_name();
+            preview.last_write_time = file.last_write_time();
+        }
         return match file.is_unchanged() {
             Ok(true) => result,
             Ok(false) | Err(_) => PreviewResult::Status(ResolverStatus::Unavailable),
@@ -290,6 +296,11 @@ mod tests {
         };
         assert_eq!((preview.source_width, preview.source_height), (2, 1));
         assert_eq!((preview.width, preview.height), (2, 1));
+        assert_eq!(
+            preview.display_name,
+            image_path.file_name().unwrap().to_string_lossy()
+        );
+        assert!(preview.last_write_time > 0);
         assert_eq!(
             preview.premultiplied_bgra,
             [20, 40, 60, 128, 20, 40, 60, 128]

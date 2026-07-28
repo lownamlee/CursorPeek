@@ -376,7 +376,7 @@ impl PopupMenu {
             w!("Large (800 x 600)"),
             (state.preview_width, state.preview_height) == (800, 600),
         )?;
-        settings.append_submenu(preview, w!("Preview size"))?;
+        settings.append_submenu(preview, w!("Maximum preview size"))?;
 
         let theme = Self::new()?;
         theme.append_command(

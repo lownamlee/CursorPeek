@@ -33,6 +33,8 @@ use windows::{
     core::{Error as WindowsError, HRESULT, PCWSTR},
 };
 
+use super::payload::is_unsafe_display_name_scalar;
+
 const MAX_PATH_UNITS: usize = 32_768;
 const INITIAL_FINAL_PATH_UNITS: usize = 260;
 const MAX_CONTENT_PREFIX_LEN: usize = 256 * 1024;
@@ -123,6 +125,33 @@ impl PreviewFile {
 
     pub(super) const fn file_size(&self) -> u64 {
         self.snapshot.file_size
+    }
+
+    pub(super) const fn last_write_time(&self) -> i64 {
+        self.snapshot.last_write_time
+    }
+
+    pub(super) fn display_name(&self) -> String {
+        let name = self
+            .opened_path
+            .file_name()
+            .or_else(|| self.final_path.file_name())
+            .map_or_else(|| "preview".into(), |name| name.to_string_lossy());
+        let sanitized: String = name
+            .chars()
+            .map(|scalar| {
+                if is_unsafe_display_name_scalar(scalar) {
+                    '\u{fffd}'
+                } else {
+                    scalar
+                }
+            })
+            .collect();
+        if sanitized.is_empty() {
+            "preview".to_owned()
+        } else {
+            sanitized
+        }
     }
 
     pub(super) fn duplicate_reader(&self) -> Result<File, PreviewFileError> {
@@ -586,9 +615,11 @@ mod tests {
 
         let file = PreviewFile::open(&path).expect("the local file should open");
         assert_eq!(file.snapshot().file_size, 7);
+        assert!(file.last_write_time() > 0);
         assert_ne!(file.snapshot().identity.file_id, [0; 16]);
         assert!(file.final_path().is_absolute());
         assert!(file.final_path().ends_with("配置.txt"));
+        assert_eq!(file.display_name(), "配置.txt");
         assert_eq!(
             file.cache_identity().linked_content,
             file.is_linked_content()

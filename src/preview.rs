@@ -17,6 +17,14 @@ impl PreviewSize {
     pub(crate) const fn diagnostic() -> Self {
         Self::new(320, 240)
     }
+
+    pub(crate) const fn width(self) -> u32 {
+        self.width
+    }
+
+    pub(crate) const fn height(self) -> u32 {
+        self.height
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,18 +49,55 @@ pub(crate) fn place_preview(
     dpi: u32,
     size: PreviewSize,
 ) -> Option<PreviewPlacement> {
+    if dpi == 0 || size.width == 0 || size.height == 0 {
+        return None;
+    }
+    place_preview_with_physical_size(
+        anchor,
+        work_area,
+        dpi,
+        scale_from_96_dpi(i64::from(size.width), dpi)?,
+        scale_from_96_dpi(i64::from(size.height), dpi)?,
+    )
+}
+
+pub(crate) fn place_preview_pixels(
+    anchor: PhysicalScreenPoint,
+    work_area: ScreenRect,
+    dpi: u32,
+    width: u32,
+    height: u32,
+) -> Option<PreviewPlacement> {
+    if dpi == 0 || width == 0 || height == 0 {
+        return None;
+    }
+    place_preview_with_physical_size(anchor, work_area, dpi, i64::from(width), i64::from(height))
+}
+
+fn place_preview_with_physical_size(
+    anchor: PhysicalScreenPoint,
+    work_area: ScreenRect,
+    dpi: u32,
+    requested_width: i64,
+    requested_height: i64,
+) -> Option<PreviewPlacement> {
     let work_left = i64::from(work_area.left);
     let work_top = i64::from(work_area.top);
     let work_right = i64::from(work_area.right);
     let work_bottom = i64::from(work_area.bottom);
     let work_width = work_right.checked_sub(work_left)?;
     let work_height = work_bottom.checked_sub(work_top)?;
-    if work_width <= 0 || work_height <= 0 || dpi == 0 || size.width == 0 || size.height == 0 {
+    if work_width <= 0
+        || work_height <= 0
+        || dpi == 0
+        || requested_width <= 0
+        || requested_height <= 0
+    {
         return None;
     }
 
-    let width = scale_from_96_dpi(i64::from(size.width), dpi)?.min(work_width);
-    let height = scale_from_96_dpi(i64::from(size.height), dpi)?.min(work_height);
+    let width = requested_width.min(work_width);
+    let height = requested_height.min(work_height);
     let gap = scale_from_96_dpi(POINTER_GAP, dpi)?;
     let anchor_x = i64::from(anchor.x);
     let anchor_y = i64::from(anchor.y);
@@ -153,7 +198,7 @@ fn visible_area(
 
 #[cfg(test)]
 mod tests {
-    use super::{PreviewPlacement, PreviewSize, ScreenRect, place_preview};
+    use super::{PreviewPlacement, PreviewSize, ScreenRect, place_preview, place_preview_pixels};
     use crate::hover::PhysicalScreenPoint;
 
     const PRIMARY_WORK_AREA: ScreenRect = ScreenRect {
@@ -375,6 +420,25 @@ mod tests {
                 y: 110,
                 width: 800,
                 height: 600,
+            })
+        );
+    }
+
+    #[test]
+    fn accepts_an_already_scaled_physical_window_size() {
+        assert_eq!(
+            place_preview_pixels(
+                PhysicalScreenPoint::new(200, 100),
+                PRIMARY_WORK_AREA,
+                192,
+                488,
+                364,
+            ),
+            Some(PreviewPlacement {
+                x: 216,
+                y: 116,
+                width: 488,
+                height: 364,
             })
         );
     }

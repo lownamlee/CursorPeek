@@ -10,18 +10,21 @@ use std::{
 
 use crate::{
     hover::PhysicalScreenPoint,
-    preview::{PreviewPlacement, PreviewSize, ScreenRect, place_preview},
+    preview::{PreviewPlacement, PreviewSize, ScreenRect, place_preview, place_preview_pixels},
     settings::Theme,
-    worker::{ImageFormat, ImagePreview, TextPreview},
+    worker::{ImagePreview, TextPreview},
 };
+use cursorpeek_core::layout::fit_dimensions;
 
 use windows::{
     Foundation::TypedEventHandler,
     UI::ViewManagement::{UIColorType, UISettings},
     Win32::{
         Foundation::{
-            D2DERR_RECREATE_TARGET, E_INVALIDARG, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+            D2DERR_RECREATE_TARGET, E_INVALIDARG, FILETIME, HINSTANCE, HWND, LPARAM, LRESULT, RECT,
+            SYSTEMTIME, WPARAM,
         },
+        Globalization::{DATE_SHORTDATE, GetDateFormatEx, GetTimeFormatEx, TIME_NOSECONDS},
         Graphics::{
             Direct2D::{
                 Common::{
@@ -49,10 +52,13 @@ use windows::{
                 RedrawWindow,
             },
         },
-        System::LibraryLoader::GetModuleHandleW,
+        System::{
+            LibraryLoader::GetModuleHandleW,
+            Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTimeEx},
+        },
         UI::{
             Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
-            HiDpi::{GetDpiForWindow, SystemParametersInfoForDpi},
+            HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow, SystemParametersInfoForDpi},
             WindowsAndMessaging::{
                 CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA,
                 GetClientRect, GetWindowLongPtrW, HWND_TOPMOST, MA_NOACTIVATEANDEAT,
@@ -77,6 +83,9 @@ const BASE_DPI: f32 = 96.0;
 const CONTENT_MARGIN: f32 = 12.0;
 const HEADER_HEIGHT: f32 = 18.0;
 const HEADER_BODY_GAP: f32 = 8.0;
+const IMAGE_MARGIN: f32 = 4.0;
+const IMAGE_METADATA_HEIGHT: f32 = 56.0;
+const IMAGE_MINIMUM_WIDTH: f32 = 158.0;
 const SYSTEM_APPEARANCE_CHANGED_MESSAGE: u32 = WM_APP + 20;
 
 pub(crate) struct PreviewWindow {
@@ -211,17 +220,27 @@ impl PreviewWindow {
             return Err(Error::from_thread());
         }
 
-        let placement = place_preview(
-            anchor,
-            ScreenRect {
-                left: monitor_info.rcWork.left,
-                top: monitor_info.rcWork.top,
-                right: monitor_info.rcWork.right,
-                bottom: monitor_info.rcWork.bottom,
-            },
-            dpi,
-            size,
-        )
+        let work_area = ScreenRect {
+            left: monitor_info.rcWork.left,
+            top: monitor_info.rcWork.top,
+            right: monitor_info.rcWork.right,
+            bottom: monitor_info.rcWork.bottom,
+        };
+        let placement = match content.as_ref() {
+            Some(RetainedContent::Image(content)) => {
+                let client_size = image_client_pixel_size(&content.preview, size, dpi)
+                    .ok_or_else(Error::from_thread)?;
+                let window_size = adjusted_window_pixel_size(client_size, dpi)?;
+                place_preview_pixels(
+                    anchor,
+                    work_area,
+                    dpi,
+                    window_size.width,
+                    window_size.height,
+                )
+            }
+            Some(RetainedContent::Text(_)) | None => place_preview(anchor, work_area, dpi, size),
+        }
         .ok_or_else(Error::from_thread)?;
 
         let title = content
@@ -516,40 +535,62 @@ impl PreviewWindowState {
             .expect("layouts are created only for retained content");
         let width = pixels_to_dips(self.pixel_size.width, self.dpi);
         let height = pixels_to_dips(self.pixel_size.height, self.dpi);
-        let layout_width = (width - CONTENT_MARGIN * 2.0).max(1.0);
-        let body_origin_y = CONTENT_MARGIN + HEADER_HEIGHT + HEADER_BODY_GAP;
-        let body_height = (height - body_origin_y - CONTENT_MARGIN).max(1.0);
+        match content {
+            RetainedContent::Text(content) => {
+                let layout_width = (width - CONTENT_MARGIN * 2.0).max(1.0);
+                let body_origin_y = CONTENT_MARGIN + HEADER_HEIGHT + HEADER_BODY_GAP;
+                let body_height = (height - body_origin_y - CONTENT_MARGIN).max(1.0);
 
-        // SAFETY: The bounded UTF-16 buffers remain alive in content for the complete calls.
-        // Formats and the factory are retained COM resources on this thread.
-        let header = unsafe {
-            self.dwrite_factory.CreateTextLayout(
-                content.header(),
-                &self.formats.header,
-                layout_width,
-                HEADER_HEIGHT,
-            )?
-        };
-        let body = match content {
-            RetainedContent::Text(content) if !content.body.is_empty() => {
-                // SAFETY: The bounded UTF-16 body and retained format remain valid for this
-                // synchronous call; DirectWrite returns an independently owned layout.
-                Some(unsafe {
+                // SAFETY: The bounded UTF-16 buffers remain alive in content for the complete
+                // calls. Formats and the factory are retained COM resources on this thread.
+                let header = unsafe {
                     self.dwrite_factory.CreateTextLayout(
-                        &content.body,
-                        &self.formats.body,
+                        &content.header,
+                        &self.formats.header,
                         layout_width,
-                        body_height,
+                        HEADER_HEIGHT,
                     )?
+                };
+                let body = if content.body.is_empty() {
+                    None
+                } else {
+                    // SAFETY: The bounded UTF-16 body and retained format remain valid for this
+                    // synchronous call; DirectWrite returns an independently owned layout.
+                    Some(unsafe {
+                        self.dwrite_factory.CreateTextLayout(
+                            &content.body,
+                            &self.formats.body,
+                            layout_width,
+                            body_height,
+                        )?
+                    })
+                };
+                Ok(ContentLayouts::Text {
+                    header,
+                    body,
+                    body_origin_y,
                 })
             }
-            RetainedContent::Text(_) | RetainedContent::Image(_) => None,
-        };
-        Ok(ContentLayouts {
-            header,
-            body,
-            body_origin_y,
-        })
+            RetainedContent::Image(content) => {
+                let layout_width = (width - IMAGE_MARGIN * 2.0).max(1.0);
+                let metadata_origin_y =
+                    (height - IMAGE_MARGIN - IMAGE_METADATA_HEIGHT).max(IMAGE_MARGIN);
+                // SAFETY: The bounded UTF-16 metadata remains alive in content for this
+                // synchronous call. The returned layout owns its DirectWrite state.
+                let metadata = unsafe {
+                    self.dwrite_factory.CreateTextLayout(
+                        &content.metadata,
+                        &self.formats.image_metadata,
+                        layout_width,
+                        IMAGE_METADATA_HEIGHT,
+                    )?
+                };
+                Ok(ContentLayouts::Image {
+                    metadata,
+                    metadata_origin_y,
+                })
+            }
+        }
     }
 
     fn render_with_recovery(&mut self, hwnd: HWND) -> Result<()> {
@@ -588,28 +629,6 @@ impl PreviewWindowState {
         unsafe {
             device.target.BeginDraw();
             device.target.Clear(Some(&self.colors.background));
-            if let Some(layouts) = self.layouts.as_ref() {
-                device.target.DrawTextLayout(
-                    Vector2 {
-                        X: CONTENT_MARGIN,
-                        Y: CONTENT_MARGIN,
-                    },
-                    &layouts.header,
-                    &device.metadata_brush,
-                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                );
-                if let Some(body) = layouts.body.as_ref() {
-                    device.target.DrawTextLayout(
-                        Vector2 {
-                            X: CONTENT_MARGIN,
-                            Y: layouts.body_origin_y,
-                        },
-                        body,
-                        &device.body_brush,
-                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                    );
-                }
-            }
             if let (Some(bitmap), Some(RetainedContent::Image(content))) =
                 (self.image_bitmap.as_ref(), self.content.as_ref())
                 && let Some(destination) =
@@ -622,6 +641,50 @@ impl PreviewWindowState {
                     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
                     None,
                 );
+            }
+            if let Some(layouts) = self.layouts.as_ref() {
+                match layouts {
+                    ContentLayouts::Text {
+                        header,
+                        body,
+                        body_origin_y,
+                    } => {
+                        device.target.DrawTextLayout(
+                            Vector2 {
+                                X: CONTENT_MARGIN,
+                                Y: CONTENT_MARGIN,
+                            },
+                            header,
+                            &device.metadata_brush,
+                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        );
+                        if let Some(body) = body.as_ref() {
+                            device.target.DrawTextLayout(
+                                Vector2 {
+                                    X: CONTENT_MARGIN,
+                                    Y: *body_origin_y,
+                                },
+                                body,
+                                &device.body_brush,
+                                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                            );
+                        }
+                    }
+                    ContentLayouts::Image {
+                        metadata,
+                        metadata_origin_y,
+                    } => {
+                        device.target.DrawTextLayout(
+                            Vector2 {
+                                X: IMAGE_MARGIN,
+                                Y: *metadata_origin_y,
+                            },
+                            metadata,
+                            &device.body_brush,
+                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        );
+                    }
+                }
             }
             device.target.EndDraw(None, None)
         }
@@ -716,13 +779,6 @@ enum RetainedContent {
 }
 
 impl RetainedContent {
-    fn header(&self) -> &[u16] {
-        match self {
-            Self::Text(content) => &content.header,
-            Self::Image(content) => &content.header,
-        }
-    }
-
     const fn accessible_title(&self) -> PCWSTR {
         match self {
             Self::Text(_) => w!("CursorPeek text preview"),
@@ -732,23 +788,29 @@ impl RetainedContent {
 }
 
 struct ImageContent {
-    header: Vec<u16>,
+    metadata: Vec<u16>,
     preview: ImagePreview,
 }
 
 impl ImageContent {
     fn from_preview(preview: ImagePreview) -> Self {
         Self {
-            header: image_preview_header(&preview).encode_utf16().collect(),
+            metadata: image_preview_metadata(&preview).encode_utf16().collect(),
             preview,
         }
     }
 }
 
-struct ContentLayouts {
-    header: IDWriteTextLayout,
-    body: Option<IDWriteTextLayout>,
-    body_origin_y: f32,
+enum ContentLayouts {
+    Text {
+        header: IDWriteTextLayout,
+        body: Option<IDWriteTextLayout>,
+        body_origin_y: f32,
+    },
+    Image {
+        metadata: IDWriteTextLayout,
+        metadata_origin_y: f32,
+    },
 }
 
 struct DeviceResources {
@@ -760,6 +822,7 @@ struct DeviceResources {
 struct TextFormats {
     header: IDWriteTextFormat,
     body: IDWriteTextFormat,
+    image_metadata: IDWriteTextFormat,
 }
 
 impl TextFormats {
@@ -793,6 +856,18 @@ impl TextFormats {
                 w!("en-US"),
             )?
         };
+        // SAFETY: The same terminated family buffer remains live for this synchronous call.
+        let image_metadata = unsafe {
+            factory.CreateTextFormat(
+                family,
+                None::<&IDWriteFontCollection>,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                font.size,
+                w!("en-US"),
+            )?
+        };
         // SAFETY: These calls mutate only newly created device-independent formats owned here.
         unsafe {
             header.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
@@ -801,8 +876,15 @@ impl TextFormats {
             body.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
             body.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR)?;
             body.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP)?;
+            image_metadata.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
+            image_metadata.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR)?;
+            image_metadata.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
         }
-        Ok(Self { header, body })
+        Ok(Self {
+            header,
+            body,
+            image_metadata,
+        })
     }
 }
 
@@ -966,33 +1048,75 @@ fn preview_header(preview: &TextPreview) -> String {
     header
 }
 
-fn image_preview_header(preview: &ImagePreview) -> String {
-    let mut header = format!(
-        "{}  \u{b7}  {} \u{d7} {}  \u{b7}  {}",
-        image_format_label(preview.format),
+fn image_preview_metadata(preview: &ImagePreview) -> String {
+    let mut details = format!(
+        "{}    ({} \u{d7} {})",
+        format_file_size(preview.file_size),
         preview.source_width,
         preview.source_height,
-        format_file_size(preview.file_size)
     );
     if preview.first_frame_only {
-        header.push_str("  \u{b7}  first frame");
+        details.push_str("  \u{b7}  first frame");
     }
     if preview.linked_content {
-        header.push_str("  \u{b7}  linked");
+        details.push_str("  \u{b7}  linked");
     }
-    header
+    let modified = format_last_write_time(preview.last_write_time)
+        .unwrap_or_else(|| "Modified time unavailable".to_owned());
+    format!("{}\n{details}\n{modified}", preview.display_name)
 }
 
-const fn image_format_label(format: ImageFormat) -> &'static str {
-    match format {
-        ImageFormat::Jpeg => "JPEG",
-        ImageFormat::Png => "PNG",
-        ImageFormat::Gif => "GIF",
-        ImageFormat::WebP => "WebP",
-        ImageFormat::Bmp => "BMP",
-        ImageFormat::Ico => "ICO",
-        ImageFormat::Tiff => "TIFF",
+fn format_last_write_time(value: i64) -> Option<String> {
+    let value = u64::try_from(value).ok()?;
+    let file_time = FILETIME {
+        dwLowDateTime: value as u32,
+        dwHighDateTime: (value >> 32) as u32,
+    };
+    let mut utc = SYSTEMTIME::default();
+    let mut local = SYSTEMTIME::default();
+    // SAFETY: Both calls read fully initialized time structures and write to distinct valid
+    // outputs. A null time-zone argument selects the current dynamic Windows time zone.
+    unsafe {
+        FileTimeToSystemTime(&file_time, &mut utc).ok()?;
+        SystemTimeToTzSpecificLocalTimeEx(None, &utc, &mut local).ok()?;
     }
+
+    let date = localized_system_time_part(&local, true)
+        .unwrap_or_else(|| format!("{:04}-{:02}-{:02}", local.wYear, local.wMonth, local.wDay));
+    let time = localized_system_time_part(&local, false)
+        .unwrap_or_else(|| format!("{:02}:{:02}", local.wHour, local.wMinute));
+    Some(format!("{date} {time}"))
+}
+
+fn localized_system_time_part(time: &SYSTEMTIME, date: bool) -> Option<String> {
+    let mut buffer = [0_u16; 96];
+    // SAFETY: `time` is initialized local calendar time. Null locale/format pointers request the
+    // current user's defaults, and the fixed writable buffer supplies its exact element count.
+    let length = unsafe {
+        if date {
+            GetDateFormatEx(
+                PCWSTR::null(),
+                DATE_SHORTDATE,
+                Some(std::ptr::from_ref(time)),
+                PCWSTR::null(),
+                Some(&mut buffer),
+                PCWSTR::null(),
+            )
+        } else {
+            GetTimeFormatEx(
+                PCWSTR::null(),
+                TIME_NOSECONDS,
+                Some(std::ptr::from_ref(time)),
+                PCWSTR::null(),
+                Some(&mut buffer),
+            )
+        }
+    };
+    let length = usize::try_from(length).ok()?;
+    if !(2..=buffer.len()).contains(&length) || buffer[length - 1] != 0 {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buffer[..length - 1]))
 }
 
 fn checked_image_layout(preview: &ImagePreview) -> Option<(u32, usize)> {
@@ -1020,6 +1144,63 @@ fn checked_image_layout(preview: &ImagePreview) -> Option<(u32, usize)> {
     Some((pitch, length))
 }
 
+fn image_client_pixel_size(
+    preview: &ImagePreview,
+    maximum: PreviewSize,
+    dpi: u32,
+) -> Option<D2D_SIZE_U> {
+    if dpi == 0 || checked_image_layout(preview).is_none() {
+        return None;
+    }
+
+    let max_width = dips_to_pixels(maximum.width() as f32, dpi)?;
+    let max_height = dips_to_pixels(maximum.height() as f32, dpi)?;
+    let margin = dips_to_pixels(IMAGE_MARGIN, dpi)?;
+    let metadata_height = dips_to_pixels(IMAGE_METADATA_HEIGHT, dpi)?;
+    let horizontal_chrome = margin.checked_mul(2)?;
+    let vertical_chrome = horizontal_chrome.checked_add(metadata_height)?;
+    let available_width = max_width.checked_sub(horizontal_chrome)?;
+    let available_height = max_height.checked_sub(vertical_chrome)?;
+    let (image_width, image_height) = fit_dimensions(
+        preview.width,
+        preview.height,
+        available_width,
+        available_height,
+    )?;
+    let minimum_width = dips_to_pixels(IMAGE_MINIMUM_WIDTH, dpi)?.min(available_width);
+    let content_width = image_width.max(minimum_width);
+
+    Some(D2D_SIZE_U {
+        width: content_width.checked_add(horizontal_chrome)?,
+        height: image_height.checked_add(vertical_chrome)?,
+    })
+}
+
+fn adjusted_window_pixel_size(client: D2D_SIZE_U, dpi: u32) -> Result<D2D_SIZE_U> {
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: i32::try_from(client.width).map_err(|_| Error::from_thread())?,
+        bottom: i32::try_from(client.height).map_err(|_| Error::from_thread())?,
+    };
+    // SAFETY: `rect` describes a desired client area and remains writable for the complete call.
+    // The style values exactly match the preview HWND created by this module.
+    unsafe {
+        AdjustWindowRectExForDpi(
+            &mut rect,
+            WS_POPUP | WS_BORDER,
+            false,
+            WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+            dpi,
+        )?;
+    }
+    let (_, _, width, height) = checked_window_rect(&rect)?;
+    Ok(D2D_SIZE_U {
+        width: u32::try_from(width).map_err(|_| Error::from_thread())?,
+        height: u32::try_from(height).map_err(|_| Error::from_thread())?,
+    })
+}
+
 fn image_destination_rect(
     preview: &ImagePreview,
     pixel_size: D2D_SIZE_U,
@@ -1031,9 +1212,8 @@ fn image_destination_rect(
 
     let client_width = pixels_to_dips(pixel_size.width, dpi);
     let client_height = pixels_to_dips(pixel_size.height, dpi);
-    let body_origin_y = CONTENT_MARGIN + HEADER_HEIGHT + HEADER_BODY_GAP;
-    let available_width = client_width - CONTENT_MARGIN * 2.0;
-    let available_height = client_height - body_origin_y - CONTENT_MARGIN;
+    let available_width = client_width - IMAGE_MARGIN * 2.0;
+    let available_height = client_height - IMAGE_MARGIN * 2.0 - IMAGE_METADATA_HEIGHT;
     if available_width <= 0.0 || available_height <= 0.0 {
         return None;
     }
@@ -1045,8 +1225,8 @@ fn image_destination_rect(
         .min(1.0);
     let rendered_width = image_width * scale;
     let rendered_height = image_height * scale;
-    let left = CONTENT_MARGIN + (available_width - rendered_width) / 2.0;
-    let top = body_origin_y + (available_height - rendered_height) / 2.0;
+    let left = IMAGE_MARGIN + (available_width - rendered_width) / 2.0;
+    let top = IMAGE_MARGIN;
 
     Some(D2D_RECT_F {
         left,
@@ -1081,6 +1261,18 @@ fn color_from_colorref(color: u32) -> D2D1_COLOR_F {
 
 fn pixels_to_dips(pixels: u32, dpi: u32) -> f32 {
     pixels as f32 * BASE_DPI / dpi as f32
+}
+
+fn dips_to_pixels(dips: f32, dpi: u32) -> Option<u32> {
+    if !dips.is_finite() || dips <= 0.0 || dpi == 0 {
+        return None;
+    }
+    let pixels = (dips * dpi as f32 / BASE_DPI).ceil();
+    if pixels > u32::MAX as f32 {
+        None
+    } else {
+        Some(pixels as u32)
+    }
 }
 
 fn client_pixel_size(hwnd: HWND) -> Result<D2D_SIZE_U> {
@@ -1325,10 +1517,11 @@ fn preview_state(hwnd: HWND) -> Option<&'static RefCell<PreviewWindowState>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        D2D_SIZE_U, PreviewColors, PreviewWindow, PreviewWindowState, RetainedContent, TextContent,
-        checked_image_layout, checked_window_rect, color_from_colorref, format_file_size,
-        image_destination_rect, image_preview_header, preview_header, system_dark_mode,
-        system_message_font,
+        ContentLayouts, D2D_SIZE_U, PreviewColors, PreviewWindow, PreviewWindowState,
+        RetainedContent, TextContent, adjusted_window_pixel_size, checked_image_layout,
+        checked_window_rect, client_pixel_size, color_from_colorref, format_file_size,
+        image_client_pixel_size, image_destination_rect, image_preview_metadata, preview_header,
+        system_dark_mode, system_message_font,
     };
     use crate::{
         hover::PhysicalScreenPoint,
@@ -1358,8 +1551,10 @@ mod tests {
     fn image_preview() -> ImagePreview {
         ImagePreview {
             file_size: 12_800,
+            last_write_time: 133_000_000_000_000_000,
             linked_content: true,
             first_frame_only: true,
+            display_name: "sample.png".to_owned(),
             format: ImageFormat::Png,
             source_width: 2,
             source_height: 1,
@@ -1571,13 +1766,35 @@ mod tests {
     fn image_bitmap_renders_and_recovers_device_resources() {
         thread::spawn(|| {
             let preview = PreviewWindow::create().expect("the preview window should be created");
-            preview
+            let content = image_preview();
+            let placement = preview
                 .show_image_at(
                     PhysicalScreenPoint::new(200, 200),
                     PreviewSize::new(640, 480),
-                    image_preview(),
+                    content.clone(),
                 )
                 .expect("bounded image pixels should render");
+            let dpi = preview
+                .window_dpi()
+                .expect("the shown window should expose its monitor DPI");
+            let expected_client =
+                image_client_pixel_size(&content, PreviewSize::new(640, 480), dpi)
+                    .expect("the valid image should produce a bounded natural client size");
+            assert_eq!(
+                client_pixel_size(preview.handle())
+                    .expect("the live window client rectangle should be queryable"),
+                expected_client
+            );
+            let expected_window = adjusted_window_pixel_size(expected_client, dpi)
+                .expect("the natural client should produce a window rectangle");
+            assert_eq!(
+                placement.width,
+                i32::try_from(expected_window.width).unwrap()
+            );
+            assert_eq!(
+                placement.height,
+                i32::try_from(expected_window.height).unwrap()
+            );
             assert!(preview.is_visible());
             assert_eq!(preview.accessible_title(), "CursorPeek image preview");
             assert!(preview.has_content_layouts());
@@ -1659,7 +1876,10 @@ mod tests {
                 let layouts = state
                     .create_layouts()
                     .expect("the multilingual text should produce layouts");
-                let body = layouts.body.expect("the corpus body is not empty");
+                let ContentLayouts::Text { body, .. } = layouts else {
+                    panic!("text content should create text layouts");
+                };
+                let body = body.expect("the corpus body is not empty");
                 let mut metrics = DWRITE_TEXT_METRICS::default();
                 // SAFETY: metrics is writable storage and body is a live retained layout.
                 unsafe {
@@ -1692,10 +1912,12 @@ mod tests {
     #[test]
     fn image_metadata_and_renderer_boundary_are_explicit() {
         let preview = image_preview();
-        assert_eq!(
-            image_preview_header(&preview),
-            "PNG  ·  2 × 1  ·  12.5 KiB  ·  first frame  ·  linked"
-        );
+        let metadata = image_preview_metadata(&preview);
+        let lines: Vec<_> = metadata.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "sample.png");
+        assert_eq!(lines[1], "12.5 KiB    (2 × 1)  ·  first frame  ·  linked");
+        assert!(!lines[2].is_empty());
         assert_eq!(checked_image_layout(&preview), Some((8, 8)));
 
         let mut wrong_length = preview.clone();
@@ -1708,11 +1930,67 @@ mod tests {
     }
 
     #[test]
+    fn image_window_uses_natural_pixels_until_the_selected_maximum() {
+        let preview = |width: u32, height: u32| ImagePreview {
+            file_size: 1,
+            last_write_time: 133_000_000_000_000_000,
+            linked_content: false,
+            first_frame_only: false,
+            display_name: "sample.png".to_owned(),
+            format: ImageFormat::Png,
+            source_width: width,
+            source_height: height,
+            width,
+            height,
+            premultiplied_bgra: vec![0; width as usize * height as usize * 4],
+        };
+        let maximum = PreviewSize::new(640, 480);
+
+        assert_eq!(
+            image_client_pixel_size(&preview(480, 300), maximum, 96),
+            Some(D2D_SIZE_U {
+                width: 488,
+                height: 364,
+            })
+        );
+        assert_eq!(
+            image_client_pixel_size(&preview(960, 540), maximum, 96),
+            Some(D2D_SIZE_U {
+                width: 640,
+                height: 420,
+            })
+        );
+        assert_eq!(
+            image_client_pixel_size(&preview(540, 960), maximum, 96),
+            Some(D2D_SIZE_U {
+                width: 242,
+                height: 480,
+            })
+        );
+        assert_eq!(
+            image_client_pixel_size(&preview(480, 300), maximum, 192),
+            Some(D2D_SIZE_U {
+                width: 496,
+                height: 428,
+            })
+        );
+        assert_eq!(
+            image_client_pixel_size(&preview(2, 1), maximum, 96),
+            Some(D2D_SIZE_U {
+                width: 166,
+                height: 65,
+            })
+        );
+    }
+
+    #[test]
     fn image_destination_preserves_aspect_ratio_without_upscaling() {
         let preview = ImagePreview {
             file_size: 1,
+            last_write_time: 133_000_000_000_000_000,
             linked_content: false,
             first_frame_only: false,
+            display_name: "wallpaper.jpg".to_owned(),
             format: ImageFormat::Jpeg,
             source_width: 960,
             source_height: 540,
@@ -1730,10 +2008,10 @@ mod tests {
             96,
         )
         .expect("the image should fit at 100 percent");
-        assert!((at_100.left - 12.0).abs() < 0.01);
-        assert!((at_100.top - 79.75).abs() < 0.01);
-        assert!((at_100.right - 628.0).abs() < 0.01);
-        assert!((at_100.bottom - 426.25).abs() < 0.01);
+        assert!((at_100.left - 4.0).abs() < 0.01);
+        assert!((at_100.top - 4.0).abs() < 0.01);
+        assert!((at_100.right - 636.0).abs() < 0.01);
+        assert!((at_100.bottom - 359.5).abs() < 0.01);
 
         let at_200 = image_destination_rect(
             &preview,
@@ -1745,9 +2023,9 @@ mod tests {
         )
         .expect("the image should fit at 200 percent");
         assert!((at_200.left - 80.0).abs() < 0.01);
-        assert!((at_200.top - 118.0).abs() < 0.01);
+        assert!((at_200.top - 4.0).abs() < 0.01);
         assert!((at_200.right - 560.0).abs() < 0.01);
-        assert!((at_200.bottom - 388.0).abs() < 0.01);
+        assert!((at_200.bottom - 274.0).abs() < 0.01);
     }
 
     #[test]

@@ -119,11 +119,13 @@ impl DecodedImage {
 
         Ok(ImagePreview {
             file_size: file.file_size(),
+            last_write_time: file.last_write_time(),
             linked_content: file.is_linked_content(),
             first_frame_only: matches!(
                 metadata.format,
                 ImageFormat::Png | ImageFormat::Gif | ImageFormat::WebP
             ),
+            display_name: file.display_name(),
             format: metadata.format,
             source_width,
             source_height,

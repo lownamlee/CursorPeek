@@ -13,7 +13,7 @@ use crate::{
 };
 
 const MAGIC: [u8; 4] = *b"CPWK";
-const VERSION: u16 = 3;
+const VERSION: u16 = 4;
 const HEADER_LEN: usize = 24;
 const NONCE_LEN: usize = 16;
 const MAX_LEGACY_ENCODING_WIRE_LEN: usize = 40;

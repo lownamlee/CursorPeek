@@ -1,7 +1,7 @@
 use std::{error::Error, fmt};
 
 pub const MAX_PREVIEW_PAYLOAD_LEN: usize = 4 * 1024 * 1024;
-pub const IMAGE_FIXED_LEN: usize = 40;
+pub const IMAGE_FIXED_LEN: usize = 52;
 pub const BGRA_BYTES_PER_PIXEL: usize = 4;
 pub const MAX_SOURCE_IMAGE_AXIS: u32 = 20_000;
 pub const MAX_SOURCE_IMAGE_PIXELS: u64 = 40_000_000;
@@ -9,12 +9,26 @@ pub const MAX_PREVIEW_IMAGE_WIDTH: u32 = 960;
 pub const MAX_PREVIEW_IMAGE_HEIGHT: u32 = 720;
 
 pub fn fitted_preview_dimensions(source_width: u32, source_height: u32) -> Option<(u32, u32)> {
-    if source_width == 0 || source_height == 0 {
+    fit_dimensions(
+        source_width,
+        source_height,
+        MAX_PREVIEW_IMAGE_WIDTH,
+        MAX_PREVIEW_IMAGE_HEIGHT,
+    )
+}
+
+pub fn fit_dimensions(
+    source_width: u32,
+    source_height: u32,
+    max_width: u32,
+    max_height: u32,
+) -> Option<(u32, u32)> {
+    if source_width == 0 || source_height == 0 || max_width == 0 || max_height == 0 {
         return None;
     }
 
-    let width_bound = source_width.min(MAX_PREVIEW_IMAGE_WIDTH);
-    let height_bound = source_height.min(MAX_PREVIEW_IMAGE_HEIGHT);
+    let width_bound = source_width.min(max_width);
+    let height_bound = source_height.min(max_height);
     let round_ratio = |numerator: u32, factor: u32, denominator: u32| {
         u64::from(numerator)
             .checked_mul(u64::from(factor))
@@ -92,7 +106,7 @@ impl Error for LayoutError {}
 mod tests {
     use super::{
         BGRA_BYTES_PER_PIXEL, LayoutError, MAX_PREVIEW_IMAGE_HEIGHT, MAX_PREVIEW_IMAGE_WIDTH,
-        checked_bgra_layout, fitted_preview_dimensions,
+        checked_bgra_layout, fit_dimensions, fitted_preview_dimensions,
     };
 
     #[test]
@@ -100,6 +114,14 @@ mod tests {
         assert_eq!(fitted_preview_dimensions(1_920, 1_080), Some((960, 540)));
         assert_eq!(fitted_preview_dimensions(100, 200), Some((100, 200)));
         assert_eq!(fitted_preview_dimensions(0, 1), None);
+    }
+
+    #[test]
+    fn arbitrary_fits_never_upscale_and_preserve_aspect_ratio() {
+        assert_eq!(fit_dimensions(480, 300, 632, 416), Some((480, 300)));
+        assert_eq!(fit_dimensions(1_920, 1_080, 632, 416), Some((632, 356)));
+        assert_eq!(fit_dimensions(1_080, 1_920, 632, 416), Some((234, 416)));
+        assert_eq!(fit_dimensions(1, 1, 0, 416), None);
     }
 
     #[test]

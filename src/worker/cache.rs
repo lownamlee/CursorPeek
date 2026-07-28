@@ -16,7 +16,7 @@ const MAX_CACHE_BYTES: usize = 8 * 1024 * 1024;
 // These versions make provider output semantics an explicit part of the key. Increment the
 // relevant value if a future long-lived worker can switch implementation rules in-process.
 const TEXT_PROVIDER_VERSION: u32 = 1;
-const IMAGE_PROVIDER_VERSION: u32 = 1;
+const IMAGE_PROVIDER_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PreviewProvider {
@@ -116,7 +116,10 @@ fn result_heap_bytes(result: &PreviewResult) -> Option<usize> {
             .encoding
             .capacity()
             .checked_add(preview.text.capacity()),
-        PreviewResult::Image(preview) => Some(preview.premultiplied_bgra.capacity()),
+        PreviewResult::Image(preview) => preview
+            .display_name
+            .capacity()
+            .checked_add(preview.premultiplied_bgra.capacity()),
     }
 }
 

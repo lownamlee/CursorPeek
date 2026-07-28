@@ -111,8 +111,8 @@ Matching is case-insensitive. Images and text are validated before previewing. S
 
 ## ⚙️ Settings
 
-Right-click the tray icon to pause previews or change the dwell delay, preview size, theme, and
-startup behavior. See [settings and configuration](docs/USER_GUIDE.md#tray-menu).
+Right-click the tray icon to pause previews or change the dwell delay, maximum preview size, theme,
+and startup behavior. See [settings and configuration](docs/USER_GUIDE.md#tray-menu).
 
 ## 🛡️ Privacy and security
 

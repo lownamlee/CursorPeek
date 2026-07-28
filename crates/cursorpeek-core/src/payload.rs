@@ -12,6 +12,7 @@ pub const MAX_TEXT_UTF8_LEN: usize = 128 * 1024;
 pub const MAX_TEXT_SCALARS: usize = 32_000;
 pub const MAX_TEXT_LINES: usize = 200;
 pub const MAX_ENCODING_LABEL_LEN: usize = 40;
+pub const MAX_DISPLAY_NAME_UTF8_LEN: usize = 1_024;
 
 const RESULT_STATUS: u32 = 0;
 const RESULT_TEXT: u32 = 1;
@@ -86,8 +87,10 @@ pub struct TextPreview {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ImagePreview {
     pub file_size: u64,
+    pub last_write_time: i64,
     pub linked_content: bool,
     pub first_frame_only: bool,
+    pub display_name: String,
     pub format: ImageFormat,
     pub source_width: u32,
     pub source_height: u32,
@@ -153,7 +156,8 @@ pub fn encode_result(result: &PreviewResult) -> Result<Vec<u8>, PayloadError> {
         PreviewResult::Image(preview) => {
             validate_image(preview)?;
             let payload_len = IMAGE_FIXED_LEN
-                .checked_add(preview.premultiplied_bgra.len())
+                .checked_add(preview.display_name.len())
+                .and_then(|length| length.checked_add(preview.premultiplied_bgra.len()))
                 .ok_or(PayloadError::LengthOverflow)?;
             ensure_payload_cap(payload_len)?;
             output.reserve(payload_len);
@@ -166,6 +170,7 @@ pub fn encode_result(result: &PreviewResult) -> Result<Vec<u8>, PayloadError> {
                 ]),
             );
             push_u64(&mut output, preview.file_size);
+            push_i64(&mut output, preview.last_write_time);
             push_u32(&mut output, preview.format as u32);
             push_u32(&mut output, preview.source_width);
             push_u32(&mut output, preview.source_height);
@@ -173,9 +178,15 @@ pub fn encode_result(result: &PreviewResult) -> Result<Vec<u8>, PayloadError> {
             push_u32(&mut output, preview.height);
             push_u32(
                 &mut output,
+                u32::try_from(preview.display_name.len())
+                    .expect("the display-name cap fits the wire length"),
+            );
+            push_u32(
+                &mut output,
                 u32::try_from(preview.premultiplied_bgra.len())
                     .expect("the image payload cap fits the wire length"),
             );
+            output.extend_from_slice(preview.display_name.as_bytes());
             output.extend_from_slice(&preview.premultiplied_bgra);
         }
     }
@@ -262,22 +273,34 @@ fn decode_image(bytes: &[u8]) -> Result<PreviewResult, PayloadError> {
 
     let raw_flags = read_u32(bytes, 4);
     reject_unknown_flags("image", raw_flags, IMAGE_FLAGS)?;
-    let pixel_len = read_u32(bytes, 36) as usize;
+    let display_name_len = read_u32(bytes, 44) as usize;
+    let pixel_len = read_u32(bytes, 48) as usize;
     let expected = IMAGE_FIXED_LEN
-        .checked_add(pixel_len)
+        .checked_add(display_name_len)
+        .and_then(|length| length.checked_add(pixel_len))
         .ok_or(PayloadError::LengthOverflow)?;
     require_exact_length("image", bytes.len(), expected)?;
+    if display_name_len > MAX_DISPLAY_NAME_UTF8_LEN {
+        return Err(PayloadError::DisplayNameTooLong {
+            actual: display_name_len,
+        });
+    }
 
+    let display_name_end = IMAGE_FIXED_LEN + display_name_len;
+    let display_name = std::str::from_utf8(&bytes[IMAGE_FIXED_LEN..display_name_end])
+        .map_err(|_| PayloadError::InvalidDisplayName)?;
     let preview = ImagePreview {
         file_size: read_u64(bytes, 8),
+        last_write_time: read_i64(bytes, 16),
         linked_content: raw_flags & FLAG_LINKED_CONTENT != 0,
         first_frame_only: raw_flags & FLAG_IMAGE_FIRST_FRAME_ONLY != 0,
-        format: ImageFormat::from_raw(read_u32(bytes, 16))?,
-        source_width: read_u32(bytes, 20),
-        source_height: read_u32(bytes, 24),
-        width: read_u32(bytes, 28),
-        height: read_u32(bytes, 32),
-        premultiplied_bgra: bytes[IMAGE_FIXED_LEN..].to_vec(),
+        display_name: display_name.to_owned(),
+        format: ImageFormat::from_raw(read_u32(bytes, 24))?,
+        source_width: read_u32(bytes, 28),
+        source_height: read_u32(bytes, 32),
+        width: read_u32(bytes, 36),
+        height: read_u32(bytes, 40),
+        premultiplied_bgra: bytes[display_name_end..].to_vec(),
     };
     validate_image(&preview)?;
     Ok(PreviewResult::Image(preview))
@@ -338,6 +361,7 @@ pub const fn is_unsafe_text_control(scalar: char) -> bool {
 }
 
 fn validate_image(preview: &ImagePreview) -> Result<(), PayloadError> {
+    validate_display_name(&preview.display_name)?;
     if preview.source_width == 0
         || preview.source_height == 0
         || preview.source_width > MAX_SOURCE_IMAGE_AXIS
@@ -405,9 +429,28 @@ fn validate_image(preview: &ImagePreview) -> Result<(), PayloadError> {
     }
     ensure_payload_cap(
         IMAGE_FIXED_LEN
-            .checked_add(expected)
+            .checked_add(preview.display_name.len())
+            .and_then(|length| length.checked_add(expected))
             .ok_or(PayloadError::LengthOverflow)?,
     )
+}
+
+fn validate_display_name(value: &str) -> Result<(), PayloadError> {
+    if value.len() > MAX_DISPLAY_NAME_UTF8_LEN {
+        return Err(PayloadError::DisplayNameTooLong {
+            actual: value.len(),
+        });
+    }
+    if value.is_empty() || value.chars().any(is_unsafe_display_name_scalar) {
+        return Err(PayloadError::InvalidDisplayName);
+    }
+    Ok(())
+}
+
+pub const fn is_unsafe_display_name_scalar(scalar: char) -> bool {
+    matches!(scalar, '/' | '\\')
+        || is_noncanonical_text_line_break(scalar)
+        || is_unsafe_text_control(scalar)
 }
 
 fn ensure_payload_cap(length: usize) -> Result<(), PayloadError> {
@@ -464,6 +507,10 @@ fn push_u64(output: &mut Vec<u8>, value: u64) {
     output.extend_from_slice(&value.to_le_bytes());
 }
 
+fn push_i64(output: &mut Vec<u8>, value: i64) {
+    output.extend_from_slice(&value.to_le_bytes());
+}
+
 fn read_u32(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(
         bytes[offset..offset + 4]
@@ -474,6 +521,14 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
 
 fn read_u64(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(
+        bytes[offset..offset + 8]
+            .try_into()
+            .expect("the variant length is checked before fixed metadata is read"),
+    )
+}
+
+fn read_i64(bytes: &[u8], offset: usize) -> i64 {
+    i64::from_le_bytes(
         bytes[offset..offset + 8]
             .try_into()
             .expect("the variant length is checked before fixed metadata is read"),
@@ -513,6 +568,10 @@ pub enum PayloadError {
     },
     UnsafeTextScalar(u32),
     InvalidTextUtf8,
+    DisplayNameTooLong {
+        actual: usize,
+    },
+    InvalidDisplayName,
     InvalidSourceDimensions {
         width: u32,
         height: u32,
@@ -597,6 +656,11 @@ impl fmt::Display for PayloadError {
                 )
             }
             Self::InvalidTextUtf8 => write!(formatter, "text preview is not valid UTF-8"),
+            Self::DisplayNameTooLong { actual } => write!(
+                formatter,
+                "display name length {actual} exceeds {MAX_DISPLAY_NAME_UTF8_LEN} UTF-8 bytes"
+            ),
+            Self::InvalidDisplayName => write!(formatter, "invalid preview display name"),
             Self::InvalidSourceDimensions { width, height } => write!(
                 formatter,
                 "invalid source image dimensions {width}x{height}"
@@ -646,9 +710,10 @@ impl Error for PayloadError {}
 mod tests {
     use super::{
         FLAG_IMAGE_FIRST_FRAME_ONLY, FLAG_TEXT_TRUNCATED, IMAGE_FIXED_LEN, ImageFormat,
-        ImagePreview, MAX_ENCODING_LABEL_LEN, MAX_PREVIEW_IMAGE_WIDTH, MAX_SOURCE_IMAGE_AXIS,
-        MAX_SOURCE_IMAGE_PIXELS, MAX_TEXT_LINES, MAX_TEXT_SCALARS, MAX_TEXT_UTF8_LEN, PayloadError,
-        PreviewResult, ResolverStatus, TEXT_FIXED_LEN, TextPreview, decode_result, encode_result,
+        ImagePreview, MAX_DISPLAY_NAME_UTF8_LEN, MAX_ENCODING_LABEL_LEN, MAX_PREVIEW_IMAGE_WIDTH,
+        MAX_SOURCE_IMAGE_AXIS, MAX_SOURCE_IMAGE_PIXELS, MAX_TEXT_LINES, MAX_TEXT_SCALARS,
+        MAX_TEXT_UTF8_LEN, PayloadError, PreviewResult, ResolverStatus, TEXT_FIXED_LEN,
+        TextPreview, decode_result, encode_result,
     };
 
     fn text_preview() -> TextPreview {
@@ -665,8 +730,10 @@ mod tests {
     fn image_preview() -> ImagePreview {
         ImagePreview {
             file_size: 45_678,
+            last_write_time: 133_000_000_000_000_000,
             linked_content: false,
             first_frame_only: true,
+            display_name: "sample.png".to_owned(),
             format: ImageFormat::Png,
             source_width: 3,
             source_height: 2,
@@ -766,6 +833,24 @@ mod tests {
     #[test]
     fn image_dimensions_and_exact_bgra_length_fail_closed() {
         let mut preview = image_preview();
+        preview.display_name = "x".repeat(MAX_DISPLAY_NAME_UTF8_LEN + 1);
+        assert_eq!(
+            encode_result(&PreviewResult::Image(preview)),
+            Err(PayloadError::DisplayNameTooLong {
+                actual: MAX_DISPLAY_NAME_UTF8_LEN + 1
+            })
+        );
+
+        for display_name in ["", "folder/name.png", "before\u{202e}after.png"] {
+            let mut preview = image_preview();
+            preview.display_name = display_name.to_owned();
+            assert_eq!(
+                encode_result(&PreviewResult::Image(preview)),
+                Err(PayloadError::InvalidDisplayName)
+            );
+        }
+
+        let mut preview = image_preview();
         preview.source_width = MAX_SOURCE_IMAGE_AXIS + 1;
         assert!(matches!(
             encode_result(&PreviewResult::Image(preview)),
@@ -863,15 +948,20 @@ mod tests {
         ));
 
         let mut image = encode_result(&PreviewResult::Image(image_preview())).unwrap();
-        image[36..40].copy_from_slice(&23_u32.to_le_bytes());
+        image[48..52].copy_from_slice(&23_u32.to_le_bytes());
+        let display_name_len = image_preview().display_name.len();
         assert_eq!(
             decode_result(&image),
             Err(PayloadError::PayloadLengthMismatch {
                 kind: "image",
-                expected: IMAGE_FIXED_LEN + 23,
-                actual: IMAGE_FIXED_LEN + 24
+                expected: IMAGE_FIXED_LEN + display_name_len + 23,
+                actual: IMAGE_FIXED_LEN + display_name_len + 24
             })
         );
+
+        let mut image = encode_result(&PreviewResult::Image(image_preview())).unwrap();
+        image[IMAGE_FIXED_LEN] = 0xff;
+        assert_eq!(decode_result(&image), Err(PayloadError::InvalidDisplayName));
     }
 
     #[test]

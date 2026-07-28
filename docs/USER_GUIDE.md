@@ -30,7 +30,7 @@ Right-click the CursorPeek icon:
   - Fast: 250 ms
   - Standard: 400 ms
   - Relaxed: 700 ms
-- **Settings > Preview size**
+- **Settings > Maximum preview size**
   - Compact: 480 x 360
   - Standard: 640 x 480
   - Large: 800 x 600
@@ -74,6 +74,8 @@ Current image limits:
 - displayed preview bitmap: at most 960 x 720 pixels.
 
 Images are never enlarged beyond their decoded size and are fitted without changing aspect ratio.
+The popup follows the displayed image size, up to the selected maximum, with file details beneath
+the image.
 
 ## Supported text
 
@@ -189,8 +191,8 @@ start_with_windows=false
 | Key | Accepted value |
 | --- | --- |
 | `dwell_delay_ms` | integer from 150 through 2000 |
-| `preview_width` | integer from 320 through 960 |
-| `preview_height` | integer from 240 through 720 |
+| `preview_width` | maximum preview client width, from 320 through 960 |
+| `preview_height` | maximum preview client height, from 240 through 720 |
 | `theme` | `system`, `light`, or `dark` |
 | `legacy_encoding` | `auto`, `system`, `off`, or a supported legacy label such as `windows-1252` or `shift_jis` |
 | `start_with_windows` | `true` or `false` |
