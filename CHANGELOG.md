@@ -4,6 +4,26 @@ This file records user-visible changes to CursorPeek. Release dates are added on
 
 ## Unreleased
 
+## [0.2.2] - 2026-07-29
+
+This patch shortens the preview wait and adds opt-in diagnostics for investigating Explorer performance.
+
+### Added
+
+- Add an optional diagnostic build with correlated timing across the coordinator and contained preview worker.
+- Include a PowerShell summary tool for hover-to-visible latency, lifecycle failures, and dropped diagnostic records.
+
+### Changed
+
+- Reduce the default dwell delay to 50 ms and use a 25 ms re-show delay after leaving a preview.
+- Offer 50 ms, 100 ms, and 250 ms dwell presets from the notification-area menu.
+- Optimize the release executable for runtime speed while retaining full link-time optimization.
+
+### Privacy
+
+- Keep diagnostic tracing disabled in normal release builds.
+- Bound diagnostic storage and exclude file contents, file names, complete paths, credentials, and environment values.
+
 ## [0.2.1] - 2026-07-29
 
 This patch keeps CursorPeek visible through two common Explorer hover conflicts.
@@ -72,6 +92,7 @@ This patch release restores the notification-area menu when CursorPeek is right-
 
 Version 0.1 is intentionally narrow. See [Known limitations](docs/KNOWN_LIMITATIONS.md) before installing or running this release.
 
+[0.2.2]: https://github.com/lownamlee/CursorPeek/releases/tag/v0.2.2
 [0.2.1]: https://github.com/lownamlee/CursorPeek/releases/tag/v0.2.1
 [0.2.0]: https://github.com/lownamlee/CursorPeek/releases/tag/v0.2.0
 [0.1.1]: https://github.com/lownamlee/CursorPeek/releases/tag/v0.1.1
