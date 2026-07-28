@@ -1,4 +1,7 @@
+use std::ffi::c_void;
+
 use crate::hover::PhysicalScreenPoint;
+use cursorpeek_core::ExplorerWindowId;
 
 use windows::{
     Win32::{
@@ -9,7 +12,7 @@ use windows::{
         },
         UI::WindowsAndMessaging::{
             GA_ROOT, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId,
-            WindowFromPhysicalPoint,
+            IsIconic, IsWindow, IsWindowVisible, WindowFromPhysicalPoint,
         },
     },
     core::{Owned, PWSTR},
@@ -21,8 +24,19 @@ const CABINET_WINDOW_CLASS: &[u8] = b"CabinetWClass";
 const EXPLORE_WINDOW_CLASS: &[u8] = b"ExploreWClass";
 const EXPLORER_IMAGE_NAME: &[u8] = b"explorer.exe";
 
-pub(super) fn is_explorer_window_at(point: PhysicalScreenPoint) -> bool {
-    is_explorer_window(window_at(point))
+pub(super) fn explorer_window_at(point: PhysicalScreenPoint) -> Option<ExplorerWindowId> {
+    explorer_window_id(root_window(window_at(point))?)
+}
+
+pub(super) fn point_belongs_to_explorer_window(
+    point: PhysicalScreenPoint,
+    expected: ExplorerWindowId,
+) -> bool {
+    root_window(window_at(point)).and_then(window_id) == Some(expected)
+}
+
+pub(super) fn explorer_window_is_available(expected: ExplorerWindowId) -> bool {
+    window_from_id(expected).is_some_and(explorer_root_is_available)
 }
 
 pub(super) fn is_foreground_explorer_window_at(point: PhysicalScreenPoint) -> bool {
@@ -37,43 +51,16 @@ pub(super) fn is_foreground_explorer_window_at(point: PhysicalScreenPoint) -> bo
         return false;
     };
 
-    point_root == foreground_root && is_explorer_root(point_root)
+    point_root == foreground_root && explorer_root_is_available(point_root)
 }
 
-pub(super) fn points_share_foreground_explorer(
-    first: PhysicalScreenPoint,
-    second: PhysicalScreenPoint,
-) -> bool {
-    let Some(first_root) = root_window(window_at(first)) else {
-        return false;
-    };
-    let Some(second_root) = root_window(window_at(second)) else {
-        return false;
-    };
-
-    // SAFETY: This has no pointer or ownership requirements. A null or changing foreground HWND
-    // fails the equality check and therefore cannot authorize a fast re-show transition.
-    let foreground = unsafe { GetForegroundWindow() };
-    let Some(foreground_root) = root_window(foreground) else {
-        return false;
-    };
-
-    first_root == second_root && first_root == foreground_root && is_explorer_root(first_root)
-}
-
+#[cfg(test)]
 pub(super) fn is_explorer_window(window: HWND) -> bool {
-    root_window(window).is_some_and(is_explorer_root)
+    root_window(window).is_some_and(explorer_root_is_available)
 }
 
-pub(super) fn belongs_to_explorer_window_at(window: HWND, point: PhysicalScreenPoint) -> bool {
-    let Some(event_root) = root_window(window) else {
-        return false;
-    };
-    let Some(point_root) = root_window(window_at(point)) else {
-        return false;
-    };
-
-    event_root == point_root && is_explorer_root(point_root)
+pub(super) fn belongs_to_explorer_window(window: HWND, expected: ExplorerWindowId) -> bool {
+    root_window(window).and_then(window_id) == Some(expected)
 }
 
 fn window_at(point: PhysicalScreenPoint) -> HWND {
@@ -96,6 +83,34 @@ fn root_window(window: HWND) -> Option<HWND> {
     // parent-chain lookup and returns another borrowed HWND or null on failure.
     let root = unsafe { GetAncestor(window, GA_ROOT) };
     (!root.0.is_null()).then_some(root)
+}
+
+fn explorer_window_id(root: HWND) -> Option<ExplorerWindowId> {
+    explorer_root_is_available(root)
+        .then(|| window_id(root))
+        .flatten()
+}
+
+fn window_id(window: HWND) -> Option<ExplorerWindowId> {
+    ExplorerWindowId::try_from_raw(window.0 as usize as u64)
+}
+
+fn window_from_id(id: ExplorerWindowId) -> Option<HWND> {
+    let raw = usize::try_from(id.get()).ok()?;
+    Some(HWND(raw as *mut c_void))
+}
+
+fn explorer_root_is_available(root: HWND) -> bool {
+    // SAFETY: `root` is a copied HWND value. Each query is synchronous and returns false for a
+    // destroyed or otherwise invalid window. A minimized or hidden Explorer cannot own a hover
+    // target at a physical screen point.
+    unsafe {
+        IsWindow(Some(root)).as_bool()
+            && IsWindowVisible(root).as_bool()
+            && !IsIconic(root).as_bool()
+            && root_window(root) == Some(root)
+            && is_explorer_root(root)
+    }
 }
 
 fn is_explorer_root(root: HWND) -> bool {

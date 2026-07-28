@@ -157,12 +157,14 @@ impl ExplorerResolver {
     fn select_active_view(
         &mut self,
         point: PhysicalScreenPoint,
+        explorer_window: Option<cursorpeek_core::ExplorerWindowId>,
         evidence: candidate::CandidateEvidence<'_>,
     ) -> Result<shell::ActiveFolderView, shell::ShellRejection> {
         let first = shell::select(
             &self.shell_windows,
             &mut self.active_folder_view,
             point,
+            explorer_window,
             evidence,
         );
         if !matches!(
@@ -179,6 +181,7 @@ impl ExplorerResolver {
             &self.shell_windows,
             &mut self.active_folder_view,
             point,
+            explorer_window,
             evidence,
         )
     }
@@ -426,7 +429,7 @@ impl ExplorerResolver {
 
     #[cfg(feature = "resolver-corpus")]
     pub(crate) fn observe(&mut self, point: PhysicalScreenPoint) -> CorpusObservation {
-        let outcome = self.resolve(point);
+        let outcome = self.resolve(point, None);
         let trace = self
             .last_trace
             .as_ref()
@@ -450,7 +453,11 @@ impl ExplorerResolver {
 }
 
 impl PointResolver for ExplorerResolver {
-    fn resolve(&mut self, point: PhysicalScreenPoint) -> ResolveOutcome {
+    fn resolve(
+        &mut self,
+        point: PhysicalScreenPoint,
+        explorer_window: Option<cursorpeek_core::ExplorerWindowId>,
+    ) -> ResolveOutcome {
         let PointInspection {
             trace: uia,
             item_element,
@@ -462,7 +469,7 @@ impl PointResolver for ExplorerResolver {
             ),
             ResolutionTrace::Candidate(candidate) => match candidate.shell_evidence() {
                 Ok(evidence) => {
-                    let active_view = self.select_active_view(point, evidence);
+                    let active_view = self.select_active_view(point, explorer_window, evidence);
                     let mut verification = match &active_view {
                         Ok(active_view) => shell::verify(active_view, point, evidence),
                         Err(reason) => shell::selection_failure(*reason),
@@ -688,8 +695,8 @@ fn shell_rejection_reason(reason: shell::ShellRejection) -> CorpusReason {
         ShellRejection::PointerWindowUnavailable => {
             CorpusReason::new("shell.pointer_window_unavailable")
         }
-        ShellRejection::PointerLeftForegroundExplorer => {
-            CorpusReason::new("shell.pointer_left_foreground_explorer")
+        ShellRejection::PointerLeftTargetExplorer => {
+            CorpusReason::new("shell.pointer_left_target_explorer")
         }
         ShellRejection::ShellWindowItemFailed { index, code } => CorpusReason::with_context(
             "shell.window_item_failed",
@@ -904,7 +911,7 @@ mod tests {
             let point = PhysicalScreenPoint::new(0, 0);
             let shell_collection = Interface::as_raw(&resolver.shell_windows);
             assert!(matches!(
-                resolver.resolve(point),
+                resolver.resolve(point, None),
                 ResolveOutcome::Unavailable
                     | ResolveOutcome::Unsupported
                     | ResolveOutcome::Ambiguous

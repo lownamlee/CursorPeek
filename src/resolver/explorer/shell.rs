@@ -19,8 +19,7 @@ use windows::{
                 SIGDN_NORMALDISPLAY, SVGIO_ALLVIEW, ShellWindows,
             },
             WindowsAndMessaging::{
-                GA_ROOT, GetAncestor, GetForegroundWindow, IsChild, IsIconic, IsWindowVisible,
-                WindowFromPoint,
+                GA_ROOT, GetAncestor, IsChild, IsIconic, IsWindowVisible, WindowFromPoint,
             },
         },
     },
@@ -28,7 +27,7 @@ use windows::{
 };
 
 use crate::{hover::PhysicalScreenPoint, resolver::ResolvedTarget};
-use cursorpeek_core::PhysicalScreenRect;
+use cursorpeek_core::{ExplorerWindowId, PhysicalScreenRect};
 
 use super::candidate::CandidateEvidence;
 
@@ -75,7 +74,7 @@ pub(super) enum ShellRejection {
     InvalidShellWindowCount(i32),
     ShellWindowLimitExceeded(i32),
     PointerWindowUnavailable,
-    PointerLeftForegroundExplorer,
+    PointerLeftTargetExplorer,
     ShellWindowItemFailed { index: i32, code: i32 },
     BrowserServiceProviderFailed { index: i32, code: i32 },
     TopLevelBrowserFailed { index: i32, code: i32 },
@@ -117,10 +116,11 @@ pub(super) fn select(
     shell_windows: &IShellWindows,
     cached: &mut Option<ActiveFolderView>,
     point: PhysicalScreenPoint,
+    explorer_window: Option<ExplorerWindowId>,
     evidence: CandidateEvidence<'_>,
 ) -> Result<ActiveFolderView, ShellRejection> {
     if let Some(existing) = cached.as_ref() {
-        match existing.try_reuse(shell_windows, point) {
+        match existing.try_reuse(shell_windows, point, explorer_window) {
             Ok(Some(active_view)) => {
                 *cached = Some(active_view.clone());
                 return Ok(active_view);
@@ -135,7 +135,7 @@ pub(super) fn select(
         }
     }
 
-    let active_view = active_folder_view(shell_windows, point, evidence)?;
+    let active_view = active_folder_view(shell_windows, point, explorer_window, evidence)?;
     *cached = Some(active_view.clone());
     Ok(active_view)
 }
@@ -217,9 +217,38 @@ fn rejected(outcome: ShellOutcome, reason: ShellRejection) -> ShellVerification 
     }
 }
 
+fn pointer_windows(
+    point: PhysicalScreenPoint,
+    explorer_window: Option<ExplorerWindowId>,
+) -> Result<(HWND, HWND), ShellRejection> {
+    // SAFETY: the point is a copied physical screen coordinate. The returned HWND values are
+    // borrowed scalar identities and are revalidated against the Shell browser before use.
+    unsafe {
+        let pointer_window = WindowFromPoint(POINT {
+            x: point.x,
+            y: point.y,
+        });
+        if pointer_window.0.is_null() {
+            return Err(ShellRejection::PointerWindowUnavailable);
+        }
+        let pointer_root = GetAncestor(pointer_window, GA_ROOT);
+        if pointer_root.0.is_null()
+            || !window_id_matches_expected(pointer_root.0 as usize as u64, explorer_window)
+        {
+            return Err(ShellRejection::PointerLeftTargetExplorer);
+        }
+        Ok((pointer_window, pointer_root))
+    }
+}
+
+fn window_id_matches_expected(actual: u64, expected: Option<ExplorerWindowId>) -> bool {
+    expected.is_none_or(|expected| actual == expected.get())
+}
+
 fn active_folder_view(
     shell_windows: &IShellWindows,
     point: PhysicalScreenPoint,
+    explorer_window: Option<ExplorerWindowId>,
     evidence: CandidateEvidence<'_>,
 ) -> Result<ActiveFolderView, ShellRejection> {
     // SAFETY: every method is called on an apartment-local interface. Window handles are copied
@@ -227,19 +256,7 @@ fn active_folder_view(
     unsafe {
         let count = shell_window_count(shell_windows)?;
 
-        let screen_point = POINT {
-            x: point.x,
-            y: point.y,
-        };
-        let pointer_window = WindowFromPoint(screen_point);
-        if pointer_window.0.is_null() {
-            return Err(ShellRejection::PointerWindowUnavailable);
-        }
-        let pointer_root = GetAncestor(pointer_window, GA_ROOT);
-        let foreground = GetForegroundWindow();
-        if pointer_root.0.is_null() || foreground != pointer_root {
-            return Err(ShellRejection::PointerLeftForegroundExplorer);
-        }
+        let (pointer_window, pointer_root) = pointer_windows(point, explorer_window)?;
 
         let mut candidates = Vec::new();
         for index in 0..count {
@@ -387,24 +404,15 @@ impl ActiveFolderView {
         &self,
         shell_windows: &IShellWindows,
         point: PhysicalScreenPoint,
+        explorer_window: Option<ExplorerWindowId>,
     ) -> Result<Option<Self>, ShellRejection> {
         // SAFETY: the cached interfaces remain on their owning MTA. A cache hit is allowed only
-        // while the point still belongs to the same visible foreground browser, exactly one Shell
+        // while the point still belongs to the same visible target browser, exactly one Shell
         // window is registered, and QueryActiveShellView returns the same controlling-IUnknown
         // identity. Multiple registrations may be same-frame tabs, so they always force full
         // evidence correlation instead of taking the cache.
         unsafe {
-            let pointer_window = WindowFromPoint(POINT {
-                x: point.x,
-                y: point.y,
-            });
-            if pointer_window.0.is_null() {
-                return Err(ShellRejection::PointerWindowUnavailable);
-            }
-            let pointer_root = GetAncestor(pointer_window, GA_ROOT);
-            if pointer_root.0.is_null() || GetForegroundWindow() != pointer_root {
-                return Err(ShellRejection::PointerLeftForegroundExplorer);
-            }
+            let (pointer_window, pointer_root) = pointer_windows(point, explorer_window)?;
             if pointer_root != self.browser_window
                 || !IsWindowVisible(self.browser_window).as_bool()
                 || IsIconic(self.browser_window).as_bool()
@@ -458,17 +466,14 @@ impl ActiveFolderView {
                 return Err(ShellRejection::PointerWindowUnavailable);
             }
             let pointer_root = GetAncestor(pointer_window, GA_ROOT);
-            if pointer_root.0.is_null()
-                || pointer_root != self.browser_window
-                || GetForegroundWindow() != pointer_root
-            {
-                return Err(ShellRejection::PointerLeftForegroundExplorer);
+            if pointer_root.0.is_null() || pointer_root != self.browser_window {
+                return Err(ShellRejection::PointerLeftTargetExplorer);
             }
             if pointer_window != self.pointer_window
                 && !IsChild(self.pointer_window, pointer_window).as_bool()
                 && !IsChild(pointer_window, self.pointer_window).as_bool()
             {
-                return Err(ShellRejection::PointerLeftForegroundExplorer);
+                return Err(ShellRejection::PointerLeftTargetExplorer);
             }
 
             if item_native_window != 0 {
@@ -777,7 +782,9 @@ impl Drop for OwnedShellPath {
 mod tests {
     use super::{
         ViewMatchSelection, classify_view_matches, display_name_matches, is_supported_local_path,
+        window_id_matches_expected,
     };
+    use cursorpeek_core::ExplorerWindowId;
 
     #[test]
     fn local_path_policy_accepts_only_drive_absolute_values() {
@@ -820,5 +827,14 @@ mod tests {
         assert!(display_name_matches(None, &different));
         assert!(display_name_matches(Some(&expected), &expected));
         assert!(!display_name_matches(Some(&expected), &different));
+    }
+
+    #[test]
+    fn requested_explorer_identity_must_match_the_window_under_the_pointer() {
+        let expected = ExplorerWindowId::try_from_raw(0x1234).unwrap();
+
+        assert!(window_id_matches_expected(0x1234, Some(expected)));
+        assert!(!window_id_matches_expected(0x5678, Some(expected)));
+        assert!(window_id_matches_expected(0x5678, None));
     }
 }

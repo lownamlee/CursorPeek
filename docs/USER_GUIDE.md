@@ -15,7 +15,8 @@ Open File Explorer and keep the pointer within a supported file item for the con
 (250 ms by default). The pointer may move inside that item before or after the preview appears.
 Moving directly to another file uses a brief re-show delay while the complete Explorer and file
 checks run again. Leaving Explorer, scrolling, clicking, pressing Escape, changing the active view,
-or switching applications dismisses the preview.
+or covering the hovered item dismisses the preview. Activating another application by itself does
+not prevent a preview while the pointer remains over an unobscured Explorer item.
 
 CursorPeek allows one normal instance in the current interactive session. Starting it again asks
 the existing instance to show its tray menu.
@@ -122,8 +123,8 @@ other people can see the display.
 
 ## Files that intentionally do not preview
 
-CursorPeek requires one unambiguous local filesystem file from the active Explorer view. It does
-not preview:
+CursorPeek requires one unambiguous local filesystem file from the visible view in the Explorer
+window under the pointer. It does not preview:
 
 - folders or multiple/ambiguous candidates;
 - UNC and network paths;
@@ -280,9 +281,10 @@ for normal use.
 
 ### The preview disappears immediately
 
-Leaving the hovered item, wheel input, clicks, Escape, foreground/selection changes, display
-changes, and Explorer lifecycle events dismiss it by design. Ordinary pointer motion inside the
-same item preserves the dwell deadline and the visible preview.
+Leaving or covering the hovered item, wheel input, clicks, Escape, selection/view changes, display
+changes, and Explorer lifecycle events dismiss it by design. Switching foreground applications
+alone does not. Ordinary pointer motion inside the same item preserves the dwell deadline and the
+visible preview.
 
 ### OneDrive or another cloud file does not preview
 

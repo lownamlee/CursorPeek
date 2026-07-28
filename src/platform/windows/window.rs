@@ -10,8 +10,8 @@ use std::{
 };
 
 use super::explorer::{
-    belongs_to_explorer_window_at, is_explorer_window_at, is_foreground_explorer_window_at,
-    points_share_foreground_explorer,
+    belongs_to_explorer_window, explorer_window_at, explorer_window_is_available,
+    is_foreground_explorer_window_at, point_belongs_to_explorer_window,
 };
 #[cfg(test)]
 use super::input::registered_raw_devices;
@@ -29,7 +29,7 @@ use crate::worker::{
     CompletionNotifier, PendingWorkerPoll, PendingWorkerResolution, PreviewResult, ResolverStatus,
     WorkerManager, WorkerManagerError,
 };
-use cursorpeek_core::PhysicalScreenRect;
+use cursorpeek_core::{ExplorerWindowId, PhysicalScreenRect};
 
 use super::{PreviewWindow, StartupRegistration, TrayCommand, TrayIcon, TrayMenuState, TrayStatus};
 
@@ -71,6 +71,7 @@ pub(super) const ACTIVATE_MESSAGE: u32 = WM_APP + 4;
 const PREVIEW_CONTEXT_INVALIDATED_MESSAGE: u32 = WM_APP + 6;
 const SYSTEM_LIFECYCLE_CHANGED_MESSAGE: u32 = WM_APP + 7;
 const TRAY_EVENT_MESSAGE: u32 = WM_APP + 8;
+const PREVIEW_CONTEXT_REVALIDATE_MESSAGE: u32 = WM_APP + 9;
 const DWELL_TIMER_ID: usize = 1;
 const INPUT_SAMPLE_TIMER_ID: usize = 2;
 const INPUT_DIAGNOSTIC_DEADLINE_TIMER_ID: usize = 3;
@@ -132,6 +133,7 @@ pub(crate) struct MessageWindow {
     dwell_timer: Option<WindowTimer>,
     preview_guard_timer: WindowTimer,
     hover_state: HoverState,
+    tracked_explorer_window: Option<ExplorerWindowId>,
     preview_size: PreviewSize,
     input_diagnostics: Option<InputDiagnostics>,
     preview_diagnostics: Option<ActivePreviewDiagnostics>,
@@ -146,7 +148,7 @@ pub(crate) struct MessageWindow {
     worker_recovering: bool,
     worker_manager: Option<WorkerManager>,
     pending_worker_resolution: Option<PendingWorkerResolution>,
-    pending_worker_anchor: Option<(Generation, PhysicalScreenPoint)>,
+    pending_worker_anchor: Option<(Generation, PhysicalScreenPoint, ExplorerWindowId)>,
     latest_worker_completion: Option<Generation>,
     active_preview: Option<ActivePreview>,
     preview_event_hooks: Option<PreviewEventHooks>,
@@ -206,6 +208,7 @@ impl MessageWindow {
             dwell_timer: Some(WindowTimer::new(hwnd, DWELL_TIMER_ID)),
             preview_guard_timer: WindowTimer::new(hwnd, PREVIEW_GUARD_TIMER_ID),
             hover_state: HoverState::new(dwell_delay),
+            tracked_explorer_window: None,
             preview_size,
             input_diagnostics: None,
             preview_diagnostics: None,
@@ -487,6 +490,12 @@ impl MessageWindow {
                 continue;
             }
 
+            if message.hwnd == self.hwnd && message.message == PREVIEW_CONTEXT_REVALIDATE_MESSAGE {
+                self.handle_preview_context_revalidation(message.wParam.0);
+                self.record_ui_task(ui_task_started.elapsed());
+                continue;
+            }
+
             let raw_input = if message.hwnd == self.hwnd && message.message == WM_INPUT {
                 Some(read_raw_input_activity(message.lParam))
             } else {
@@ -571,18 +580,21 @@ impl MessageWindow {
                     Ok(point) => {
                         let point = PhysicalScreenPoint::new(point.x, point.y);
                         let now = Instant::now();
-                        let shares_foreground_explorer =
-                            self.active_preview.is_some_and(|active| {
-                                points_share_foreground_explorer(active.anchor, point)
-                            });
+                        let active_preview = self.active_preview;
+                        let shares_target_explorer = active_preview.is_some_and(|active| {
+                            point_belongs_to_explorer_window(point, active.explorer_window)
+                        });
                         match classify_preview_pointer_motion(
-                            self.active_preview,
+                            active_preview,
                             point,
-                            shares_foreground_explorer,
+                            shares_target_explorer,
                         ) {
                             PreviewPointerMotion::Preserve => {}
                             PreviewPointerMotion::Reshow => {
-                                self.restart_dwell_after_preview(point, now);
+                                let explorer_window = active_preview
+                                    .expect("a re-show requires an active preview")
+                                    .explorer_window;
+                                self.restart_dwell_after_preview(point, explorer_window, now);
                             }
                             PreviewPointerMotion::Restart => {
                                 self.track_or_restart_dwell(point, now);
@@ -659,28 +671,47 @@ impl MessageWindow {
     }
 
     fn restart_dwell(&mut self, point: PhysicalScreenPoint, now: Instant) {
+        let Some(explorer_window) = explorer_window_at(point) else {
+            self.cancel_dwell();
+            return;
+        };
+        self.restart_dwell_in_explorer(point, explorer_window, now);
+    }
+
+    fn restart_dwell_in_explorer(
+        &mut self,
+        point: PhysicalScreenPoint,
+        explorer_window: ExplorerWindowId,
+        now: Instant,
+    ) {
+        self.tracked_explorer_window = Some(explorer_window);
         let interval = self.hover_state.restart(point, now);
         self.arm_dwell(interval);
     }
 
     fn track_or_restart_dwell(&mut self, point: PhysicalScreenPoint, now: Instant) {
-        match self.hover_state.tracking_anchor() {
-            Some(anchor) if points_share_foreground_explorer(anchor, point) => {
-                let tracked = self.hover_state.track_motion(point);
-                debug_assert!(tracked, "a retained anchor belongs to tracked hover state");
-            }
-            Some(_) if is_foreground_explorer_window_at(point) => {
-                self.restart_dwell(point, now);
-            }
-            Some(_) => self.cancel_dwell(),
-            None if is_foreground_explorer_window_at(point) => {
-                self.restart_dwell(point, now);
-            }
+        if self.hover_state.tracking_anchor().is_some()
+            && let Some(tracked) = self.tracked_explorer_window
+            && point_belongs_to_explorer_window(point, tracked)
+        {
+            let tracked = self.hover_state.track_motion(point);
+            debug_assert!(tracked, "a retained anchor belongs to tracked hover state");
+            return;
+        }
+
+        match explorer_window_at(point) {
+            Some(current) => self.restart_dwell_in_explorer(point, current, now),
             None => self.cancel_dwell(),
         }
     }
 
-    fn restart_dwell_after_preview(&mut self, point: PhysicalScreenPoint, now: Instant) {
+    fn restart_dwell_after_preview(
+        &mut self,
+        point: PhysicalScreenPoint,
+        explorer_window: ExplorerWindowId,
+        now: Instant,
+    ) {
+        self.tracked_explorer_window = Some(explorer_window);
         let interval = self.hover_state.restart_after_preview(point, now);
         self.arm_dwell(interval);
     }
@@ -700,6 +731,7 @@ impl MessageWindow {
     fn cancel_dwell(&mut self) {
         self.invalidate_worker_delivery();
         self.hover_state.cancel();
+        self.tracked_explorer_window = None;
         if let Some(timer) = self.dwell_timer.as_mut() {
             let _ = timer.stop();
         }
@@ -729,6 +761,10 @@ impl MessageWindow {
                 }
             }
             DwellTimerEvent::Candidate(candidate) => {
+                let Some(explorer_window) = self.tracked_explorer_window else {
+                    self.cancel_dwell();
+                    return;
+                };
                 let Some(current) = self.refresh_tracked_pointer() else {
                     self.cancel_dwell();
                     return;
@@ -737,7 +773,8 @@ impl MessageWindow {
                 // Keep the validated generation attached through the manager, protocol, and UI
                 // delivery boundaries so later input can invalidate this exact request.
                 let (generation, anchor, point, pointer_span) = candidate.into_parts();
-                if !points_share_foreground_explorer(anchor, point) || !is_explorer_window_at(point)
+                if !point_belongs_to_explorer_window(anchor, explorer_window)
+                    || !point_belongs_to_explorer_window(point, explorer_window)
                 {
                     self.cancel_dwell();
                     return;
@@ -752,18 +789,23 @@ impl MessageWindow {
                     .as_ref()
                     .expect("a successful recovery check retains the worker manager");
                 let notifier = worker_result_notifier(self.hwnd);
-                let pending =
-                    match manager.submit_with_notifier(generation, point, pointer_span, notifier) {
-                        Ok(pending) => pending,
-                        Err(_) => {
-                            self.hover_state.finish_resolution(generation);
-                            self.set_worker_recovering(true);
-                            return;
-                        }
-                    };
+                let pending = match manager.submit_with_notifier(
+                    generation,
+                    point,
+                    explorer_window,
+                    pointer_span,
+                    notifier,
+                ) {
+                    Ok(pending) => pending,
+                    Err(_) => {
+                        self.hover_state.finish_resolution(generation);
+                        self.set_worker_recovering(true);
+                        return;
+                    }
+                };
 
                 self.pending_worker_resolution = Some(pending);
-                self.pending_worker_anchor = Some((generation, point));
+                self.pending_worker_anchor = Some((generation, point, explorer_window));
             }
         }
     }
@@ -787,7 +829,7 @@ impl MessageWindow {
                         );
                         self.latest_worker_completion = generation;
 
-                        if let (Some(generation), Some((anchor_generation, point))) =
+                        if let (Some(generation), Some((anchor_generation, point, explorer_window))) =
                             (generation, anchor)
                             && generation == anchor_generation
                         {
@@ -801,7 +843,12 @@ impl MessageWindow {
                                     .hover_state
                                     .tracked_span_fits(generation, target_bounds)
                             {
-                                self.show_worker_result(point, target_bounds, result);
+                                self.show_worker_result(
+                                    point,
+                                    explorer_window,
+                                    target_bounds,
+                                    result,
+                                );
                             } else if target_bounds.is_some() {
                                 self.restart_after_pointer_span_rejection(current);
                             } else {
@@ -827,20 +874,19 @@ impl MessageWindow {
     }
 
     fn refresh_tracked_pointer(&mut self) -> Option<PhysicalScreenPoint> {
-        let anchor = self.hover_state.tracking_anchor()?;
+        self.hover_state.tracking_anchor()?;
+        let explorer_window = self.tracked_explorer_window?;
         let point = physical_cursor_position()
             .ok()
             .map(|point| PhysicalScreenPoint::new(point.x, point.y))?;
-        if !points_share_foreground_explorer(anchor, point) {
+        if !point_belongs_to_explorer_window(point, explorer_window) {
             return None;
         }
         self.hover_state.track_motion(point).then_some(point)
     }
 
     fn restart_after_pointer_span_rejection(&mut self, current: Option<PhysicalScreenPoint>) {
-        if let Some(point) = current
-            && is_foreground_explorer_window_at(point)
-        {
+        if let Some(point) = current {
             self.restart_dwell(point, Instant::now());
         } else {
             self.cancel_dwell();
@@ -879,6 +925,7 @@ impl MessageWindow {
     fn show_worker_result(
         &mut self,
         anchor: PhysicalScreenPoint,
+        explorer_window: ExplorerWindowId,
         target_bounds: PhysicalScreenRect,
         result: PreviewResult,
     ) {
@@ -886,7 +933,10 @@ impl MessageWindow {
             self.hide_product_preview();
             return;
         }
-        if !target_bounds.contains(anchor) {
+        if !target_bounds.contains(anchor)
+            || !point_belongs_to_explorer_window(anchor, explorer_window)
+            || !explorer_window_is_available(explorer_window)
+        {
             self.hide_product_preview();
             return;
         }
@@ -926,7 +976,7 @@ impl MessageWindow {
                 self.hover_state.preview_shown();
                 let active = ActivePreview {
                     generation,
-                    anchor,
+                    explorer_window,
                     target_bounds,
                 };
                 self.active_preview = Some(active);
@@ -957,11 +1007,11 @@ impl MessageWindow {
         let current = physical_cursor_position()
             .ok()
             .map(|point| PhysicalScreenPoint::new(point.x, point.y));
-        if !preview_context_is_current(
-            active.target_bounds,
-            current,
-            is_foreground_explorer_window_at(active.anchor),
-        ) {
+        let target_explorer_is_current = explorer_window_is_available(active.explorer_window)
+            && current.is_some_and(|point| {
+                point_belongs_to_explorer_window(point, active.explorer_window)
+            });
+        if !preview_context_is_current(active.target_bounds, current, target_explorer_is_current) {
             self.cancel_dwell();
         }
     }
@@ -969,6 +1019,12 @@ impl MessageWindow {
     fn handle_preview_context_invalidation(&mut self, generation: usize) {
         if preview_context_generation_matches(self.active_preview, generation) {
             self.cancel_dwell();
+        }
+    }
+
+    fn handle_preview_context_revalidation(&mut self, generation: usize) {
+        if preview_context_generation_matches(self.active_preview, generation) {
+            self.guard_product_preview();
         }
     }
 
@@ -1311,9 +1367,9 @@ fn accept_worker_completion(
 fn preview_context_is_current(
     target_bounds: PhysicalScreenRect,
     current: Option<PhysicalScreenPoint>,
-    foreground_explorer: bool,
+    target_explorer_is_current: bool,
 ) -> bool {
-    current.is_some_and(|point| target_bounds.contains(point)) && foreground_explorer
+    current.is_some_and(|point| target_bounds.contains(point)) && target_explorer_is_current
 }
 
 fn pointer_motion_stays_on_active_target(
@@ -1334,10 +1390,10 @@ enum PreviewPointerMotion {
 fn classify_preview_pointer_motion(
     active: Option<ActivePreview>,
     current: PhysicalScreenPoint,
-    shares_foreground_explorer: bool,
+    shares_target_explorer: bool,
 ) -> PreviewPointerMotion {
     match active {
-        Some(_) if !shares_foreground_explorer => PreviewPointerMotion::Cancel,
+        Some(_) if !shares_target_explorer => PreviewPointerMotion::Cancel,
         Some(_) if pointer_motion_stays_on_active_target(active, current) => {
             PreviewPointerMotion::Preserve
         }
@@ -1358,10 +1414,20 @@ fn preview_input_requires_dismissal(raw_input: &Result<Option<RawInputActivity>>
     }
 }
 
+fn preview_event_message(event: u32, belongs_to_target_explorer: bool) -> Option<u32> {
+    if event == EVENT_SYSTEM_FOREGROUND {
+        Some(PREVIEW_CONTEXT_REVALIDATE_MESSAGE)
+    } else if belongs_to_target_explorer {
+        Some(PREVIEW_CONTEXT_INVALIDATED_MESSAGE)
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ActivePreview {
     generation: Generation,
-    anchor: PhysicalScreenPoint,
+    explorer_window: ExplorerWindowId,
     target_bounds: PhysicalScreenRect,
 }
 
@@ -1456,22 +1522,23 @@ unsafe extern "system" fn preview_event_callback(
             let Some(target) = target.get() else {
                 return;
             };
-            if event != EVENT_SYSTEM_FOREGROUND
-                && !belongs_to_explorer_window_at(event_window, target.active.anchor)
-            {
+            let Some(message) = preview_event_message(
+                event,
+                belongs_to_explorer_window(event_window, target.active.explorer_window),
+            ) else {
                 return;
-            }
+            };
             let Ok(generation) = usize::try_from(target.active.generation.get()) else {
                 return;
             };
 
             // SAFETY: The target is the live hidden coordinator HWND owned by the registering
-            // thread. The private message carries only a generation scalar, never a callback
-            // pointer or borrowed event data.
+            // thread. The private message carries only a generation scalar. Foreground changes
+            // request a fresh point/root check; target Explorer object changes fail closed.
             unsafe {
                 let _ = PostMessageW(
                     Some(target.message_window),
-                    PREVIEW_CONTEXT_INVALIDATED_MESSAGE,
+                    message,
                     WPARAM(generation),
                     LPARAM(0),
                 );
@@ -1747,7 +1814,7 @@ fn dispatch_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) ->
 
     // SAFETY: These are the untouched parameters supplied by Windows to this window procedure.
     // Every WM_INPUT reaches this default procedure because the owning loop copies it before
-    // dispatch and applies safe state only after required foreground cleanup.
+    // dispatch and applies safe state only after required input cleanup.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
 
@@ -1779,13 +1846,15 @@ fn system_lifecycle_change_for_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivePreview, CLASS_NAME, DWELL_TIMER_ID, IsWindow, LPARAM, MessageWindow,
+        ActivePreview, CLASS_NAME, DWELL_TIMER_ID, EVENT_OBJECT_LOCATIONCHANGE,
+        EVENT_SYSTEM_FOREGROUND, IsWindow, LPARAM, MessageWindow,
+        PREVIEW_CONTEXT_INVALIDATED_MESSAGE, PREVIEW_CONTEXT_REVALIDATE_MESSAGE,
         PREVIEW_WINDOW_DIAGNOSTIC_DURATION, PREVIEW_WINDOW_PRACTICE_DURATION, PreviewPointerMotion,
         SYSTEM_LIFECYCLE_CHANGED_MESSAGE, SystemLifecycleChange, TASKBAR_CREATED_MESSAGE,
         TEST_PANIC_MESSAGE, TRAY_CALLBACK_MESSAGE, TRAY_EVENT_MESSAGE, WPARAM,
         accept_worker_completion, classify_preview_pointer_motion,
         pointer_motion_stays_on_active_target, post_worker_result,
-        preview_context_generation_matches, preview_context_is_current,
+        preview_context_generation_matches, preview_context_is_current, preview_event_message,
         preview_input_requires_dismissal, registered_raw_devices, timer_interval_ms, tray_status,
     };
     use crate::hover::{Generation, PhysicalScreenPoint};
@@ -1793,7 +1862,7 @@ mod tests {
     use crate::platform::windows::explorer::is_explorer_window;
     use crate::platform::windows::input::{RawInputActivity, RawMouseActivity};
     use crate::worker::WorkerManager;
-    use cursorpeek_core::PhysicalScreenRect;
+    use cursorpeek_core::{ExplorerWindowId, PhysicalScreenRect};
     use std::{
         sync::atomic::Ordering,
         thread,
@@ -2014,7 +2083,11 @@ mod tests {
             };
             assert!(!found.as_bool());
 
-            first.restart_dwell(PhysicalScreenPoint::new(-10, 20), Instant::now());
+            first.restart_dwell_in_explorer(
+                PhysicalScreenPoint::new(-10, 20),
+                ExplorerWindowId::try_from_raw(1).unwrap(),
+                Instant::now(),
+            );
             assert!(first.dwell_timer_is_armed());
             first
                 .handle_system_lifecycle_change(SystemLifecycleChange::DisplayConfiguration)
@@ -2031,7 +2104,11 @@ mod tests {
                 .handle_system_lifecycle_change(SystemLifecycleChange::Resume)
                 .expect("resume invalidation without a worker should be infallible");
             assert!(!first.power_suspended);
-            first.restart_dwell(PhysicalScreenPoint::new(-10, 20), Instant::now());
+            first.restart_dwell_in_explorer(
+                PhysicalScreenPoint::new(-10, 20),
+                ExplorerWindowId::try_from_raw(1).unwrap(),
+                Instant::now(),
+            );
             first.handle_dwell_timer(Instant::now());
             assert!(
                 first.dwell_timer_is_armed(),
@@ -2169,7 +2246,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_guard_accepts_the_complete_target_rectangle_only_while_explorer_is_foreground() {
+    fn preview_guard_accepts_the_complete_target_rectangle_only_in_the_target_explorer() {
         let anchor = PhysicalScreenPoint::new(-400, 250);
         let bounds = PhysicalScreenRect::try_new(-400, 250, -350, 300).unwrap();
         assert!(preview_context_is_current(bounds, Some(anchor), true));
@@ -2192,7 +2269,7 @@ mod tests {
         let bounds = PhysicalScreenRect::try_new(100, 200, 300, 400).unwrap();
         let active = Some(ActivePreview {
             generation: Generation::from_raw(24),
-            anchor: PhysicalScreenPoint::new(150, 250),
+            explorer_window: ExplorerWindowId::try_from_raw(1).unwrap(),
             target_bounds: bounds,
         });
 
@@ -2211,11 +2288,11 @@ mod tests {
     }
 
     #[test]
-    fn pointer_motion_restarts_quickly_only_between_items_in_the_same_foreground_explorer() {
+    fn pointer_motion_restarts_quickly_only_between_items_in_the_same_target_explorer() {
         let bounds = PhysicalScreenRect::try_new(100, 200, 300, 400).unwrap();
         let active = Some(ActivePreview {
             generation: Generation::from_raw(24),
-            anchor: PhysicalScreenPoint::new(150, 250),
+            explorer_window: ExplorerWindowId::try_from_raw(1).unwrap(),
             target_bounds: bounds,
         });
 
@@ -2242,13 +2319,29 @@ mod tests {
         let generation = Generation::from_raw(25);
         let active = Some(ActivePreview {
             generation,
-            anchor: PhysicalScreenPoint::new(300, 200),
+            explorer_window: ExplorerWindowId::try_from_raw(1).unwrap(),
             target_bounds: PhysicalScreenRect::try_new(250, 150, 350, 250).unwrap(),
         });
 
         assert!(!preview_context_generation_matches(active, 24));
         assert!(preview_context_generation_matches(active, 25));
         assert!(!preview_context_generation_matches(None, 25));
+    }
+
+    #[test]
+    fn foreground_changes_revalidate_while_target_object_changes_invalidate() {
+        assert_eq!(
+            preview_event_message(EVENT_SYSTEM_FOREGROUND, false),
+            Some(PREVIEW_CONTEXT_REVALIDATE_MESSAGE)
+        );
+        assert_eq!(
+            preview_event_message(EVENT_OBJECT_LOCATIONCHANGE, true),
+            Some(PREVIEW_CONTEXT_INVALIDATED_MESSAGE)
+        );
+        assert_eq!(
+            preview_event_message(EVENT_OBJECT_LOCATIONCHANGE, false),
+            None
+        );
     }
 
     fn assert_raw_input_registrations(target: windows::Win32::Foundation::HWND) {

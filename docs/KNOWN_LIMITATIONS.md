@@ -9,8 +9,9 @@ locality, format, or resource checks cannot be satisfied safely.
 - CursorPeek 0.1 supports x64 Windows 10 22H2 and Windows 11. There is no x86 or ARM64 package.
 - Previews work in Windows File Explorer. The desktop, file pickers, archive viewers, third-party
   file managers, browsers, and other list controls are outside the 0.1 scope.
-- CursorPeek requires one unambiguous local filesystem item from the active Explorer view. Folders,
-  virtual Shell items, and ambiguous or changing candidates do not preview.
+- CursorPeek requires one unambiguous local filesystem item from the visible view in the Explorer
+  window under the pointer. The window may be inactive, but the item must remain unobscured.
+  Folders, virtual Shell items, and ambiguous or changing candidates do not preview.
 - UNC paths, mapped or remote files, device paths, offline files, and cloud placeholders that still
   require recall or hydration are rejected. CursorPeek does not download content.
 

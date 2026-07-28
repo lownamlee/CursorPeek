@@ -25,7 +25,8 @@ use crate::{
     settings::LegacyEncoding,
 };
 use cursorpeek_core::{
-    PhysicalScreenRect, PhysicalScreenSpan, protocol::DEFAULT_PREVIEW_CACHE_ENTRIES,
+    ExplorerWindowId, PhysicalScreenRect, PhysicalScreenSpan,
+    protocol::DEFAULT_PREVIEW_CACHE_ENTRIES,
 };
 
 use super::{
@@ -251,6 +252,7 @@ impl WorkerManager {
         &self,
         generation: Generation,
         point: PhysicalScreenPoint,
+        explorer_window: ExplorerWindowId,
         pointer_span: PhysicalScreenSpan,
         notifier: CompletionNotifier,
     ) -> Result<PendingWorkerResolution, WorkerManagerError> {
@@ -258,6 +260,7 @@ impl WorkerManager {
             receiver: self.requests.submit_with_notifier(
                 generation,
                 point,
+                Some(explorer_window),
                 pointer_span,
                 notifier,
             )?,
@@ -384,6 +387,7 @@ pub(crate) enum PendingWorkerPoll {
 struct PendingRequest {
     generation: Generation,
     point: PhysicalScreenPoint,
+    explorer_window: Option<ExplorerWindowId>,
     pointer_span: PhysicalScreenSpan,
     response_sender: SyncSender<Result<WorkerResolution, WorkerManagerError>>,
     completion_notifier: Option<CompletionNotifier>,
@@ -463,6 +467,7 @@ impl LatestRequestMailbox {
         self.submit_request(
             generation,
             point,
+            None,
             PhysicalScreenSpan::from_point(point),
             None,
         )
@@ -472,16 +477,24 @@ impl LatestRequestMailbox {
         &self,
         generation: Generation,
         point: PhysicalScreenPoint,
+        explorer_window: Option<ExplorerWindowId>,
         pointer_span: PhysicalScreenSpan,
         notifier: CompletionNotifier,
     ) -> Result<Receiver<Result<WorkerResolution, WorkerManagerError>>, WorkerManagerError> {
-        self.submit_request(generation, point, pointer_span, Some(notifier))
+        self.submit_request(
+            generation,
+            point,
+            explorer_window,
+            pointer_span,
+            Some(notifier),
+        )
     }
 
     fn submit_request(
         &self,
         generation: Generation,
         point: PhysicalScreenPoint,
+        explorer_window: Option<ExplorerWindowId>,
         pointer_span: PhysicalScreenSpan,
         completion_notifier: Option<CompletionNotifier>,
     ) -> Result<Receiver<Result<WorkerResolution, WorkerManagerError>>, WorkerManagerError> {
@@ -498,6 +511,7 @@ impl LatestRequestMailbox {
             let replaced = state.pending.replace(PendingRequest {
                 generation,
                 point,
+                explorer_window,
                 pointer_span,
                 response_sender,
                 completion_notifier,
@@ -644,6 +658,7 @@ fn manager_loop(
             MailboxTake::Request(PendingRequest {
                 generation,
                 point,
+                explorer_window,
                 pointer_span,
                 response_sender,
                 completion_notifier,
@@ -667,7 +682,7 @@ fn manager_loop(
                 let result = session
                     .as_ref()
                     .expect("a session is created before request dispatch")
-                    .resolve(generation, point, pointer_span);
+                    .resolve(generation, point, explorer_window, pointer_span);
                 last_used = Instant::now();
 
                 match result {
@@ -853,6 +868,7 @@ impl WorkerSession {
         &self,
         generation: Generation,
         point: PhysicalScreenPoint,
+        explorer_window: Option<ExplorerWindowId>,
         pointer_span: PhysicalScreenSpan,
     ) -> Result<WorkerResponse, WorkerManagerError> {
         let (response_sender, response_receiver) = mpsc::sync_channel(1);
@@ -862,6 +878,7 @@ impl WorkerSession {
             .send(ProtocolCommand {
                 generation,
                 point,
+                explorer_window,
                 pointer_span,
                 response_sender,
             })
@@ -929,6 +946,7 @@ impl WorkerSession {
 struct ProtocolCommand {
     generation: Generation,
     point: PhysicalScreenPoint,
+    explorer_window: Option<ExplorerWindowId>,
     pointer_span: PhysicalScreenSpan,
     response_sender: SyncSender<Result<WorkerResponse, WorkerManagerError>>,
 }
@@ -973,6 +991,7 @@ fn protocol_loop(
                 WorkerMessage::ResolvePoint {
                     generation: command.generation,
                     point: command.point,
+                    explorer_window: command.explorer_window,
                     pointer_span: command.pointer_span,
                 },
             )?;
@@ -1326,7 +1345,7 @@ mod tests {
     use super::{
         CompletionNotifier, DEFAULT_WORKER_IDLE_LIFETIME, LatestRequestMailbox, MailboxTake,
         PendingWorkerPoll, PendingWorkerResolution, WorkerManager, WorkerManagerConfig,
-        WorkerManagerError, WorkerResolution, validate_ready, validate_result,
+        WorkerManagerError, WorkerResolution, complete_request, validate_ready, validate_result,
     };
     use crate::{
         hover::{Generation, PhysicalScreenPoint},
@@ -1335,7 +1354,7 @@ mod tests {
             protocol::{SessionNonce, WorkerMessage},
         },
     };
-    use cursorpeek_core::{PhysicalScreenRect, PhysicalScreenSpan};
+    use cursorpeek_core::{ExplorerWindowId, PhysicalScreenRect, PhysicalScreenSpan};
     use std::{
         sync::atomic::{AtomicUsize, Ordering},
         thread,
@@ -1506,6 +1525,44 @@ mod tests {
     }
 
     #[test]
+    fn notified_product_request_retains_its_explorer_identity() {
+        NOTIFICATION_COUNT.store(0, Ordering::SeqCst);
+        let mailbox = LatestRequestMailbox::new();
+        let explorer_window = ExplorerWindowId::try_from_raw(0x1234).unwrap();
+        let point = PhysicalScreenPoint::new(20, 30);
+        let pending = mailbox
+            .submit_with_notifier(
+                Generation::from_raw(3),
+                point,
+                Some(explorer_window),
+                PhysicalScreenSpan::from_point(point),
+                CompletionNotifier::new(1, record_notification),
+            )
+            .unwrap();
+
+        let request = match mailbox.take(Some(Duration::ZERO)).unwrap() {
+            MailboxTake::Request(request) => request,
+            MailboxTake::RecycleSession
+            | MailboxTake::Prewarm
+            | MailboxTake::TimedOut
+            | MailboxTake::Closed => panic!("the product request should be pending"),
+        };
+        assert_eq!(request.explorer_window, Some(explorer_window));
+        complete_request(
+            request,
+            Ok(WorkerResolution {
+                generation: Generation::from_raw(3),
+                session_id: 1,
+                target_bounds: None,
+                result: PreviewResult::Status(ResolverStatus::Unavailable),
+            }),
+        );
+
+        assert!(pending.recv().unwrap().is_ok());
+        assert_eq!(NOTIFICATION_COUNT.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn superseded_notified_request_wakes_its_consumer_once() {
         NOTIFICATION_COUNT.store(0, Ordering::SeqCst);
         let mailbox = LatestRequestMailbox::new();
@@ -1513,6 +1570,7 @@ mod tests {
             .submit_with_notifier(
                 Generation::from_raw(1),
                 PhysicalScreenPoint::new(1, 1),
+                None,
                 PhysicalScreenSpan::from_point(PhysicalScreenPoint::new(1, 1)),
                 CompletionNotifier::new(1, record_notification),
             )

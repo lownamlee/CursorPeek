@@ -61,17 +61,19 @@ where
     let mut cache = PreviewCache::with_entry_limit(cache_entries);
 
     loop {
-        let (generation, point, pointer_span) = match protocol::read_message(reader)? {
-            Some(WorkerMessage::ResolvePoint {
-                generation,
-                point,
-                pointer_span,
-            }) => (generation, point, pointer_span),
-            Some(_) => return Err(WorkerSessionError::ExpectedResolvePoint),
-            None => return Ok(()),
-        };
+        let (generation, point, explorer_window, pointer_span) =
+            match protocol::read_message(reader)? {
+                Some(WorkerMessage::ResolvePoint {
+                    generation,
+                    point,
+                    explorer_window,
+                    pointer_span,
+                }) => (generation, point, explorer_window, pointer_span),
+                Some(_) => return Err(WorkerSessionError::ExpectedResolvePoint),
+                None => return Ok(()),
+            };
         let (target_bounds, result) = resolver_result_with_cache(
-            resolver.resolve(point),
+            resolver.resolve(point, explorer_window),
             pointer_span,
             &legacy_encoding,
             &mut cache,
@@ -242,7 +244,7 @@ mod tests {
     use crate::settings::LegacyEncoding;
     use crate::worker::payload::{PreviewResult, ResolverStatus};
     use ::image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
-    use cursorpeek_core::{PhysicalScreenRect, PhysicalScreenSpan};
+    use cursorpeek_core::{ExplorerWindowId, PhysicalScreenRect, PhysicalScreenSpan};
     use protocol::{SessionNonce, WorkerMessage};
     use std::{
         env, fs,
@@ -267,9 +269,61 @@ mod tests {
     struct UnavailableResolver;
 
     impl PointResolver for UnavailableResolver {
-        fn resolve(&mut self, _point: PhysicalScreenPoint) -> ResolveOutcome {
+        fn resolve(
+            &mut self,
+            _point: PhysicalScreenPoint,
+            _explorer_window: Option<ExplorerWindowId>,
+        ) -> ResolveOutcome {
             ResolveOutcome::Unavailable
         }
+    }
+
+    #[derive(Default)]
+    struct RecordingResolver {
+        explorer_windows: Vec<Option<ExplorerWindowId>>,
+    }
+
+    impl PointResolver for RecordingResolver {
+        fn resolve(
+            &mut self,
+            _point: PhysicalScreenPoint,
+            explorer_window: Option<ExplorerWindowId>,
+        ) -> ResolveOutcome {
+            self.explorer_windows.push(explorer_window);
+            ResolveOutcome::Unavailable
+        }
+    }
+
+    #[test]
+    fn session_delivers_the_authenticated_explorer_identity_to_the_resolver() {
+        let explorer_window = ExplorerWindowId::try_from_raw(0x1234_5678).unwrap();
+        let point = PhysicalScreenPoint::new(400, 300);
+        let mut input = Vec::new();
+        protocol::write_message(
+            &mut input,
+            WorkerMessage::Hello {
+                nonce: NONCE,
+                cache_entries: protocol::DEFAULT_PREVIEW_CACHE_ENTRIES,
+                legacy_encoding: LegacyEncoding::Auto,
+            },
+        )
+        .unwrap();
+        protocol::write_message(
+            &mut input,
+            WorkerMessage::ResolvePoint {
+                generation: Generation::from_raw(1),
+                point,
+                explorer_window: Some(explorer_window),
+                pointer_span: PhysicalScreenSpan::from_point(point),
+            },
+        )
+        .unwrap();
+
+        let mut output = Vec::new();
+        let mut resolver = RecordingResolver::default();
+        run_session(&mut input.as_slice(), &mut output, &mut resolver).unwrap();
+
+        assert_eq!(resolver.explorer_windows, vec![Some(explorer_window)]);
     }
 
     #[test]
@@ -483,6 +537,7 @@ mod tests {
                 WorkerMessage::ResolvePoint {
                     generation,
                     point: PhysicalScreenPoint::new(-1_920 + index as i32, 1_080),
+                    explorer_window: ExplorerWindowId::try_from_raw(0x1234),
                     pointer_span: PhysicalScreenSpan::from_point(PhysicalScreenPoint::new(
                         -1_920 + index as i32,
                         1_080,

@@ -3,7 +3,7 @@ mod explorer;
 use std::path::{Path, PathBuf};
 
 use crate::hover::PhysicalScreenPoint;
-use cursorpeek_core::PhysicalScreenRect;
+use cursorpeek_core::{ExplorerWindowId, PhysicalScreenRect};
 
 pub(crate) use explorer::{ExplorerResolver, ResolverError};
 
@@ -39,5 +39,9 @@ impl ResolvedTarget {
 }
 
 pub(crate) trait PointResolver {
-    fn resolve(&mut self, point: PhysicalScreenPoint) -> ResolveOutcome;
+    fn resolve(
+        &mut self,
+        point: PhysicalScreenPoint,
+        explorer_window: Option<ExplorerWindowId>,
+    ) -> ResolveOutcome;
 }

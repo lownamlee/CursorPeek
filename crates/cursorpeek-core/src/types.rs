@@ -16,6 +16,19 @@ impl Generation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExplorerWindowId(u64);
+
+impl ExplorerWindowId {
+    pub const fn try_from_raw(value: u64) -> Option<Self> {
+        if value == 0 { None } else { Some(Self(value)) }
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PhysicalScreenPoint {
     pub x: i32,
     pub y: i32,
@@ -195,12 +208,18 @@ fn is_encoding_label(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Generation, LegacyEncoding, PhysicalScreenPoint, PhysicalScreenRect, PhysicalScreenSpan,
+        ExplorerWindowId, Generation, LegacyEncoding, PhysicalScreenPoint, PhysicalScreenRect,
+        PhysicalScreenSpan,
     };
 
     #[test]
     fn protocol_value_types_preserve_extreme_values() {
         assert_eq!(Generation::from_raw(u64::MAX).get(), u64::MAX);
+        assert_eq!(ExplorerWindowId::try_from_raw(0), None);
+        assert_eq!(
+            ExplorerWindowId::try_from_raw(u64::MAX).map(ExplorerWindowId::get),
+            Some(u64::MAX)
+        );
         assert_eq!(
             PhysicalScreenPoint::new(i32::MIN, i32::MAX),
             PhysicalScreenPoint {

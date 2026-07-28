@@ -5,7 +5,8 @@ use std::{
 };
 
 use crate::{
-    Generation, LegacyEncoding, PhysicalScreenPoint, PhysicalScreenRect, PhysicalScreenSpan,
+    ExplorerWindowId, Generation, LegacyEncoding, PhysicalScreenPoint, PhysicalScreenRect,
+    PhysicalScreenSpan,
     payload::{
         MAX_PREVIEW_PAYLOAD_LEN, MIN_PREVIEW_RESULT_LEN, PayloadError, PreviewResult,
         decode_result, encode_result,
@@ -13,7 +14,7 @@ use crate::{
 };
 
 const MAGIC: [u8; 4] = *b"CPWK";
-const VERSION: u16 = 8;
+const VERSION: u16 = 9;
 const HEADER_LEN: usize = 24;
 const NONCE_LEN: usize = 16;
 const CACHE_ENTRIES_LEN: usize = 2;
@@ -50,6 +51,7 @@ pub enum WorkerMessage {
     ResolvePoint {
         generation: Generation,
         point: PhysicalScreenPoint,
+        explorer_window: Option<ExplorerWindowId>,
         pointer_span: PhysicalScreenSpan,
     },
     PreviewResult {
@@ -105,7 +107,7 @@ impl MessageKind {
                 NONCE_LEN + CACHE_ENTRIES_LEN + MAX_LEGACY_ENCODING_WIRE_LEN,
             ),
             Self::Ready => (NONCE_LEN, NONCE_LEN),
-            Self::ResolvePoint => (24, 24),
+            Self::ResolvePoint => (32, 32),
             Self::PreviewResult => (MIN_PREVIEW_RESPONSE_LEN, MAX_PREVIEW_RESPONSE_LEN),
         }
     }
@@ -436,15 +438,21 @@ fn encode_message(message: WorkerMessage) -> Result<EncodedMessage, ProtocolErro
         WorkerMessage::Ready { nonce } => nonce.0.to_vec(),
         WorkerMessage::ResolvePoint {
             point,
+            explorer_window,
             pointer_span,
             ..
         } => {
             if !pointer_span.contains(point) {
                 return Err(ProtocolError::InvalidPointerSpan);
             }
-            let mut payload = Vec::with_capacity(24);
+            let mut payload = Vec::with_capacity(32);
             payload.extend_from_slice(&point.x.to_le_bytes());
             payload.extend_from_slice(&point.y.to_le_bytes());
+            payload.extend_from_slice(
+                &explorer_window
+                    .map_or(0, ExplorerWindowId::get)
+                    .to_le_bytes(),
+            );
             payload.extend_from_slice(&pointer_span.min_x().to_le_bytes());
             payload.extend_from_slice(&pointer_span.min_y().to_le_bytes());
             payload.extend_from_slice(&pointer_span.max_x().to_le_bytes());
@@ -515,11 +523,12 @@ fn decode_payload(header: FrameHeader, payload: &[u8]) -> Result<WorkerMessage, 
         }
         MessageKind::ResolvePoint => {
             let point = PhysicalScreenPoint::new(read_i32(payload, 0), read_i32(payload, 4));
+            let explorer_window = ExplorerWindowId::try_from_raw(read_u64(payload, 8));
             let pointer_span = PhysicalScreenSpan::try_new(
-                read_i32(payload, 8),
-                read_i32(payload, 12),
                 read_i32(payload, 16),
                 read_i32(payload, 20),
+                read_i32(payload, 24),
+                read_i32(payload, 28),
             )
             .ok_or(ProtocolError::InvalidPointerSpan)?;
             if !pointer_span.contains(point) {
@@ -528,6 +537,7 @@ fn decode_payload(header: FrameHeader, payload: &[u8]) -> Result<WorkerMessage, 
             Ok(WorkerMessage::ResolvePoint {
                 generation: header.generation,
                 point,
+                explorer_window,
                 pointer_span,
             })
         }
@@ -547,6 +557,14 @@ fn read_i32(bytes: &[u8], offset: usize) -> i32 {
         bytes[offset..offset + 4]
             .try_into()
             .expect("validated fixed-size protocol payload contains a complete i32"),
+    )
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(
+        bytes[offset..offset + 8]
+            .try_into()
+            .expect("validated fixed-size protocol payload contains a complete u64"),
     )
 }
 
@@ -646,7 +664,8 @@ mod tests {
         VERSION, WorkerMessage, decode_frame, encode_message, read_message, write_message,
     };
     use crate::{
-        Generation, LegacyEncoding, PhysicalScreenPoint, PhysicalScreenRect, PhysicalScreenSpan,
+        ExplorerWindowId, Generation, LegacyEncoding, PhysicalScreenPoint, PhysicalScreenRect,
+        PhysicalScreenSpan,
         payload::{PayloadError, PreviewResult, ResolverStatus, TextPreview},
     };
     use std::io::{self, ErrorKind, Read, Write};
@@ -685,6 +704,7 @@ mod tests {
         WorkerMessage::ResolvePoint {
             generation: Generation::from_raw(0x0102_0304_0506_0708),
             point: PhysicalScreenPoint::new(-2, 0x0102_0304),
+            explorer_window: ExplorerWindowId::try_from_raw(0x1112_1314_1516_1718),
             pointer_span: PhysicalScreenSpan::try_new(-10, -20, 30, 0x0102_0304).unwrap(),
         }
     }
@@ -818,7 +838,7 @@ mod tests {
     fn unordered_pointer_spans_fail_closed() {
         let encoded = encode_message(request_message()).unwrap();
         let mut inverted = encoded.bytes;
-        inverted[HEADER_LEN + 8..HEADER_LEN + 12].copy_from_slice(&31_i32.to_le_bytes());
+        inverted[HEADER_LEN + 16..HEADER_LEN + 20].copy_from_slice(&31_i32.to_le_bytes());
 
         assert_eq!(
             decode_frame(&inverted),
@@ -826,7 +846,7 @@ mod tests {
         );
 
         let mut missing_point = encode_message(request_message()).unwrap().bytes;
-        missing_point[HEADER_LEN + 8..HEADER_LEN + 12].copy_from_slice(&(-1_i32).to_le_bytes());
+        missing_point[HEADER_LEN + 16..HEADER_LEN + 20].copy_from_slice(&(-1_i32).to_le_bytes());
         assert_eq!(
             decode_frame(&missing_point),
             Err(ProtocolError::InvalidPointerSpan)
@@ -841,15 +861,16 @@ mod tests {
         assert_eq!(&bytes[..4], &MAGIC);
         assert_eq!(&bytes[4..6], &VERSION.to_le_bytes());
         assert_eq!(&bytes[6..8], &3_u16.to_le_bytes());
-        assert_eq!(&bytes[8..12], &24_u32.to_le_bytes());
+        assert_eq!(&bytes[8..12], &32_u32.to_le_bytes());
         assert_eq!(&bytes[12..16], &[0; 4]);
         assert_eq!(&bytes[16..24], &0x0102_0304_0506_0708_u64.to_le_bytes());
         assert_eq!(&bytes[24..28], &(-2_i32).to_le_bytes());
         assert_eq!(&bytes[28..32], &0x0102_0304_i32.to_le_bytes());
-        assert_eq!(&bytes[32..36], &(-10_i32).to_le_bytes());
-        assert_eq!(&bytes[36..40], &(-20_i32).to_le_bytes());
-        assert_eq!(&bytes[40..44], &30_i32.to_le_bytes());
-        assert_eq!(&bytes[44..48], &0x0102_0304_i32.to_le_bytes());
+        assert_eq!(&bytes[32..40], &0x1112_1314_1516_1718_u64.to_le_bytes());
+        assert_eq!(&bytes[40..44], &(-10_i32).to_le_bytes());
+        assert_eq!(&bytes[44..48], &(-20_i32).to_le_bytes());
+        assert_eq!(&bytes[48..52], &30_i32.to_le_bytes());
+        assert_eq!(&bytes[52..56], &0x0102_0304_i32.to_le_bytes());
 
         let encoded = encode_message(hello(LegacyEncoding::Auto)).unwrap();
         let bytes = encoded.as_bytes();
@@ -987,6 +1008,7 @@ mod tests {
         let message = WorkerMessage::ResolvePoint {
             generation: Generation::from_raw(42),
             point: PhysicalScreenPoint::new(i32::MIN, i32::MAX),
+            explorer_window: None,
             pointer_span: PhysicalScreenSpan::from_point(PhysicalScreenPoint::new(
                 i32::MIN,
                 i32::MAX,
