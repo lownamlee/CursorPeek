@@ -50,9 +50,11 @@ pub(super) fn decode(
     let (text, output_truncated) = sanitize_and_truncate(&decoded.text);
     Ok(TextDecodeResult::Preview(TextPreview {
         file_size: file.file_size(),
+        last_write_time: file.last_write_time(),
         linked_content: file.is_linked_content(),
         encoding_was_guessed: decoded.encoding_was_guessed,
         truncated: prefix_truncated || decoded.incomplete_tail || output_truncated,
+        display_name: file.display_name(),
         encoding: decoded.encoding.to_owned(),
         text,
     }))

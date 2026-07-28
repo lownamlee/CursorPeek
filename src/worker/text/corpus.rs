@@ -61,6 +61,8 @@ fn generated_multilingual_and_hostile_corpus_obeys_the_product_contract() {
         fs::write(&path, &case.bytes).expect("the generated corpus case should be written");
         let file = PreviewFile::open(&path).expect("the generated corpus case should open");
         let expected_linked_content = file.is_linked_content();
+        let expected_last_write_time = file.last_write_time();
+        let expected_display_name = file.display_name();
         let actual = decode(&file, &case.policy).expect("the corpus decode should not perform I/O");
 
         match case.expected {
@@ -73,9 +75,11 @@ fn generated_multilingual_and_hostile_corpus_obeys_the_product_contract() {
                 actual,
                 TextDecodeResult::Preview(TextPreview {
                     file_size: case.bytes.len() as u64,
+                    last_write_time: expected_last_write_time,
                     linked_content: expected_linked_content,
                     encoding_was_guessed: guessed,
                     truncated,
+                    display_name: expected_display_name,
                     encoding: encoding.to_owned(),
                     text,
                 }),

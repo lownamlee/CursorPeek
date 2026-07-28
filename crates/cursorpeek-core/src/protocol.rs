@@ -13,7 +13,7 @@ use crate::{
 };
 
 const MAGIC: [u8; 4] = *b"CPWK";
-const VERSION: u16 = 4;
+const VERSION: u16 = 5;
 const HEADER_LEN: usize = 24;
 const NONCE_LEN: usize = 16;
 const MAX_LEGACY_ENCODING_WIRE_LEN: usize = 40;
@@ -694,9 +694,11 @@ mod tests {
             generation: Generation::from_raw(77),
             result: PreviewResult::Text(TextPreview {
                 file_size: 1_000_000,
+                last_write_time: 133_000_000_000_000_000,
                 linked_content: false,
                 encoding_was_guessed: false,
                 truncated: true,
+                display_name: "sample.txt".to_owned(),
                 encoding: "utf-8".to_owned(),
                 text: "bounded 世界\n".repeat(128),
             }),

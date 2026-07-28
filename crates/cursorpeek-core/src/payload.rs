@@ -18,7 +18,7 @@ const RESULT_STATUS: u32 = 0;
 const RESULT_TEXT: u32 = 1;
 const RESULT_IMAGE: u32 = 2;
 const STATUS_PAYLOAD_LEN: usize = 8;
-const TEXT_FIXED_LEN: usize = 24;
+const TEXT_FIXED_LEN: usize = 36;
 const FLAG_LINKED_CONTENT: u32 = 1 << 0;
 const FLAG_TEXT_ENCODING_GUESSED: u32 = 1 << 1;
 const FLAG_TEXT_TRUNCATED: u32 = 1 << 2;
@@ -77,9 +77,11 @@ impl ImageFormat {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TextPreview {
     pub file_size: u64,
+    pub last_write_time: i64,
     pub linked_content: bool,
     pub encoding_was_guessed: bool,
     pub truncated: bool,
+    pub display_name: String,
     pub encoding: String,
     pub text: String,
 }
@@ -126,7 +128,8 @@ pub fn encode_result(result: &PreviewResult) -> Result<Vec<u8>, PayloadError> {
         PreviewResult::Text(preview) => {
             validate_text(preview)?;
             let payload_len = TEXT_FIXED_LEN
-                .checked_add(preview.encoding.len())
+                .checked_add(preview.display_name.len())
+                .and_then(|length| length.checked_add(preview.encoding.len()))
                 .and_then(|length| length.checked_add(preview.text.len()))
                 .ok_or(PayloadError::LengthOverflow)?;
             ensure_payload_cap(payload_len)?;
@@ -141,6 +144,12 @@ pub fn encode_result(result: &PreviewResult) -> Result<Vec<u8>, PayloadError> {
                 ]),
             );
             push_u64(&mut output, preview.file_size);
+            push_i64(&mut output, preview.last_write_time);
+            push_u32(
+                &mut output,
+                u32::try_from(preview.display_name.len())
+                    .expect("the display-name cap fits the wire length"),
+            );
             push_u32(
                 &mut output,
                 u32::try_from(preview.encoding.len())
@@ -150,6 +159,7 @@ pub fn encode_result(result: &PreviewResult) -> Result<Vec<u8>, PayloadError> {
                 &mut output,
                 u32::try_from(preview.text.len()).expect("the text cap fits the wire length"),
             );
+            output.extend_from_slice(preview.display_name.as_bytes());
             output.extend_from_slice(preview.encoding.as_bytes());
             output.extend_from_slice(preview.text.as_bytes());
         }
@@ -226,13 +236,20 @@ fn decode_text(bytes: &[u8]) -> Result<PreviewResult, PayloadError> {
 
     let raw_flags = read_u32(bytes, 4);
     reject_unknown_flags("text", raw_flags, TEXT_FLAGS)?;
-    let encoding_len = read_u32(bytes, 16) as usize;
-    let text_len = read_u32(bytes, 20) as usize;
+    let display_name_len = read_u32(bytes, 24) as usize;
+    let encoding_len = read_u32(bytes, 28) as usize;
+    let text_len = read_u32(bytes, 32) as usize;
     let expected = TEXT_FIXED_LEN
-        .checked_add(encoding_len)
+        .checked_add(display_name_len)
+        .and_then(|length| length.checked_add(encoding_len))
         .and_then(|length| length.checked_add(text_len))
         .ok_or(PayloadError::LengthOverflow)?;
     require_exact_length("text", bytes.len(), expected)?;
+    if display_name_len > MAX_DISPLAY_NAME_UTF8_LEN {
+        return Err(PayloadError::DisplayNameTooLong {
+            actual: display_name_len,
+        });
+    }
     if encoding_len > MAX_ENCODING_LABEL_LEN {
         return Err(PayloadError::EncodingLabelTooLong {
             actual: encoding_len,
@@ -242,8 +259,11 @@ fn decode_text(bytes: &[u8]) -> Result<PreviewResult, PayloadError> {
         return Err(PayloadError::TextTooLarge { actual: text_len });
     }
 
-    let encoding_end = TEXT_FIXED_LEN + encoding_len;
-    let encoding = std::str::from_utf8(&bytes[TEXT_FIXED_LEN..encoding_end])
+    let display_name_end = TEXT_FIXED_LEN + display_name_len;
+    let encoding_end = display_name_end + encoding_len;
+    let display_name = std::str::from_utf8(&bytes[TEXT_FIXED_LEN..display_name_end])
+        .map_err(|_| PayloadError::InvalidDisplayName)?;
+    let encoding = std::str::from_utf8(&bytes[display_name_end..encoding_end])
         .map_err(|_| PayloadError::InvalidEncodingLabel)?;
     if !is_encoding_label(encoding) {
         return Err(PayloadError::InvalidEncodingLabel);
@@ -252,9 +272,11 @@ fn decode_text(bytes: &[u8]) -> Result<PreviewResult, PayloadError> {
         std::str::from_utf8(&bytes[encoding_end..]).map_err(|_| PayloadError::InvalidTextUtf8)?;
     let preview = TextPreview {
         file_size: read_u64(bytes, 8),
+        last_write_time: read_i64(bytes, 16),
         linked_content: raw_flags & FLAG_LINKED_CONTENT != 0,
         encoding_was_guessed: raw_flags & FLAG_TEXT_ENCODING_GUESSED != 0,
         truncated: raw_flags & FLAG_TEXT_TRUNCATED != 0,
+        display_name: display_name.to_owned(),
         encoding: encoding.to_owned(),
         text: text.to_owned(),
     };
@@ -307,6 +329,7 @@ fn decode_image(bytes: &[u8]) -> Result<PreviewResult, PayloadError> {
 }
 
 fn validate_text(preview: &TextPreview) -> Result<(), PayloadError> {
+    validate_display_name(&preview.display_name)?;
     if preview.encoding.len() > MAX_ENCODING_LABEL_LEN {
         return Err(PayloadError::EncodingLabelTooLong {
             actual: preview.encoding.len(),
@@ -719,9 +742,11 @@ mod tests {
     fn text_preview() -> TextPreview {
         TextPreview {
             file_size: 91_234,
+            last_write_time: 133_000_000_000_000_000,
             linked_content: true,
             encoding_was_guessed: true,
             truncated: false,
+            display_name: "sample.txt".to_owned(),
             encoding: "windows-1252".to_owned(),
             text: "hello, 世界\n".to_owned(),
         }
@@ -777,6 +802,24 @@ mod tests {
 
     #[test]
     fn text_limits_and_labels_fail_closed() {
+        let mut preview = text_preview();
+        preview.display_name = "x".repeat(MAX_DISPLAY_NAME_UTF8_LEN + 1);
+        assert_eq!(
+            encode_result(&PreviewResult::Text(preview)),
+            Err(PayloadError::DisplayNameTooLong {
+                actual: MAX_DISPLAY_NAME_UTF8_LEN + 1
+            })
+        );
+
+        for display_name in ["", "folder/name.txt", "before\u{202e}after.txt"] {
+            let mut preview = text_preview();
+            preview.display_name = display_name.to_owned();
+            assert_eq!(
+                encode_result(&PreviewResult::Text(preview)),
+                Err(PayloadError::InvalidDisplayName)
+            );
+        }
+
         let mut preview = text_preview();
         preview.text = "x".repeat(MAX_TEXT_UTF8_LEN + 1);
         assert_eq!(
@@ -936,9 +979,14 @@ mod tests {
         ));
 
         let mut text = encode_result(&PreviewResult::Text(text_preview())).unwrap();
-        let encoding_len = u32::from_le_bytes(text[16..20].try_into().unwrap()) as usize;
-        text[TEXT_FIXED_LEN + encoding_len] = 0xff;
+        let display_name_len = u32::from_le_bytes(text[24..28].try_into().unwrap()) as usize;
+        let encoding_len = u32::from_le_bytes(text[28..32].try_into().unwrap()) as usize;
+        text[TEXT_FIXED_LEN + display_name_len + encoding_len] = 0xff;
         assert_eq!(decode_result(&text), Err(PayloadError::InvalidTextUtf8));
+
+        let mut text = encode_result(&PreviewResult::Text(text_preview())).unwrap();
+        text[TEXT_FIXED_LEN] = 0xff;
+        assert_eq!(decode_result(&text), Err(PayloadError::InvalidDisplayName));
 
         let mut image = encode_result(&PreviewResult::Image(image_preview())).unwrap();
         image[4..8].copy_from_slice(&(FLAG_IMAGE_FIRST_FRAME_ONLY | 0x4000_0000).to_le_bytes());

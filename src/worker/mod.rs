@@ -102,9 +102,16 @@ fn preview_file_result(
         Ok(false) | Err(_) => return PreviewResult::Status(ResolverStatus::Unavailable),
     }
     if let Some(mut result) = cache.get(&key) {
-        if let PreviewResult::Image(preview) = &mut result {
-            preview.display_name = file.display_name();
-            preview.last_write_time = file.last_write_time();
+        match &mut result {
+            PreviewResult::Text(preview) => {
+                preview.display_name = file.display_name();
+                preview.last_write_time = file.last_write_time();
+            }
+            PreviewResult::Image(preview) => {
+                preview.display_name = file.display_name();
+                preview.last_write_time = file.last_write_time();
+            }
+            PreviewResult::Status(_) => {}
         }
         return match file.is_unchanged() {
             Ok(true) => result,
@@ -232,6 +239,11 @@ mod tests {
         assert_eq!(preview.text, "preview");
         assert_eq!(preview.encoding, "UTF-8");
         assert_eq!(preview.file_size, 7);
+        assert_eq!(
+            preview.display_name,
+            path.file_name().unwrap().to_string_lossy()
+        );
+        assert!(preview.last_write_time > 0);
         assert_eq!(preview.linked_content, expected_linked_content);
         assert!(!preview.encoding_was_guessed);
         assert!(!preview.truncated);

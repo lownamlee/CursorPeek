@@ -111,6 +111,9 @@ Text is normalized and displayed as inert plain text:
 - output is bounded to 128 KiB of UTF-8, 32,000 Unicode scalars, and 200 lines;
 - only a bounded 256 KiB prefix is read for a text preview.
 
+The popup measures the rendered text and shrinks to fit short or empty files. The selected preview
+size remains the maximum for longer content, and file details appear beneath the text.
+
 Previewing a sensitive text file, including `.env`, displays its content on your screen. CursorPeek
 does not upload that content, but you should pause or exit CursorPeek when screen sharing or when
 other people can see the display.

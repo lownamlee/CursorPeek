@@ -15,7 +15,7 @@ const MAX_CACHE_ENTRIES: usize = 16;
 const MAX_CACHE_BYTES: usize = 8 * 1024 * 1024;
 // These versions make provider output semantics an explicit part of the key. Increment the
 // relevant value if a future long-lived worker can switch implementation rules in-process.
-const TEXT_PROVIDER_VERSION: u32 = 1;
+const TEXT_PROVIDER_VERSION: u32 = 2;
 const IMAGE_PROVIDER_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -113,9 +113,10 @@ fn result_heap_bytes(result: &PreviewResult) -> Option<usize> {
     match result {
         PreviewResult::Status(_) => None,
         PreviewResult::Text(preview) => preview
-            .encoding
+            .display_name
             .capacity()
-            .checked_add(preview.text.capacity()),
+            .checked_add(preview.encoding.capacity())
+            .and_then(|length| length.checked_add(preview.text.capacity())),
         PreviewResult::Image(preview) => preview
             .display_name
             .capacity()
@@ -216,7 +217,10 @@ impl PreviewCache {
 
 #[cfg(test)]
 mod tests {
-    use super::{CacheEntry, PreviewCache, PreviewCacheKey, PreviewProvider, PreviewProviderKey};
+    use super::{
+        CacheEntry, PreviewCache, PreviewCacheKey, PreviewProvider, PreviewProviderKey,
+        TEXT_PROVIDER_VERSION,
+    };
     use crate::{
         settings::LegacyEncoding,
         worker::{
@@ -259,9 +263,11 @@ mod tests {
     fn text_result(text: &str) -> PreviewResult {
         PreviewResult::Text(TextPreview {
             file_size: u64::try_from(text.len()).expect("the fixture length fits u64"),
+            last_write_time: 133_000_000_000_000_000,
             linked_content: false,
             encoding_was_guessed: false,
             truncated: false,
+            display_name: "sample.txt".to_owned(),
             encoding: "UTF-8".to_owned(),
             text: text.to_owned(),
         })
@@ -283,7 +289,7 @@ mod tests {
 
         let mut version = automatic.clone();
         version.provider = PreviewProviderKey::Text {
-            version: 2,
+            version: TEXT_PROVIDER_VERSION + 1,
             legacy_encoding: LegacyEncoding::Auto,
         };
         assert_ne!(automatic, version);
