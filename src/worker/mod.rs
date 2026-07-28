@@ -47,16 +47,17 @@ where
     R: Read,
     W: Write,
 {
-    let (nonce, legacy_encoding) = match protocol::read_message(reader)? {
+    let (nonce, legacy_encoding, cache_entries) = match protocol::read_message(reader)? {
         Some(WorkerMessage::Hello {
             nonce,
+            cache_entries,
             legacy_encoding,
-        }) => (nonce, legacy_encoding),
+        }) => (nonce, legacy_encoding, cache_entries),
         Some(_) => return Err(WorkerSessionError::ExpectedHello),
         None => return Err(WorkerSessionError::MissingHello),
     };
     protocol::write_message(writer, WorkerMessage::Ready { nonce })?;
-    let mut cache = PreviewCache::default();
+    let mut cache = PreviewCache::with_entry_limit(cache_entries);
 
     loop {
         let (generation, point) = match protocol::read_message(reader)? {
@@ -426,6 +427,7 @@ mod tests {
             &mut input,
             WorkerMessage::Hello {
                 nonce: NONCE,
+                cache_entries: protocol::DEFAULT_PREVIEW_CACHE_ENTRIES,
                 legacy_encoding: LegacyEncoding::Auto,
             },
         )
@@ -499,6 +501,7 @@ mod tests {
             &mut wrong_second,
             WorkerMessage::Hello {
                 nonce: NONCE,
+                cache_entries: protocol::DEFAULT_PREVIEW_CACHE_ENTRIES,
                 legacy_encoding: LegacyEncoding::Auto,
             },
         )
@@ -518,6 +521,7 @@ mod tests {
             &mut handshake_only,
             WorkerMessage::Hello {
                 nonce: NONCE,
+                cache_entries: protocol::DEFAULT_PREVIEW_CACHE_ENTRIES,
                 legacy_encoding: LegacyEncoding::Auto,
             },
         )

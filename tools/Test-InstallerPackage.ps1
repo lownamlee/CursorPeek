@@ -425,8 +425,9 @@ try {
         throw "Installed storage diagnostic returned '$settingsOutput'."
     }
     $configText = Read-StrictUtf8 $configPath
-    if (-not $configText.Contains("start_with_windows=false`n")) {
-        throw 'Default installation did not persist disabled startup.'
+    if (-not $configText.Contains("cache_entries=128`n") -or
+        -not $configText.Contains("start_with_windows=false`n")) {
+        throw 'Default installation did not persist canonical performance and startup settings.'
     }
     if (-not (Test-Path -LiteralPath $startMenuShortcut) -or
         -not (Test-Path -LiteralPath $startMenuUninstall) -or

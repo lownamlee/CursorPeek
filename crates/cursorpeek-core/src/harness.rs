@@ -133,6 +133,7 @@ mod tests {
             &mut frame,
             WorkerMessage::Hello {
                 nonce: SessionNonce::from_bytes([0x5a; 16]),
+                cache_entries: crate::protocol::DEFAULT_PREVIEW_CACHE_ENTRIES,
                 legacy_encoding: LegacyEncoding::Auto,
             },
         )

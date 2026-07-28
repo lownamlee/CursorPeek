@@ -2032,8 +2032,11 @@ mod tests {
                 .expect("the application message window should be created");
             assert_eq!(application.dwell_delay(), Duration::from_millis(650));
             let application_handle = application.handle();
-            let worker_manager = WorkerManager::start(crate::settings::LegacyEncoding::Auto)
-                .expect("the lazy worker manager should start");
+            let worker_manager = WorkerManager::start(
+                crate::settings::LegacyEncoding::Auto,
+                cursorpeek_core::protocol::DEFAULT_PREVIEW_CACHE_ENTRIES,
+            )
+            .expect("the lazy worker manager should start");
             application
                 .request_shutdown()
                 .expect("the application shutdown message should be queued");

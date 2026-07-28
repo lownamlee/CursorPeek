@@ -66,8 +66,10 @@ pub(crate) fn run(process_mode: ProcessMode) -> Result<(), AppError> {
                 settings.settings().dwell_delay(),
                 preview_size,
             )?;
-            let worker_manager =
-                worker::WorkerManager::start(settings.settings().legacy_encoding().clone())?;
+            let worker_manager = worker::WorkerManager::start(
+                settings.settings().legacy_encoding().clone(),
+                settings.settings().cache_entries(),
+            )?;
             message_window.run_application(worker_manager, settings_file, settings)?;
         }
         ProcessMode::InputDiagnostics => {
@@ -116,8 +118,10 @@ pub(crate) fn run(process_mode: ProcessMode) -> Result<(), AppError> {
                 settings.settings().dwell_delay(),
                 preview_size,
             )?;
-            let worker_manager =
-                worker::WorkerManager::start(settings.settings().legacy_encoding().clone())?;
+            let worker_manager = worker::WorkerManager::start(
+                settings.settings().legacy_encoding().clone(),
+                settings.settings().cache_entries(),
+            )?;
             let report = message_window.run_performance_diagnostics(
                 worker_manager,
                 settings,

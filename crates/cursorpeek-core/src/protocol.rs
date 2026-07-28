@@ -13,9 +13,10 @@ use crate::{
 };
 
 const MAGIC: [u8; 4] = *b"CPWK";
-const VERSION: u16 = 6;
+const VERSION: u16 = 7;
 const HEADER_LEN: usize = 24;
 const NONCE_LEN: usize = 16;
+const CACHE_ENTRIES_LEN: usize = 2;
 const MAX_LEGACY_ENCODING_WIRE_LEN: usize = 40;
 const TARGET_BOUNDS_FLAG_LEN: usize = 1;
 const TARGET_BOUNDS_LEN: usize = 16;
@@ -23,6 +24,9 @@ const MIN_PREVIEW_RESPONSE_LEN: usize = TARGET_BOUNDS_FLAG_LEN + MIN_PREVIEW_RES
 const MAX_PREVIEW_RESPONSE_LEN: usize =
     TARGET_BOUNDS_FLAG_LEN + TARGET_BOUNDS_LEN + MAX_PREVIEW_PAYLOAD_LEN;
 const MAX_PROTOCOL_PAYLOAD_LEN: usize = MAX_PREVIEW_RESPONSE_LEN;
+
+pub const DEFAULT_PREVIEW_CACHE_ENTRIES: u16 = 128;
+pub const MAX_PREVIEW_CACHE_ENTRIES: u16 = 512;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SessionNonce([u8; NONCE_LEN]);
@@ -37,6 +41,7 @@ impl SessionNonce {
 pub enum WorkerMessage {
     Hello {
         nonce: SessionNonce,
+        cache_entries: u16,
         legacy_encoding: LegacyEncoding,
     },
     Ready {
@@ -94,7 +99,10 @@ impl MessageKind {
 
     fn payload_limits(self) -> (usize, usize) {
         match self {
-            Self::Hello => (NONCE_LEN + 3, NONCE_LEN + MAX_LEGACY_ENCODING_WIRE_LEN),
+            Self::Hello => (
+                NONCE_LEN + CACHE_ENTRIES_LEN + 3,
+                NONCE_LEN + CACHE_ENTRIES_LEN + MAX_LEGACY_ENCODING_WIRE_LEN,
+            ),
             Self::Ready => (NONCE_LEN, NONCE_LEN),
             Self::ResolvePoint => (8, 8),
             Self::PreviewResult => (MIN_PREVIEW_RESPONSE_LEN, MAX_PREVIEW_RESPONSE_LEN),
@@ -178,6 +186,7 @@ pub enum ProtocolError {
         actual: usize,
     },
     InvalidLegacyEncoding,
+    InvalidCacheEntries(u16),
     InvalidTargetBoundsFlag(u8),
     InvalidTargetBounds,
     MissingTargetBounds,
@@ -243,6 +252,12 @@ impl fmt::Display for ProtocolError {
             ),
             Self::InvalidLegacyEncoding => {
                 write!(formatter, "invalid legacy encoding in worker handshake")
+            }
+            Self::InvalidCacheEntries(entries) => {
+                write!(
+                    formatter,
+                    "worker cache entry limit {entries} exceeds {MAX_PREVIEW_CACHE_ENTRIES}"
+                )
             }
             Self::InvalidTargetBoundsFlag(flag) => {
                 write!(formatter, "invalid target-bounds presence flag {flag}")
@@ -391,8 +406,12 @@ fn encode_message(message: WorkerMessage) -> Result<EncodedMessage, ProtocolErro
     let payload = match message {
         WorkerMessage::Hello {
             nonce,
+            cache_entries,
             legacy_encoding,
         } => {
+            if cache_entries > MAX_PREVIEW_CACHE_ENTRIES {
+                return Err(ProtocolError::InvalidCacheEntries(cache_entries));
+            }
             let label = legacy_encoding.as_str().as_bytes();
             if !(3..=MAX_LEGACY_ENCODING_WIRE_LEN).contains(&label.len())
                 || LegacyEncoding::parse(legacy_encoding.as_str()).as_ref()
@@ -400,8 +419,9 @@ fn encode_message(message: WorkerMessage) -> Result<EncodedMessage, ProtocolErro
             {
                 return Err(ProtocolError::InvalidLegacyEncoding);
             }
-            let mut payload = Vec::with_capacity(NONCE_LEN + label.len());
+            let mut payload = Vec::with_capacity(NONCE_LEN + CACHE_ENTRIES_LEN + label.len());
             payload.extend_from_slice(&nonce.0);
+            payload.extend_from_slice(&cache_entries.to_le_bytes());
             payload.extend_from_slice(label);
             payload
         }
@@ -453,12 +473,17 @@ fn decode_payload(header: FrameHeader, payload: &[u8]) -> Result<WorkerMessage, 
             let mut nonce = [0_u8; NONCE_LEN];
             nonce.copy_from_slice(&payload[..NONCE_LEN]);
             let nonce = SessionNonce(nonce);
-            let label = std::str::from_utf8(&payload[NONCE_LEN..])
+            let cache_entries = u16::from_le_bytes([payload[NONCE_LEN], payload[NONCE_LEN + 1]]);
+            if cache_entries > MAX_PREVIEW_CACHE_ENTRIES {
+                return Err(ProtocolError::InvalidCacheEntries(cache_entries));
+            }
+            let label = std::str::from_utf8(&payload[NONCE_LEN + CACHE_ENTRIES_LEN..])
                 .map_err(|_| ProtocolError::InvalidLegacyEncoding)?;
             let legacy_encoding =
                 LegacyEncoding::parse(label).ok_or(ProtocolError::InvalidLegacyEncoding)?;
             Ok(WorkerMessage::Hello {
                 nonce,
+                cache_entries,
                 legacy_encoding,
             })
         }
@@ -578,9 +603,9 @@ fn decode_frame(bytes: &[u8]) -> Result<WorkerMessage, ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HEADER_LEN, MAGIC, MAX_PROTOCOL_PAYLOAD_LEN, NONCE_LEN, ProtocolError, ProtocolStreamError,
-        SessionNonce, VERSION, WorkerMessage, decode_frame, encode_message, read_message,
-        write_message,
+        DEFAULT_PREVIEW_CACHE_ENTRIES, HEADER_LEN, MAGIC, MAX_PREVIEW_CACHE_ENTRIES,
+        MAX_PROTOCOL_PAYLOAD_LEN, NONCE_LEN, ProtocolError, ProtocolStreamError, SessionNonce,
+        VERSION, WorkerMessage, decode_frame, encode_message, read_message, write_message,
     };
     use crate::{
         Generation, LegacyEncoding, PhysicalScreenPoint, PhysicalScreenRect,
@@ -607,8 +632,13 @@ mod tests {
     }
 
     fn hello(legacy_encoding: LegacyEncoding) -> WorkerMessage {
+        hello_with_cache(legacy_encoding, DEFAULT_PREVIEW_CACHE_ENTRIES)
+    }
+
+    fn hello_with_cache(legacy_encoding: LegacyEncoding, cache_entries: u16) -> WorkerMessage {
         WorkerMessage::Hello {
             nonce: NONCE,
+            cache_entries,
             legacy_encoding,
         }
     }
@@ -630,15 +660,17 @@ mod tests {
 
     #[test]
     fn handshake_round_trips_each_legacy_encoding_policy() {
-        for policy in [
-            LegacyEncoding::Auto,
-            LegacyEncoding::System,
-            LegacyEncoding::Off,
-            LegacyEncoding::Label("windows-1252".to_owned()),
-        ] {
-            let message = hello(policy);
-            let encoded = encode_message(message.clone()).unwrap();
-            assert_eq!(decode_frame(encoded.as_bytes()), Ok(message));
+        for cache_entries in [0, DEFAULT_PREVIEW_CACHE_ENTRIES, MAX_PREVIEW_CACHE_ENTRIES] {
+            for policy in [
+                LegacyEncoding::Auto,
+                LegacyEncoding::System,
+                LegacyEncoding::Off,
+                LegacyEncoding::Label("windows-1252".to_owned()),
+            ] {
+                let message = hello_with_cache(policy, cache_entries);
+                let encoded = encode_message(message.clone()).unwrap();
+                assert_eq!(decode_frame(encoded.as_bytes()), Ok(message));
+            }
         }
     }
 
@@ -755,6 +787,15 @@ mod tests {
         assert_eq!(&bytes[16..24], &0x0102_0304_0506_0708_u64.to_le_bytes());
         assert_eq!(&bytes[24..28], &(-2_i32).to_le_bytes());
         assert_eq!(&bytes[28..32], &0x0102_0304_i32.to_le_bytes());
+
+        let encoded = encode_message(hello(LegacyEncoding::Auto)).unwrap();
+        let bytes = encoded.as_bytes();
+        assert_eq!(&bytes[8..12], &22_u32.to_le_bytes());
+        assert_eq!(
+            &bytes[HEADER_LEN + NONCE_LEN..HEADER_LEN + NONCE_LEN + 2],
+            &DEFAULT_PREVIEW_CACHE_ENTRIES.to_le_bytes()
+        );
+        assert_eq!(&bytes[HEADER_LEN + NONCE_LEN + 2..], b"auto");
     }
 
     #[test]
@@ -817,14 +858,14 @@ mod tests {
         assert_eq!(
             decode_frame(&bad_payload_len),
             Err(ProtocolError::InvalidPayloadLength {
-                minimum: 19,
-                maximum: 56,
+                minimum: 21,
+                maximum: 58,
                 actual: 15,
             })
         );
 
         let mut invalid_legacy = encoded_hello.bytes.clone();
-        invalid_legacy[HEADER_LEN + NONCE_LEN..].copy_from_slice(b"nope");
+        invalid_legacy[HEADER_LEN + NONCE_LEN + 2..].copy_from_slice(b"nope");
         assert_eq!(
             decode_frame(&invalid_legacy),
             Err(ProtocolError::InvalidLegacyEncoding)
@@ -832,6 +873,24 @@ mod tests {
         assert!(matches!(
             encode_message(hello(LegacyEncoding::Label("nope".to_owned()))),
             Err(ProtocolError::InvalidLegacyEncoding)
+        ));
+
+        let invalid_cache_entries = MAX_PREVIEW_CACHE_ENTRIES + 1;
+        let mut invalid_cache = encoded_hello.bytes.clone();
+        invalid_cache[HEADER_LEN + NONCE_LEN..HEADER_LEN + NONCE_LEN + 2]
+            .copy_from_slice(&invalid_cache_entries.to_le_bytes());
+        assert_eq!(
+            decode_frame(&invalid_cache),
+            Err(ProtocolError::InvalidCacheEntries(invalid_cache_entries))
+        );
+        assert!(matches!(
+            encode_message(WorkerMessage::Hello {
+                nonce: NONCE,
+                cache_entries: invalid_cache_entries,
+                legacy_encoding: LegacyEncoding::Auto,
+            }),
+            Err(ProtocolError::InvalidCacheEntries(entries))
+                if entries == invalid_cache_entries
         ));
 
         let mut trailing = encoded_hello.as_bytes().to_vec();

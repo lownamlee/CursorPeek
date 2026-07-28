@@ -24,7 +24,7 @@ use crate::{
     platform::{ContainedWorker, ProcessError, WorkerPipes},
     settings::LegacyEncoding,
 };
-use cursorpeek_core::PhysicalScreenRect;
+use cursorpeek_core::{PhysicalScreenRect, protocol::DEFAULT_PREVIEW_CACHE_ENTRIES};
 
 use super::{
     payload::{PreviewResult, ResolverStatus},
@@ -157,6 +157,7 @@ fn ensure_unavailable(result: &PreviewResult) -> Result<(), WorkerManagerError> 
 struct WorkerManagerConfig {
     idle_lifetime: Duration,
     legacy_encoding: LegacyEncoding,
+    cache_entries: u16,
 }
 
 impl Default for WorkerManagerConfig {
@@ -164,6 +165,7 @@ impl Default for WorkerManagerConfig {
         Self {
             idle_lifetime: DEFAULT_WORKER_IDLE_LIFETIME,
             legacy_encoding: LegacyEncoding::Auto,
+            cache_entries: DEFAULT_PREVIEW_CACHE_ENTRIES,
         }
     }
 }
@@ -176,9 +178,13 @@ pub(crate) struct WorkerManager {
 }
 
 impl WorkerManager {
-    pub(crate) fn start(legacy_encoding: LegacyEncoding) -> Result<Self, WorkerManagerError> {
+    pub(crate) fn start(
+        legacy_encoding: LegacyEncoding,
+        cache_entries: u16,
+    ) -> Result<Self, WorkerManagerError> {
         Self::start_with_config(WorkerManagerConfig {
             legacy_encoding,
+            cache_entries,
             ..WorkerManagerConfig::default()
         })
     }
@@ -627,7 +633,11 @@ fn manager_loop(
                 completion_notifier,
             }) => {
                 if session.is_none() {
-                    match spawn_worker_session(&mut next_session_id, &config.legacy_encoding) {
+                    match spawn_worker_session(
+                        &mut next_session_id,
+                        &config.legacy_encoding,
+                        config.cache_entries,
+                    ) {
                         Ok(started) => {
                             session = Some(started);
                         }
@@ -678,8 +688,11 @@ fn manager_loop(
             }
             MailboxTake::Prewarm => {
                 if session.is_none()
-                    && let Ok(started) =
-                        spawn_worker_session(&mut next_session_id, &config.legacy_encoding)
+                    && let Ok(started) = spawn_worker_session(
+                        &mut next_session_id,
+                        &config.legacy_encoding,
+                        config.cache_entries,
+                    )
                 {
                     session = Some(started);
                 }
@@ -709,12 +722,13 @@ fn manager_loop(
 fn spawn_worker_session(
     next_session_id: &mut u64,
     legacy_encoding: &LegacyEncoding,
+    cache_entries: u16,
 ) -> Result<WorkerSession, WorkerManagerError> {
     let session_id = *next_session_id;
     let following_session_id = session_id
         .checked_add(1)
         .ok_or(WorkerManagerError::SessionIdExhausted)?;
-    let started = WorkerSession::spawn(session_id, legacy_encoding.clone())?;
+    let started = WorkerSession::spawn(session_id, legacy_encoding.clone(), cache_entries)?;
     *next_session_id = following_session_id;
     Ok(started)
 }
@@ -750,7 +764,11 @@ struct WorkerSession {
 }
 
 impl WorkerSession {
-    fn spawn(id: u64, legacy_encoding: LegacyEncoding) -> Result<Self, WorkerManagerError> {
+    fn spawn(
+        id: u64,
+        legacy_encoding: LegacyEncoding,
+        cache_entries: u16,
+    ) -> Result<Self, WorkerManagerError> {
         let nonce = generate_nonce()?;
         let executable = env::current_exe().map_err(WorkerManagerError::CurrentExecutable)?;
         let mut worker = ContainedWorker::spawn(&executable)?;
@@ -777,6 +795,7 @@ impl WorkerSession {
                     stdout,
                     nonce,
                     legacy_encoding,
+                    cache_entries,
                     command_receiver,
                     ready_sender,
                 );
@@ -905,6 +924,7 @@ fn protocol_loop(
     mut stdout: impl Read,
     nonce: SessionNonce,
     legacy_encoding: LegacyEncoding,
+    cache_entries: u16,
     command_receiver: Receiver<ProtocolCommand>,
     ready_sender: SyncSender<Result<(), WorkerManagerError>>,
 ) {
@@ -913,6 +933,7 @@ fn protocol_loop(
             &mut stdin,
             WorkerMessage::Hello {
                 nonce,
+                cache_entries,
                 legacy_encoding,
             },
         )?;

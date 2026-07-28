@@ -188,6 +188,7 @@ The canonical file contains:
 dwell_delay_ms=250
 preview_width=640
 preview_height=480
+cache_entries=128
 theme=system
 legacy_encoding=auto
 start_with_windows=false
@@ -198,12 +199,14 @@ start_with_windows=false
 | `dwell_delay_ms` | integer from 150 through 2000 |
 | `preview_width` | maximum preview client width, from 320 through 960 |
 | `preview_height` | maximum preview client height, from 240 through 720 |
+| `cache_entries` | retained preview count from 0 through 512; `0` disables caching |
 | `theme` | `system`, `light`, or `dark` |
 | `legacy_encoding` | `auto`, `system`, `off`, or a supported legacy label such as `windows-1252` or `shift_jis` |
 | `start_with_windows` | `true` or `false` |
 
-The tray exposes safe presets rather than every numeric value. To use another accepted value, exit
-CursorPeek, edit `config.ini` as UTF-8, and restart it.
+The tray exposes safe presets rather than every numeric value. To use another accepted value,
+including a different cache capacity, exit CursorPeek, edit `config.ini` as UTF-8, and restart it.
+Cached preview payloads remain independently capped at 64 MiB.
 
 Malformed UTF-8, duplicate keys, invalid known values, oversized lines/files, or too many unknown
 settings prevent startup and do not overwrite the existing file. Valid bounded unknown keys are

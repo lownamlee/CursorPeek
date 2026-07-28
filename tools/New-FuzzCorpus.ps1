@@ -36,7 +36,7 @@ function New-Frame {
     $writer = [System.IO.BinaryWriter]::new($stream)
     try {
         $writer.Write([System.Text.Encoding]::ASCII.GetBytes('CPWK'))
-        $writer.Write([UInt16] 3)
+        $writer.Write([UInt16] 7)
         $writer.Write($Kind)
         $writer.Write($DeclaredLength)
         $writer.Write([UInt32] 0)
@@ -95,6 +95,7 @@ $nonce = [byte[]] (0..15)
 $helloPayload = New-BinaryPayload {
     param($writer)
     $writer.Write($nonce)
+    $writer.Write([UInt16] 128)
     $writer.Write([System.Text.Encoding]::ASCII.GetBytes('auto'))
 }
 $readyPayload = [byte[]] $nonce.Clone()
@@ -108,6 +109,8 @@ $statusPayload = New-BinaryPayload {
     $writer.Write([UInt32] 0)
     $writer.Write([UInt32] 3)
 }
+$statusProtocolPayload = [byte[]]::new($statusPayload.Length + 1)
+[System.Array]::Copy($statusPayload, 0, $statusProtocolPayload, 1, $statusPayload.Length)
 $textPayload = New-BinaryPayload {
     param($writer)
     $encoding = [System.Text.Encoding]::ASCII.GetBytes('UTF-8')
@@ -137,7 +140,7 @@ $imagePayload = New-BinaryPayload {
 Write-Seed protocol hello-auto (New-Frame 1 0 $helloPayload)
 Write-Seed protocol ready (New-Frame 2 0 $readyPayload)
 Write-Seed protocol resolve-extremes (New-Frame 3 ([UInt64]::MaxValue) $resolvePayload)
-Write-Seed protocol result-status (New-Frame 4 42 $statusPayload)
+Write-Seed protocol result-status (New-Frame 4 42 $statusProtocolPayload)
 Write-Seed protocol truncated-magic ([System.Text.Encoding]::ASCII.GetBytes('CPWK'))
 Write-Seed protocol oversized-declaration (
     New-Frame 4 1 ([byte[]] @()) ([UInt32] (4 * 1024 * 1024 + 1))

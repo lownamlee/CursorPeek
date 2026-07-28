@@ -545,6 +545,7 @@ try {
     $configText = Read-StrictUtf8 $portableConfig
     if (-not $configText.StartsWith("# CursorPeek settings`n") -or
         -not $configText.Contains("dwell_delay_ms=250`n") -or
+        -not $configText.Contains("cache_entries=128`n") -or
         -not $configText.Contains("start_with_windows=false`n")) {
         throw 'Portable configuration does not contain canonical defaults.'
     }

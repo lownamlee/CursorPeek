@@ -1,6 +1,7 @@
 use std::{collections::VecDeque, mem::size_of, path::Path};
 
 use crate::settings::LegacyEncoding;
+use cursorpeek_core::protocol::DEFAULT_PREVIEW_CACHE_ENTRIES;
 
 use super::{
     file::{PreviewFile, PreviewFileIdentity},
@@ -9,10 +10,10 @@ use super::{
     text,
 };
 
-// The cache exists only for one contained worker session. The count cap bounds metadata-heavy
-// text entries; the byte cap bounds retained pixel/text buffers independently.
-const MAX_CACHE_ENTRIES: usize = 16;
-const MAX_CACHE_BYTES: usize = 8 * 1024 * 1024;
+// The cache exists only for one contained worker session. The count cap follows QTTabBar's proven
+// browsing working set, while the independent byte cap prevents 128 maximum-size decoded images
+// from retaining hundreds of MiB. The entire cache is released when the idle worker retires.
+const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 // These versions make provider output semantics an explicit part of the key. Increment the
 // relevant value if a future long-lived worker can switch implementation rules in-process.
 const TEXT_PROVIDER_VERSION: u32 = 2;
@@ -135,11 +136,15 @@ pub(super) struct PreviewCache {
 
 impl Default for PreviewCache {
     fn default() -> Self {
-        Self::with_limits(MAX_CACHE_ENTRIES, MAX_CACHE_BYTES)
+        Self::with_entry_limit(DEFAULT_PREVIEW_CACHE_ENTRIES)
     }
 }
 
 impl PreviewCache {
+    pub(super) fn with_entry_limit(max_entries: u16) -> Self {
+        Self::with_limits(usize::from(max_entries), MAX_CACHE_BYTES)
+    }
+
     fn with_limits(max_entries: usize, max_bytes: usize) -> Self {
         Self {
             entries: VecDeque::new(),
@@ -218,8 +223,8 @@ impl PreviewCache {
 #[cfg(test)]
 mod tests {
     use super::{
-        CacheEntry, PreviewCache, PreviewCacheKey, PreviewProvider, PreviewProviderKey,
-        TEXT_PROVIDER_VERSION,
+        CacheEntry, MAX_CACHE_BYTES, PreviewCache, PreviewCacheKey, PreviewProvider,
+        PreviewProviderKey, TEXT_PROVIDER_VERSION,
     };
     use crate::{
         settings::LegacyEncoding,
@@ -228,6 +233,7 @@ mod tests {
             payload::{PreviewResult, ResolverStatus, TextPreview},
         },
     };
+    use cursorpeek_core::protocol::DEFAULT_PREVIEW_CACHE_ENTRIES;
     use std::{
         env, fs,
         path::PathBuf,
@@ -315,6 +321,70 @@ mod tests {
         assert_eq!(cache.get(&a), Some(text_result("a")));
         assert_eq!(cache.get(&c), Some(text_result("c")));
         assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn default_cache_retains_a_bounded_folder_sized_working_set() {
+        let entry_limit = usize::from(DEFAULT_PREVIEW_CACHE_ENTRIES);
+        let mut fixtures = Vec::with_capacity(entry_limit + 1);
+        let mut cache = PreviewCache::default();
+
+        for index in 0..=entry_limit {
+            let (file, key) = key(
+                &format!("folder-entry-{index}"),
+                PreviewProvider::Text,
+                &LegacyEncoding::Auto,
+            );
+            fixtures.push((file, key));
+        }
+
+        for (_, key) in fixtures.iter().take(entry_limit) {
+            assert!(cache.insert(key.clone(), text_result("cached folder entry")));
+        }
+        assert_eq!(cache.len(), entry_limit);
+
+        let first = fixtures[0].1.clone();
+        let second = fixtures[1].1.clone();
+        assert_eq!(cache.get(&first), Some(text_result("cached folder entry")));
+        assert!(cache.insert(
+            fixtures[entry_limit].1.clone(),
+            text_result("new folder entry")
+        ));
+
+        assert_eq!(cache.len(), entry_limit);
+        assert_eq!(cache.get(&second), None);
+        assert_eq!(
+            cache.get(&first),
+            Some(text_result("cached folder entry")),
+            "a recent hit must survive count-based eviction"
+        );
+        assert_eq!(
+            cache.get(&fixtures[entry_limit].1),
+            Some(text_result("new folder entry"))
+        );
+    }
+
+    #[test]
+    fn default_cache_memory_contract_is_explicit() {
+        let cache = PreviewCache::default();
+
+        assert_eq!(cache.max_entries, 128);
+        assert_eq!(cache.max_bytes, 64 * 1024 * 1024);
+        assert_eq!(
+            cache.max_entries,
+            usize::from(DEFAULT_PREVIEW_CACHE_ENTRIES)
+        );
+        assert_eq!(cache.max_bytes, MAX_CACHE_BYTES);
+    }
+
+    #[test]
+    fn configured_zero_entries_disables_caching_without_disabling_previews() {
+        let (_file, key) = key("disabled", PreviewProvider::Text, &LegacyEncoding::Auto);
+        let mut cache = PreviewCache::with_entry_limit(0);
+
+        assert!(!cache.insert(key.clone(), text_result("not retained")));
+        assert_eq!(cache.get(&key), None);
+        assert_eq!(cache.len(), 0);
     }
 
     #[test]

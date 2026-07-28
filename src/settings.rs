@@ -12,6 +12,7 @@ use std::{
 };
 
 pub(crate) use cursorpeek_core::LegacyEncoding;
+use cursorpeek_core::protocol::{DEFAULT_PREVIEW_CACHE_ENTRIES, MAX_PREVIEW_CACHE_ENTRIES};
 use windows::{
     Win32::{
         Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW},
@@ -86,6 +87,7 @@ pub(crate) struct AppSettings {
     dwell_delay_ms: u64,
     preview_width: u16,
     preview_height: u16,
+    cache_entries: u16,
     theme: Theme,
     legacy_encoding: LegacyEncoding,
     start_with_windows: bool,
@@ -97,6 +99,7 @@ impl Default for AppSettings {
             dwell_delay_ms: 250,
             preview_width: 640,
             preview_height: 480,
+            cache_entries: DEFAULT_PREVIEW_CACHE_ENTRIES,
             theme: Theme::System,
             legacy_encoding: LegacyEncoding::Auto,
             start_with_windows: false,
@@ -125,6 +128,10 @@ impl AppSettings {
         self.preview_height
     }
 
+    pub(crate) const fn cache_entries(&self) -> u16 {
+        self.cache_entries
+    }
+
     pub(crate) const fn theme(&self) -> Theme {
         self.theme
     }
@@ -142,6 +149,9 @@ impl AppSettings {
         }
         if !(MIN_PREVIEW_HEIGHT..=MAX_PREVIEW_HEIGHT).contains(&self.preview_height) {
             return Err(SettingsParseError::new(0, INVALID_PREVIEW_HEIGHT));
+        }
+        if self.cache_entries > MAX_PREVIEW_CACHE_ENTRIES {
+            return Err(SettingsParseError::new(0, INVALID_CACHE_ENTRIES));
         }
         Ok(())
     }
@@ -259,6 +269,16 @@ impl SettingsDocument {
                     )?)
                     .expect("the validated height fits u16");
                 }
+                "cache_entries" => {
+                    document.settings.cache_entries = u16::try_from(parse_bounded_integer(
+                        value,
+                        0,
+                        u64::from(MAX_PREVIEW_CACHE_ENTRIES),
+                        line_number,
+                        INVALID_CACHE_ENTRIES,
+                    )?)
+                    .expect("the validated cache entry limit fits u16");
+                }
                 "theme" => {
                     document.settings.theme = Theme::parse(value)
                         .ok_or_else(|| SettingsParseError::new(line_number, INVALID_THEME))?;
@@ -323,6 +343,8 @@ impl SettingsDocument {
             .expect("writing to a String cannot fail");
         writeln!(output, "preview_height={}", self.settings.preview_height)
             .expect("writing to a String cannot fail");
+        writeln!(output, "cache_entries={}", self.settings.cache_entries)
+            .expect("writing to a String cannot fail");
         writeln!(output, "theme={}", self.settings.theme.as_str())
             .expect("writing to a String cannot fail");
         writeln!(
@@ -357,6 +379,7 @@ const KNOWN_KEYS: &[&str] = &[
     "dwell_delay_ms",
     "preview_width",
     "preview_height",
+    "cache_entries",
     "theme",
     "legacy_encoding",
     "start_with_windows",
@@ -370,6 +393,7 @@ const INVALID_UNSIGNED_INTEGER: &str = "expected an unsigned decimal integer";
 const INVALID_DWELL_DELAY: &str = "invalid `dwell_delay_ms` value: expected 150-2000";
 const INVALID_PREVIEW_WIDTH: &str = "invalid `preview_width` value: expected 320-960";
 const INVALID_PREVIEW_HEIGHT: &str = "invalid `preview_height` value: expected 240-720";
+const INVALID_CACHE_ENTRIES: &str = "invalid `cache_entries` value: expected 0-512";
 const INVALID_THEME: &str = "invalid `theme` value: expected `system`, `light`, or `dark`";
 const INVALID_LEGACY_ENCODING: &str = "invalid `legacy_encoding` value: expected `auto`, `system`, `off`, or a supported legacy encoding label";
 const INVALID_START_WITH_WINDOWS: &str =
@@ -887,6 +911,7 @@ mod tests {
              dwell_delay_ms=250\n\
              preview_width=640\n\
              preview_height=480\n\
+             cache_entries=128\n\
              theme=system\n\
              legacy_encoding=auto\n\
              start_with_windows=false\n"
@@ -904,10 +929,11 @@ mod tests {
     #[test]
     fn valid_values_and_unknown_settings_survive_canonical_save() {
         let input = "\u{feff}; user edit\n\
-                     dwell_delay_ms = 150\n\
-                     preview_width=960\n\
-                     preview_height=720\n\
-                     theme=dark\n\
+             dwell_delay_ms = 150\n\
+             preview_width=960\n\
+             preview_height=720\n\
+             cache_entries=512\n\
+             theme=dark\n\
                      legacy_encoding=Windows-1252\n\
                      start_with_windows=true\n\
                      future.setting = 保留\n";
@@ -916,6 +942,7 @@ mod tests {
         assert_eq!(document.settings.dwell_delay_ms, 150);
         assert_eq!(document.settings.preview_width, 960);
         assert_eq!(document.settings.preview_height, 720);
+        assert_eq!(document.settings.cache_entries, 512);
         assert_eq!(document.settings.theme, Theme::Dark);
         assert_eq!(
             document.settings.legacy_encoding,
@@ -981,6 +1008,8 @@ mod tests {
             ("dwell_delay_ms=+400\n", "unsigned decimal"),
             ("preview_width=961\n", "expected 320-960"),
             ("preview_height=239\n", "expected 240-720"),
+            ("cache_entries=513\n", "expected 0-512"),
+            ("cache_entries=-1\n", "unsigned decimal"),
             ("theme=automatic\n", "system"),
             ("legacy_encoding=utf 8\n", "supported legacy"),
             ("legacy_encoding=utf-8\n", "supported legacy"),
