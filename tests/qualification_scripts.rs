@@ -390,7 +390,7 @@ fn release_notes_render_downloads_highlights_and_verification() {
             .to_str()
             .expect("the output path should be Unicode"),
         "-PreviousTag",
-        "v0.1.0",
+        "v0.1.1",
     ];
     let rendered = run_release_notes(&arguments);
     assert!(
@@ -405,13 +405,15 @@ fn release_notes_render_downloads_highlights_and_verification() {
     assert!(notes.contains(&format!("[CursorPeek-{version}-windows-x64-setup.exe]")));
     assert!(notes.contains(&format!("[CursorPeek-{version}-windows-x64-portable.zip]")));
     assert!(notes.contains("## Highlights"));
-    assert!(notes.contains("This patch release restores the notification-area menu"));
-    assert!(notes.contains("### Fixed"));
+    assert!(notes.contains("This release makes previews faster, more compact"));
+    assert!(notes.contains("### Added"));
+    assert!(notes.contains("### Changed"));
+    assert!(notes.contains("### Security"));
     assert!(notes.contains("## Verification"));
     assert!(notes.contains("[SHA256SUMS.txt]"));
     assert!(notes.contains("[CycloneDX SBOM]"));
     assert!(notes.contains(&format!(
-        "https://github.com/lownamlee/CursorPeek/compare/v0.1.0...v{version}"
+        "https://github.com/lownamlee/CursorPeek/compare/v0.1.1...v{version}"
     )));
     assert!(
         notes

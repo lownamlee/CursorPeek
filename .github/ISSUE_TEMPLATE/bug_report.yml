@@ -13,7 +13,7 @@ body:
     attributes:
       label: CursorPeek version or commit
       description: Use the version shown by CursorPeek or the tested commit hash.
-      placeholder: 0.1.1 or a full commit hash
+      placeholder: 0.2.0 or a full commit hash
     validations:
       required: true
   - type: dropdown

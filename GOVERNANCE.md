@@ -22,7 +22,7 @@ consensus for decisions that change:
 - supported formats or Windows versions;
 - runtime or build dependencies;
 - licensing, privacy, packaging, or release policy;
-- the version 0.1 product contract.
+- the current documented product contract.
 
 When consensus is not immediate, the proposal remains open while evidence is collected. Decisions
 with lasting architectural impact are recorded in the pull request, an issue, or project

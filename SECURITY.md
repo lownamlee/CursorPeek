@@ -38,5 +38,5 @@ report form.
 ## Security model
 
 [THREAT_MODEL.md](THREAT_MODEL.md) documents the trust boundaries, controls, and residual risks
-that define CursorPeek's security claims. The version 0.1 dependency, unsafe-code, IPC, file, and
+that define CursorPeek's security claims. The version 0.2 dependency, unsafe-code, IPC, file, and
 UI review is recorded in [docs/SECURITY_REVIEW.md](docs/SECURITY_REVIEW.md).

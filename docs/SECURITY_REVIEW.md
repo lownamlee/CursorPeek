@@ -1,6 +1,6 @@
-# CursorPeek 0.1 security review
+# CursorPeek 0.2 security review
 
-Review date: 2026-07-27
+Review date: 2026-07-28
 
 This review covers the locked release dependency graph, fuzz-tool graph, unsafe Windows boundary,
 worker IPC and file boundary, preview UI boundary, and release SBOM process. It complements the
@@ -64,6 +64,9 @@ the fuzz harness.
 - IPC parsing rejects invalid magic/version/kind/flags/order/length, unordered pointer spans,
   nonce mismatch, stale generation, trailing bytes, truncation, and allocation above the protocol
   cap.
+- Protocol v9 binds product requests to the coordinator-verified Explorer root. The worker
+  requires the same root under the pointer and correlates it with the matching `IWebBrowser2`
+  window and active Shell-view identity.
 - Worker launch uses explicit inherited handles, suspended Job assignment, required creation
   mitigations, post-creation mitigation queries, timeout termination, and zero-residue recovery.
 - File opening rejects relative/UNC/device paths, non-disk and remote-protocol handles, offline and
@@ -78,7 +81,7 @@ the fuzz harness.
 
 ## Release decision
 
-No unresolved security-policy exception is open for 0.1; the sole scoped license allowance is the
+No unresolved security-policy exception is open for 0.2; the sole scoped license allowance is the
 fuzz-only NCSA entry described above. Portable and installer packaging include the exact locked
 third-party license files, internal and artifact checksums, and clean-source metadata. The hosted
 distribution lifecycle relocates an already configured portable copy without changing installed
@@ -86,6 +89,6 @@ state, upgrades an older registered install with settings and user files preserv
 instance, and finishes a separate uninstall with zero product residue. The per-user installer uses
 a hash-pinned NSIS compiler, carries the distribution's exact multi-license `COPYING` notice, and
 removes only its explicit owned-file list. Release documentation discloses the unsigned status and
-remaining scope limits. The maintainer accepted the manually tested 0.1 packages. The tag-only
-workflow must still rebuild the exact source, repeat the security and package gates, verify the
-draft asset digests, create provenance and SBOM attestations, and publish only as its final action.
+remaining scope limits. The tag-only workflow must rebuild the exact source, repeat the security
+and package gates, verify the draft asset digests, create provenance and SBOM attestations, and
+publish only as its final action.

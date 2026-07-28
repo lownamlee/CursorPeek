@@ -9,7 +9,7 @@ the utility lightweight.
 - Discuss substantial UI, format, dependency, packaging, or security-boundary changes before
   implementing them.
 - Do not post vulnerability details publicly. Follow [SECURITY.md](SECURITY.md).
-- Keep version 0.1 changes within the scope described in the README and existing implementation.
+- Keep changes within the product scope described in the README and existing implementation.
 
 ## Development setup
 
@@ -41,15 +41,15 @@ Changes to Windows resources or the release executable should also run:
 .\tools\New-ReleaseSbom.ps1
 .\tools\New-PortablePackage.ps1 -AllowDirty
 .\tools\Test-PortablePackage.ps1 `
-    -PackagePath .\target\packages\CursorPeek-0.1.1-windows-x64-portable.zip `
+    -PackagePath .\target\packages\CursorPeek-0.2.0-windows-x64-portable.zip `
     -AllowDirtyMetadata
 $nsis = .\tools\Get-Nsis.ps1
 .\tools\New-InstallerPackage.ps1 `
-    -PortablePackage .\target\packages\CursorPeek-0.1.1-windows-x64-portable.zip `
+    -PortablePackage .\target\packages\CursorPeek-0.2.0-windows-x64-portable.zip `
     -NsisCompiler $nsis `
     -AllowDirtyMetadata
 .\tools\Test-InstallerPackage.ps1 `
-    -InstallerPath .\target\packages\CursorPeek-0.1.1-windows-x64-setup.exe `
+    -InstallerPath .\target\packages\CursorPeek-0.2.0-windows-x64-setup.exe `
     -AllowDirtyMetadata
 ```
 

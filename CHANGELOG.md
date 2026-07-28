@@ -5,6 +5,38 @@ corresponding version is published.
 
 ## Unreleased
 
+## [0.2.0] - 2026-07-28
+
+This release makes previews faster, more compact, and available from visible inactive Explorer
+windows.
+
+### Added
+
+- Preview supported files in an unobscured Explorer window even while another application remains
+  active.
+- Carry the verified Explorer-window identity through the contained-worker protocol and revalidate
+  the same root and active Shell view throughout preview lifetime.
+- Make the repeat-preview cache configurable, with a larger 128-entry default.
+
+### Changed
+
+- Size image previews from their natural dimensions and shrink only when they exceed the selected
+  maximum.
+- Measure text content so short files do not leave unused popup space, with metadata below both
+  image and text previews.
+- Reduce repeated-hover latency through worker prewarming, Shell-view reuse, and verified preview
+  caching.
+- Preserve the dwell deadline while the pointer moves within one Explorer item and use a brief
+  re-show delay when moving directly to another item.
+
+### Security
+
+- Protocol version 9 binds each product request to the exact Explorer root admitted by the
+  coordinator. Occlusion, pointer departure, root/view replacement, destruction, hiding, or
+  minimization still fail closed.
+- Foreground changes now trigger target-context revalidation instead of weakening or discarding the
+  Explorer identity check.
+
 ## [0.1.1] - 2026-07-27
 
 This patch release restores the notification-area menu when CursorPeek is right-clicked.
@@ -47,5 +79,6 @@ This patch release restores the notification-area menu when CursorPeek is right-
 Version 0.1 is intentionally narrow. See
 [Known limitations](docs/KNOWN_LIMITATIONS.md) before installing or running this release.
 
+[0.2.0]: https://github.com/lownamlee/CursorPeek/releases/tag/v0.2.0
 [0.1.1]: https://github.com/lownamlee/CursorPeek/releases/tag/v0.1.1
 [0.1.0]: https://github.com/lownamlee/CursorPeek/releases/tag/v0.1.0

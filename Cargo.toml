@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "windows-cursorpeek"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.97.1"
 description = "A lightweight native hover-preview utility for Windows File Explorer"

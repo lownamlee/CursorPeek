@@ -4,7 +4,7 @@
     name="CursorPeek"
     processorArchitecture="amd64"
     type="win32"
-    version="0.1.1.0"
+    version="0.2.0.0"
   />
   <description>CursorPeek</description>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">

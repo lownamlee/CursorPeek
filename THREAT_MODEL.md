@@ -1,6 +1,6 @@
 # CursorPeek threat model
 
-This model defines CursorPeek's security goals and limitations for version 0.1. It describes the
+This model defines CursorPeek's security goals and limitations for version 0.2. It describes the
 application that is built from this repository; it does not turn the contained worker into a
 sandbox or make guarantees about a compromised Windows account.
 
@@ -35,9 +35,9 @@ contained for failure and resource recovery, not isolated as least privilege.
 
 | Boundary | Untrusted input | Required validation |
 |---|---|---|
-| Explorer to resolver worker | HWNDs, UIA elements, rectangles, cached names, Shell views and paths | Exact Explorer process/class checks, item shape and bounds, active-view correlation, filesystem-path result, foreground/context revalidation |
+| Explorer to resolver worker | HWNDs, UIA elements, rectangles, cached names, Shell views and paths | Exact Explorer process/class/root checks, item shape and bounds, active-view correlation, filesystem-path result, target-context revalidation |
 | Filesystem to preview worker | Path text, links, metadata, attributes, bytes, dimensions and encodings | Drive-absolute input, handle-derived final DOS path, disk/local protocol, no offline/recall attributes, stable handle snapshot, extension plus magic/content checks, bounded reads and checked arithmetic |
-| Coordinator to worker | Pipe frames, generation, point, pointer-travel span, encoding policy and lifecycle | Explicit inherited handles, fixed framing, ordered spans, length limits, ordering, cryptographic session nonce and one active/latest-pending request policy |
+| Coordinator to worker | Pipe frames, generation, Explorer-root identity, point, pointer-travel span, encoding policy and lifecycle | Explicit inherited handles, fixed framing, exact target-root correlation, ordered spans, length limits, ordering, cryptographic session nonce and one active/latest-pending request policy |
 | Worker to coordinator | Status, metadata, text, dimensions and BGRA payload | Nonce handshake, message kind/order, generation, exact payload lengths, UTF-8/scalar/control rules, image-size arithmetic and stale-result rejection |
 | Windows UI to coordinator | Raw Input, hooks, broadcasts, timers and arbitrary window messages | Private message IDs, scalar-only internal messages, handle/context checks, bounded callbacks, panic barriers and generation invalidation |
 | Settings and startup | INI bytes, values, unknown keys, Local AppData and HKCU Run state | UTF-8/size limits, canonical typed values, atomic replacement, quoted exact executable path and per-user registry scope |
@@ -49,7 +49,8 @@ contained for failure and resource recovery, not isolated as least privilege.
 
 UI Automation proves that the point is inside an Explorer item-shaped control. Shell enumeration
 must produce exactly one correlated active view and a filesystem path. The candidate's frame,
-geometry, identity, foreground context, and generation are checked again before dispatch.
+geometry, identity, target Explorer root/view context, and generation are checked again before
+dispatch.
 The coordinator also records the complete pre-preview pointer span. The worker requires that span
 to fit the resolved item rectangle before opening the file, so motion within one item can retain a
 fixed dwell deadline without qualifying a sweep across multiple items.
@@ -97,10 +98,11 @@ panics before they could unwind across the system ABI.
 ### Focus, click, and on-screen disclosure
 
 The preview uses a no-activate window, no-activate positioning, and
-`MA_NOACTIVATEANDEAT`. Foreground Explorer and the resolver-validated item rectangle remain
-prerequisites. Pointer motion inside that rectangle preserves the active generation. Leaving it,
-buttons, wheel input, Escape, selection/foreground changes, lifecycle changes, or a newer
-generation dismiss or invalidate the preview.
+`MA_NOACTIVATEANDEAT`. The resolver-validated item rectangle and its exact visible, unobscured
+Explorer root remain prerequisites; Explorer does not need to own the foreground. Pointer motion
+inside that rectangle preserves the active generation. Foreground changes revalidate the target
+context. Leaving or covering the item, buttons, wheel input, Escape, selection/view changes,
+lifecycle changes, or a newer generation dismiss or invalidate the preview.
 
 Text is rendered inertly: markup, scripts, links, terminal escapes, controls, and bidirectional
 formatting are not executed. Eligible files may still contain secrets, and displaying them during
@@ -132,7 +134,7 @@ the installation directory.
 - Advisory and license automation depends on published metadata and known databases; it is not a
   legal opinion or a malicious-source-code detector.
 - Explorer or a sync provider may hydrate content before CursorPeek observes the final attributes.
-- Version 0.1 packages are unsigned unless the release notes explicitly say otherwise.
+- Version 0.2 packages are unsigned unless the release notes explicitly say otherwise.
 - Touchpad, pen, and RDP behavior can vary with the specific device, driver, or session; it is not
   used as a claimed isolation control.
 
