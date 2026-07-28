@@ -12,7 +12,7 @@ use std::{
 use super::explorer::{
     belongs_to_explorer_window, explorer_window_at, explorer_window_is_available,
     is_explorer_infotip_window, is_foreground_explorer_window_at, point_belongs_to_explorer_window,
-    point_is_explorer_infotip,
+    window_at_physical_point, window_belongs_to_root,
 };
 #[cfg(test)]
 use super::input::registered_raw_devices;
@@ -590,8 +590,10 @@ impl MessageWindow {
                         let point = PhysicalScreenPoint::new(point.x, point.y);
                         let now = Instant::now();
                         let active_preview = self.active_preview;
+                        let preview_handle =
+                            self.preview_window.as_ref().map(PreviewWindow::handle);
                         let shares_target_explorer = active_preview.is_some_and(|active| {
-                            point_belongs_to_active_preview_context(point, active)
+                            point_belongs_to_active_preview_context(point, active, preview_handle)
                         });
                         match classify_preview_pointer_motion(
                             active_preview,
@@ -1016,8 +1018,11 @@ impl MessageWindow {
         let current = physical_cursor_position()
             .ok()
             .map(|point| PhysicalScreenPoint::new(point.x, point.y));
+        let preview_handle = self.preview_window.as_ref().map(PreviewWindow::handle);
         let target_explorer_is_current = explorer_window_is_available(active.explorer_window)
-            && current.is_some_and(|point| point_belongs_to_active_preview_context(point, active));
+            && current.is_some_and(|point| {
+                point_belongs_to_active_preview_context(point, active, preview_handle)
+            });
         if !preview_context_is_current(active.target_bounds, current, target_explorer_is_current) {
             self.cancel_dwell();
             return;
@@ -1417,10 +1422,57 @@ fn classify_preview_pointer_motion(
 fn point_belongs_to_active_preview_context(
     point: PhysicalScreenPoint,
     active: ActivePreview,
+    preview_handle: Option<HWND>,
 ) -> bool {
-    point_belongs_to_explorer_window(point, active.explorer_window)
-        || (active.target_bounds.contains(point)
-            && point_is_explorer_infotip(point, active.explorer_window))
+    let owner = classify_preview_point_owner(point, active, preview_handle);
+    preview_point_owner_shares_context(point, active, owner)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreviewPointOwner {
+    TargetExplorer,
+    ActivePreview,
+    TargetExplorerInfotip,
+    Unrelated,
+}
+
+fn classify_preview_point_owner(
+    point: PhysicalScreenPoint,
+    active: ActivePreview,
+    preview_handle: Option<HWND>,
+) -> PreviewPointOwner {
+    let window = window_at_physical_point(point);
+    classify_preview_window_owner(window, active, preview_handle)
+}
+
+fn classify_preview_window_owner(
+    window: HWND,
+    active: ActivePreview,
+    preview_handle: Option<HWND>,
+) -> PreviewPointOwner {
+    if belongs_to_explorer_window(window, active.explorer_window) {
+        PreviewPointOwner::TargetExplorer
+    } else if preview_handle.is_some_and(|preview| window_belongs_to_root(window, preview)) {
+        PreviewPointOwner::ActivePreview
+    } else if is_explorer_infotip_window(window, active.explorer_window) {
+        PreviewPointOwner::TargetExplorerInfotip
+    } else {
+        PreviewPointOwner::Unrelated
+    }
+}
+
+fn preview_point_owner_shares_context(
+    point: PhysicalScreenPoint,
+    active: ActivePreview,
+    owner: PreviewPointOwner,
+) -> bool {
+    match owner {
+        PreviewPointOwner::TargetExplorer => true,
+        PreviewPointOwner::ActivePreview | PreviewPointOwner::TargetExplorerInfotip => {
+            active.target_bounds.contains(point)
+        }
+        PreviewPointOwner::Unrelated => false,
+    }
 }
 
 fn preview_context_generation_matches(active: Option<ActivePreview>, generation: usize) -> bool {
@@ -1882,12 +1934,14 @@ mod tests {
         EVENT_SYSTEM_FOREGROUND, IsWindow, LPARAM, MessageWindow,
         PREVIEW_CONTEXT_INVALIDATED_MESSAGE, PREVIEW_CONTEXT_REVALIDATE_MESSAGE,
         PREVIEW_WINDOW_DIAGNOSTIC_DURATION, PREVIEW_WINDOW_PRACTICE_DURATION,
-        PREVIEW_ZORDER_REPAIR_MESSAGE, PreviewPointerMotion, SYSTEM_LIFECYCLE_CHANGED_MESSAGE,
-        SystemLifecycleChange, TASKBAR_CREATED_MESSAGE, TEST_PANIC_MESSAGE, TRAY_CALLBACK_MESSAGE,
-        TRAY_EVENT_MESSAGE, WPARAM, accept_worker_completion, classify_preview_pointer_motion,
+        PREVIEW_ZORDER_REPAIR_MESSAGE, PreviewPointOwner, PreviewPointerMotion, PreviewWindow,
+        SYSTEM_LIFECYCLE_CHANGED_MESSAGE, SystemLifecycleChange, TASKBAR_CREATED_MESSAGE,
+        TEST_PANIC_MESSAGE, TRAY_CALLBACK_MESSAGE, TRAY_EVENT_MESSAGE, WPARAM,
+        accept_worker_completion, classify_preview_pointer_motion, classify_preview_window_owner,
         pointer_motion_stays_on_active_target, post_worker_result,
         preview_context_generation_matches, preview_context_is_current, preview_event_message,
-        preview_input_requires_dismissal, registered_raw_devices, timer_interval_ms, tray_status,
+        preview_input_requires_dismissal, preview_point_owner_shares_context,
+        registered_raw_devices, timer_interval_ms, tray_status,
     };
     use crate::hover::{Generation, PhysicalScreenPoint};
     use crate::platform::windows::TrayStatus;
@@ -2294,6 +2348,70 @@ mod tests {
         ));
         assert!(!preview_context_is_current(bounds, Some(anchor), false));
         assert!(!preview_context_is_current(bounds, None, true));
+    }
+
+    #[test]
+    fn preview_ownership_is_bounded_by_the_verified_source_rectangle() {
+        let active = ActivePreview {
+            generation: Generation::from_raw(24),
+            explorer_window: ExplorerWindowId::try_from_raw(1).unwrap(),
+            target_bounds: PhysicalScreenRect::try_new(100, 200, 300, 400).unwrap(),
+        };
+        let inside = PhysicalScreenPoint::new(299, 399);
+        let outside = PhysicalScreenPoint::new(300, 399);
+
+        assert!(preview_point_owner_shares_context(
+            inside,
+            active,
+            PreviewPointOwner::TargetExplorer
+        ));
+        assert!(preview_point_owner_shares_context(
+            outside,
+            active,
+            PreviewPointOwner::TargetExplorer
+        ));
+        for owner in [
+            PreviewPointOwner::ActivePreview,
+            PreviewPointOwner::TargetExplorerInfotip,
+        ] {
+            assert!(preview_point_owner_shares_context(inside, active, owner));
+            assert!(!preview_point_owner_shares_context(outside, active, owner));
+        }
+        assert!(!preview_point_owner_shares_context(
+            inside,
+            active,
+            PreviewPointOwner::Unrelated
+        ));
+    }
+
+    #[test]
+    fn preview_root_is_recognized_as_the_active_preview_owner() {
+        thread::spawn(|| {
+            let preview = PreviewWindow::create().expect("the preview window should be created");
+            let unrelated =
+                PreviewWindow::create().expect("the unrelated window should be created");
+            let active = ActivePreview {
+                generation: Generation::from_raw(24),
+                explorer_window: ExplorerWindowId::try_from_raw(1).unwrap(),
+                target_bounds: PhysicalScreenRect::try_new(100, 200, 300, 400).unwrap(),
+            };
+
+            assert_eq!(
+                classify_preview_window_owner(preview.handle(), active, Some(preview.handle())),
+                PreviewPointOwner::ActivePreview
+            );
+            assert_eq!(
+                classify_preview_window_owner(unrelated.handle(), active, Some(preview.handle())),
+                PreviewPointOwner::Unrelated
+            );
+            assert!(preview_point_owner_shares_context(
+                PhysicalScreenPoint::new(299, 399),
+                active,
+                PreviewPointOwner::ActivePreview
+            ));
+        })
+        .join()
+        .expect("the preview ownership test thread should not panic");
     }
 
     #[test]

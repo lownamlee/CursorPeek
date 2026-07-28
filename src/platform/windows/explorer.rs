@@ -26,21 +26,14 @@ const TOOLTIP_WINDOW_CLASS: &[u8] = b"tooltips_class32";
 const EXPLORER_IMAGE_NAME: &[u8] = b"explorer.exe";
 
 pub(super) fn explorer_window_at(point: PhysicalScreenPoint) -> Option<ExplorerWindowId> {
-    explorer_window_id(root_window(window_at(point))?)
+    explorer_window_id(root_window(window_at_physical_point(point))?)
 }
 
 pub(super) fn point_belongs_to_explorer_window(
     point: PhysicalScreenPoint,
     expected: ExplorerWindowId,
 ) -> bool {
-    root_window(window_at(point)).and_then(window_id) == Some(expected)
-}
-
-pub(super) fn point_is_explorer_infotip(
-    point: PhysicalScreenPoint,
-    expected: ExplorerWindowId,
-) -> bool {
-    is_explorer_infotip_window(window_at(point), expected)
+    root_window(window_at_physical_point(point)).and_then(window_id) == Some(expected)
 }
 
 pub(super) fn is_explorer_infotip_window(window: HWND, expected: ExplorerWindowId) -> bool {
@@ -64,7 +57,7 @@ pub(super) fn explorer_window_is_available(expected: ExplorerWindowId) -> bool {
 }
 
 pub(super) fn is_foreground_explorer_window_at(point: PhysicalScreenPoint) -> bool {
-    let Some(point_root) = root_window(window_at(point)) else {
+    let Some(point_root) = root_window(window_at_physical_point(point)) else {
         return false;
     };
 
@@ -87,7 +80,11 @@ pub(super) fn belongs_to_explorer_window(window: HWND, expected: ExplorerWindowI
     root_window(window).and_then(window_id) == Some(expected)
 }
 
-fn window_at(point: PhysicalScreenPoint) -> HWND {
+pub(super) fn window_belongs_to_root(window: HWND, expected_root: HWND) -> bool {
+    !expected_root.0.is_null() && root_window(window) == Some(expected_root)
+}
+
+pub(super) fn window_at_physical_point(point: PhysicalScreenPoint) -> HWND {
     // SAFETY: `point` contains physical screen coordinates sampled by GetPhysicalCursorPos.
     // The returned HWND is borrowed and used only for synchronous queries.
     unsafe {
