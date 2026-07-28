@@ -8,4 +8,6 @@ pub mod payload;
 pub mod protocol;
 pub mod sniff;
 
-pub use types::{Generation, LegacyEncoding, PhysicalScreenPoint, PhysicalScreenRect};
+pub use types::{
+    Generation, LegacyEncoding, PhysicalScreenPoint, PhysicalScreenRect, PhysicalScreenSpan,
+};

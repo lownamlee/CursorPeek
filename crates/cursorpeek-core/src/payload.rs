@@ -33,6 +33,7 @@ pub enum ResolverStatus {
     Ambiguous = 2,
     Unavailable = 3,
     TimedOut = 4,
+    PointerMoved = 5,
 }
 
 impl ResolverStatus {
@@ -43,6 +44,7 @@ impl ResolverStatus {
             2 => Ok(Self::Ambiguous),
             3 => Ok(Self::Unavailable),
             4 => Ok(Self::TimedOut),
+            5 => Ok(Self::PointerMoved),
             _ => Err(PayloadError::UnknownResolverStatus(value)),
         }
     }
@@ -776,6 +778,7 @@ mod tests {
             ResolverStatus::Ambiguous,
             ResolverStatus::Unavailable,
             ResolverStatus::TimedOut,
+            ResolverStatus::PointerMoved,
         ] {
             let result = PreviewResult::Status(status);
             assert_eq!(decode_result(&encode_result(&result).unwrap()), Ok(result));

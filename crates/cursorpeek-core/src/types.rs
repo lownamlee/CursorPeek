@@ -28,6 +28,75 @@ impl PhysicalScreenPoint {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhysicalScreenSpan {
+    min_x: i32,
+    min_y: i32,
+    max_x: i32,
+    max_y: i32,
+}
+
+impl PhysicalScreenSpan {
+    pub const fn from_point(point: PhysicalScreenPoint) -> Self {
+        Self {
+            min_x: point.x,
+            min_y: point.y,
+            max_x: point.x,
+            max_y: point.y,
+        }
+    }
+
+    pub const fn try_new(min_x: i32, min_y: i32, max_x: i32, max_y: i32) -> Option<Self> {
+        if min_x <= max_x && min_y <= max_y {
+            Some(Self {
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn include(&mut self, point: PhysicalScreenPoint) {
+        self.min_x = self.min_x.min(point.x);
+        self.min_y = self.min_y.min(point.y);
+        self.max_x = self.max_x.max(point.x);
+        self.max_y = self.max_y.max(point.y);
+    }
+
+    pub const fn min_x(self) -> i32 {
+        self.min_x
+    }
+
+    pub const fn min_y(self) -> i32 {
+        self.min_y
+    }
+
+    pub const fn max_x(self) -> i32 {
+        self.max_x
+    }
+
+    pub const fn max_y(self) -> i32 {
+        self.max_y
+    }
+
+    pub const fn contains(self, point: PhysicalScreenPoint) -> bool {
+        self.min_x <= point.x
+            && point.x <= self.max_x
+            && self.min_y <= point.y
+            && point.y <= self.max_y
+    }
+
+    pub const fn fits_within(self, bounds: PhysicalScreenRect) -> bool {
+        bounds.left <= self.min_x
+            && self.max_x < bounds.right
+            && bounds.top <= self.min_y
+            && self.max_y < bounds.bottom
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PhysicalScreenRect {
     left: i32,
     top: i32,
@@ -125,7 +194,9 @@ fn is_encoding_label(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Generation, LegacyEncoding, PhysicalScreenPoint, PhysicalScreenRect};
+    use super::{
+        Generation, LegacyEncoding, PhysicalScreenPoint, PhysicalScreenRect, PhysicalScreenSpan,
+    };
 
     #[test]
     fn protocol_value_types_preserve_extreme_values() {
@@ -162,5 +233,20 @@ mod tests {
         assert!(!bounds.contains(PhysicalScreenPoint::new(30, 39)));
         assert!(!bounds.contains(PhysicalScreenPoint::new(29, 40)));
         assert!(!bounds.contains(PhysicalScreenPoint::new(-11, -20)));
+    }
+
+    #[test]
+    fn physical_spans_accumulate_inclusive_pointer_extremes() {
+        let mut span = PhysicalScreenSpan::from_point(PhysicalScreenPoint::new(20, -10));
+        span.include(PhysicalScreenPoint::new(-5, 30));
+        span.include(PhysicalScreenPoint::new(8, 4));
+
+        assert_eq!(span, PhysicalScreenSpan::try_new(-5, -10, 20, 30).unwrap());
+        assert!(span.contains(PhysicalScreenPoint::new(8, 4)));
+        assert!(!span.contains(PhysicalScreenPoint::new(21, 4)));
+        assert!(span.fits_within(PhysicalScreenRect::try_new(-5, -10, 21, 31).unwrap()));
+        assert!(!span.fits_within(PhysicalScreenRect::try_new(-4, -10, 21, 31).unwrap()));
+        assert!(!span.fits_within(PhysicalScreenRect::try_new(-5, -10, 20, 31).unwrap()));
+        assert_eq!(PhysicalScreenSpan::try_new(1, 0, 0, 1), None);
     }
 }

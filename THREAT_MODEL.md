@@ -37,7 +37,7 @@ contained for failure and resource recovery, not isolated as least privilege.
 |---|---|---|
 | Explorer to resolver worker | HWNDs, UIA elements, rectangles, cached names, Shell views and paths | Exact Explorer process/class checks, item shape and bounds, active-view correlation, filesystem-path result, foreground/context revalidation |
 | Filesystem to preview worker | Path text, links, metadata, attributes, bytes, dimensions and encodings | Drive-absolute input, handle-derived final DOS path, disk/local protocol, no offline/recall attributes, stable handle snapshot, extension plus magic/content checks, bounded reads and checked arithmetic |
-| Coordinator to worker | Pipe frames, generation, point, encoding policy and lifecycle | Explicit inherited handles, fixed framing, length limits, ordering, cryptographic session nonce and one active/latest-pending request policy |
+| Coordinator to worker | Pipe frames, generation, point, pointer-travel span, encoding policy and lifecycle | Explicit inherited handles, fixed framing, ordered spans, length limits, ordering, cryptographic session nonce and one active/latest-pending request policy |
 | Worker to coordinator | Status, metadata, text, dimensions and BGRA payload | Nonce handshake, message kind/order, generation, exact payload lengths, UTF-8/scalar/control rules, image-size arithmetic and stale-result rejection |
 | Windows UI to coordinator | Raw Input, hooks, broadcasts, timers and arbitrary window messages | Private message IDs, scalar-only internal messages, handle/context checks, bounded callbacks, panic barriers and generation invalidation |
 | Settings and startup | INI bytes, values, unknown keys, Local AppData and HKCU Run state | UTF-8/size limits, canonical typed values, atomic replacement, quoted exact executable path and per-user registry scope |
@@ -50,6 +50,9 @@ contained for failure and resource recovery, not isolated as least privilege.
 UI Automation proves that the point is inside an Explorer item-shaped control. Shell enumeration
 must produce exactly one correlated active view and a filesystem path. The candidate's frame,
 geometry, identity, foreground context, and generation are checked again before dispatch.
+The coordinator also records the complete pre-preview pointer span. The worker requires that span
+to fit the resolved item rectangle before opening the file, so motion within one item can retain a
+fixed dwell deadline without qualifying a sweep across multiple items.
 
 The worker opens the file with a stable handle, rejects non-disk and remote-protocol handles,
 derives the final DOS path from that handle, captures file identity/size/timestamps, and reads from

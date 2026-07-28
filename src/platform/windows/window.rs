@@ -17,7 +17,6 @@ use super::explorer::{
 use super::input::registered_raw_devices;
 use super::input::{
     RawInputActivity, RawInputRegistration, physical_cursor_position, read_raw_input_activity,
-    system_hover_rectangle,
 };
 
 use crate::hover::{
@@ -27,8 +26,8 @@ use crate::hover::{
 use crate::preview::{PreviewPlacement, PreviewSize};
 use crate::settings::{SettingsDocument, SettingsFile, Theme};
 use crate::worker::{
-    CompletionNotifier, PendingWorkerPoll, PendingWorkerResolution, PreviewResult, WorkerManager,
-    WorkerManagerError,
+    CompletionNotifier, PendingWorkerPoll, PendingWorkerResolution, PreviewResult, ResolverStatus,
+    WorkerManager, WorkerManagerError,
 };
 use cursorpeek_core::PhysicalScreenRect;
 
@@ -586,7 +585,7 @@ impl MessageWindow {
                                 self.restart_dwell_after_preview(point, now);
                             }
                             PreviewPointerMotion::Restart => {
-                                self.restart_dwell(point, now);
+                                self.track_or_restart_dwell(point, now);
                             }
                             PreviewPointerMotion::Cancel => self.cancel_dwell(),
                         }
@@ -664,6 +663,23 @@ impl MessageWindow {
         self.arm_dwell(interval);
     }
 
+    fn track_or_restart_dwell(&mut self, point: PhysicalScreenPoint, now: Instant) {
+        match self.hover_state.tracking_anchor() {
+            Some(anchor) if points_share_foreground_explorer(anchor, point) => {
+                let tracked = self.hover_state.track_motion(point);
+                debug_assert!(tracked, "a retained anchor belongs to tracked hover state");
+            }
+            Some(_) if is_foreground_explorer_window_at(point) => {
+                self.restart_dwell(point, now);
+            }
+            Some(_) => self.cancel_dwell(),
+            None if is_foreground_explorer_window_at(point) => {
+                self.restart_dwell(point, now);
+            }
+            None => self.cancel_dwell(),
+        }
+    }
+
     fn restart_dwell_after_preview(&mut self, point: PhysicalScreenPoint, now: Instant) {
         let interval = self.hover_state.restart_after_preview(point, now);
         self.arm_dwell(interval);
@@ -713,29 +729,22 @@ impl MessageWindow {
                 }
             }
             DwellTimerEvent::Candidate(candidate) => {
-                let ready = physical_cursor_position()
-                    .map(|point| PhysicalScreenPoint::new(point.x, point.y))
-                    .and_then(|current| {
-                        let rectangle = system_hover_rectangle(candidate.anchor())?;
-                        Ok(candidate.validate(current, rectangle))
-                    })
-                    .ok()
-                    .flatten();
-
-                let Some(ready) = ready else {
+                let Some(current) = self.refresh_tracked_pointer() else {
                     self.cancel_dwell();
                     return;
                 };
-
+                let candidate = candidate.include(current);
                 // Keep the validated generation attached through the manager, protocol, and UI
                 // delivery boundaries so later input can invalidate this exact request.
-                let (generation, point) = ready.into_parts();
-                if !is_explorer_window_at(point) {
+                let (generation, anchor, point, pointer_span) = candidate.into_parts();
+                if !points_share_foreground_explorer(anchor, point) || !is_explorer_window_at(point)
+                {
                     self.cancel_dwell();
                     return;
                 }
 
                 if !self.ensure_worker_manager_running() {
+                    self.hover_state.finish_resolution(generation);
                     return;
                 }
                 let manager = self
@@ -743,13 +752,15 @@ impl MessageWindow {
                     .as_ref()
                     .expect("a successful recovery check retains the worker manager");
                 let notifier = worker_result_notifier(self.hwnd);
-                let pending = match manager.submit_with_notifier(generation, point, notifier) {
-                    Ok(pending) => pending,
-                    Err(_) => {
-                        self.set_worker_recovering(true);
-                        return;
-                    }
-                };
+                let pending =
+                    match manager.submit_with_notifier(generation, point, pointer_span, notifier) {
+                        Ok(pending) => pending,
+                        Err(_) => {
+                            self.hover_state.finish_resolution(generation);
+                            self.set_worker_recovering(true);
+                            return;
+                        }
+                    };
 
                 self.pending_worker_resolution = Some(pending);
                 self.pending_worker_anchor = Some((generation, point));
@@ -781,9 +792,20 @@ impl MessageWindow {
                             && generation == anchor_generation
                         {
                             let (target_bounds, result) = resolution.into_parts();
-                            if let Some(target_bounds) = target_bounds {
+                            let current = self.refresh_tracked_pointer();
+                            if result.status() == Some(ResolverStatus::PointerMoved) {
+                                self.restart_after_pointer_span_rejection(current);
+                            } else if current.is_some()
+                                && let Some(target_bounds) = target_bounds
+                                && self
+                                    .hover_state
+                                    .tracked_span_fits(generation, target_bounds)
+                            {
                                 self.show_worker_result(point, target_bounds, result);
+                            } else if target_bounds.is_some() {
+                                self.restart_after_pointer_span_rejection(current);
                             } else {
+                                self.hover_state.finish_resolution(generation);
                                 self.hide_product_preview();
                             }
                         } else {
@@ -794,11 +816,34 @@ impl MessageWindow {
                         if !error.is_request_cancellation() {
                             self.set_worker_recovering(true);
                         }
+                        self.hover_state
+                            .finish_resolution(self.hover_state.generation());
                         self.latest_worker_completion = None;
                         self.hide_product_preview();
                     }
                 }
             }
+        }
+    }
+
+    fn refresh_tracked_pointer(&mut self) -> Option<PhysicalScreenPoint> {
+        let anchor = self.hover_state.tracking_anchor()?;
+        let point = physical_cursor_position()
+            .ok()
+            .map(|point| PhysicalScreenPoint::new(point.x, point.y))?;
+        if !points_share_foreground_explorer(anchor, point) {
+            return None;
+        }
+        self.hover_state.track_motion(point).then_some(point)
+    }
+
+    fn restart_after_pointer_span_rejection(&mut self, current: Option<PhysicalScreenPoint>) {
+        if let Some(point) = current
+            && is_foreground_explorer_window_at(point)
+        {
+            self.restart_dwell(point, Instant::now());
+        } else {
+            self.cancel_dwell();
         }
     }
 

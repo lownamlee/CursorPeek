@@ -24,7 +24,9 @@ use crate::{
     platform::{ContainedWorker, ProcessError, WorkerPipes},
     settings::LegacyEncoding,
 };
-use cursorpeek_core::{PhysicalScreenRect, protocol::DEFAULT_PREVIEW_CACHE_ENTRIES};
+use cursorpeek_core::{
+    PhysicalScreenRect, PhysicalScreenSpan, protocol::DEFAULT_PREVIEW_CACHE_ENTRIES,
+};
 
 use super::{
     payload::{PreviewResult, ResolverStatus},
@@ -249,12 +251,16 @@ impl WorkerManager {
         &self,
         generation: Generation,
         point: PhysicalScreenPoint,
+        pointer_span: PhysicalScreenSpan,
         notifier: CompletionNotifier,
     ) -> Result<PendingWorkerResolution, WorkerManagerError> {
         Ok(PendingWorkerResolution {
-            receiver: self
-                .requests
-                .submit_with_notifier(generation, point, notifier)?,
+            receiver: self.requests.submit_with_notifier(
+                generation,
+                point,
+                pointer_span,
+                notifier,
+            )?,
         })
     }
 
@@ -378,6 +384,7 @@ pub(crate) enum PendingWorkerPoll {
 struct PendingRequest {
     generation: Generation,
     point: PhysicalScreenPoint,
+    pointer_span: PhysicalScreenSpan,
     response_sender: SyncSender<Result<WorkerResolution, WorkerManagerError>>,
     completion_notifier: Option<CompletionNotifier>,
 }
@@ -453,22 +460,29 @@ impl LatestRequestMailbox {
         generation: Generation,
         point: PhysicalScreenPoint,
     ) -> Result<Receiver<Result<WorkerResolution, WorkerManagerError>>, WorkerManagerError> {
-        self.submit_request(generation, point, None)
+        self.submit_request(
+            generation,
+            point,
+            PhysicalScreenSpan::from_point(point),
+            None,
+        )
     }
 
     fn submit_with_notifier(
         &self,
         generation: Generation,
         point: PhysicalScreenPoint,
+        pointer_span: PhysicalScreenSpan,
         notifier: CompletionNotifier,
     ) -> Result<Receiver<Result<WorkerResolution, WorkerManagerError>>, WorkerManagerError> {
-        self.submit_request(generation, point, Some(notifier))
+        self.submit_request(generation, point, pointer_span, Some(notifier))
     }
 
     fn submit_request(
         &self,
         generation: Generation,
         point: PhysicalScreenPoint,
+        pointer_span: PhysicalScreenSpan,
         completion_notifier: Option<CompletionNotifier>,
     ) -> Result<Receiver<Result<WorkerResolution, WorkerManagerError>>, WorkerManagerError> {
         let (response_sender, response_receiver) = mpsc::sync_channel(1);
@@ -484,6 +498,7 @@ impl LatestRequestMailbox {
             let replaced = state.pending.replace(PendingRequest {
                 generation,
                 point,
+                pointer_span,
                 response_sender,
                 completion_notifier,
             });
@@ -629,6 +644,7 @@ fn manager_loop(
             MailboxTake::Request(PendingRequest {
                 generation,
                 point,
+                pointer_span,
                 response_sender,
                 completion_notifier,
             }) => {
@@ -651,7 +667,7 @@ fn manager_loop(
                 let result = session
                     .as_ref()
                     .expect("a session is created before request dispatch")
-                    .resolve(generation, point);
+                    .resolve(generation, point, pointer_span);
                 last_used = Instant::now();
 
                 match result {
@@ -837,6 +853,7 @@ impl WorkerSession {
         &self,
         generation: Generation,
         point: PhysicalScreenPoint,
+        pointer_span: PhysicalScreenSpan,
     ) -> Result<WorkerResponse, WorkerManagerError> {
         let (response_sender, response_receiver) = mpsc::sync_channel(1);
         self.command_sender
@@ -845,6 +862,7 @@ impl WorkerSession {
             .send(ProtocolCommand {
                 generation,
                 point,
+                pointer_span,
                 response_sender,
             })
             .map_err(|_| WorkerManagerError::ProtocolChannelDisconnected)?;
@@ -911,6 +929,7 @@ impl WorkerSession {
 struct ProtocolCommand {
     generation: Generation,
     point: PhysicalScreenPoint,
+    pointer_span: PhysicalScreenSpan,
     response_sender: SyncSender<Result<WorkerResponse, WorkerManagerError>>,
 }
 
@@ -954,6 +973,7 @@ fn protocol_loop(
                 WorkerMessage::ResolvePoint {
                     generation: command.generation,
                     point: command.point,
+                    pointer_span: command.pointer_span,
                 },
             )?;
             validate_result(
@@ -1315,7 +1335,7 @@ mod tests {
             protocol::{SessionNonce, WorkerMessage},
         },
     };
-    use cursorpeek_core::PhysicalScreenRect;
+    use cursorpeek_core::{PhysicalScreenRect, PhysicalScreenSpan};
     use std::{
         sync::atomic::{AtomicUsize, Ordering},
         thread,
@@ -1461,6 +1481,10 @@ mod tests {
         };
         assert_eq!(pending.generation, Generation::from_raw(2));
         assert_eq!(pending.point, PhysicalScreenPoint::new(2, 2));
+        assert_eq!(
+            pending.pointer_span,
+            PhysicalScreenSpan::from_point(PhysicalScreenPoint::new(2, 2))
+        );
         pending
             .response_sender
             .send(Ok(WorkerResolution {
@@ -1489,6 +1513,7 @@ mod tests {
             .submit_with_notifier(
                 Generation::from_raw(1),
                 PhysicalScreenPoint::new(1, 1),
+                PhysicalScreenSpan::from_point(PhysicalScreenPoint::new(1, 1)),
                 CompletionNotifier::new(1, record_notification),
             )
             .unwrap();

@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{
-    Generation, LegacyEncoding, PhysicalScreenPoint, PhysicalScreenRect,
+    Generation, LegacyEncoding, PhysicalScreenPoint, PhysicalScreenRect, PhysicalScreenSpan,
     payload::{
         MAX_PREVIEW_PAYLOAD_LEN, MIN_PREVIEW_RESULT_LEN, PayloadError, PreviewResult,
         decode_result, encode_result,
@@ -13,7 +13,7 @@ use crate::{
 };
 
 const MAGIC: [u8; 4] = *b"CPWK";
-const VERSION: u16 = 7;
+const VERSION: u16 = 8;
 const HEADER_LEN: usize = 24;
 const NONCE_LEN: usize = 16;
 const CACHE_ENTRIES_LEN: usize = 2;
@@ -50,6 +50,7 @@ pub enum WorkerMessage {
     ResolvePoint {
         generation: Generation,
         point: PhysicalScreenPoint,
+        pointer_span: PhysicalScreenSpan,
     },
     PreviewResult {
         generation: Generation,
@@ -104,7 +105,7 @@ impl MessageKind {
                 NONCE_LEN + CACHE_ENTRIES_LEN + MAX_LEGACY_ENCODING_WIRE_LEN,
             ),
             Self::Ready => (NONCE_LEN, NONCE_LEN),
-            Self::ResolvePoint => (8, 8),
+            Self::ResolvePoint => (24, 24),
             Self::PreviewResult => (MIN_PREVIEW_RESPONSE_LEN, MAX_PREVIEW_RESPONSE_LEN),
         }
     }
@@ -187,6 +188,7 @@ pub enum ProtocolError {
     },
     InvalidLegacyEncoding,
     InvalidCacheEntries(u16),
+    InvalidPointerSpan,
     InvalidTargetBoundsFlag(u8),
     InvalidTargetBounds,
     MissingTargetBounds,
@@ -257,6 +259,12 @@ impl fmt::Display for ProtocolError {
                 write!(
                     formatter,
                     "worker cache entry limit {entries} exceeds {MAX_PREVIEW_CACHE_ENTRIES}"
+                )
+            }
+            Self::InvalidPointerSpan => {
+                write!(
+                    formatter,
+                    "worker request contains an unordered pointer span"
                 )
             }
             Self::InvalidTargetBoundsFlag(flag) => {
@@ -426,10 +434,21 @@ fn encode_message(message: WorkerMessage) -> Result<EncodedMessage, ProtocolErro
             payload
         }
         WorkerMessage::Ready { nonce } => nonce.0.to_vec(),
-        WorkerMessage::ResolvePoint { point, .. } => {
-            let mut payload = Vec::with_capacity(8);
+        WorkerMessage::ResolvePoint {
+            point,
+            pointer_span,
+            ..
+        } => {
+            if !pointer_span.contains(point) {
+                return Err(ProtocolError::InvalidPointerSpan);
+            }
+            let mut payload = Vec::with_capacity(24);
             payload.extend_from_slice(&point.x.to_le_bytes());
             payload.extend_from_slice(&point.y.to_le_bytes());
+            payload.extend_from_slice(&pointer_span.min_x().to_le_bytes());
+            payload.extend_from_slice(&pointer_span.min_y().to_le_bytes());
+            payload.extend_from_slice(&pointer_span.max_x().to_le_bytes());
+            payload.extend_from_slice(&pointer_span.max_y().to_le_bytes());
             payload
         }
         WorkerMessage::PreviewResult {
@@ -494,13 +513,24 @@ fn decode_payload(header: FrameHeader, payload: &[u8]) -> Result<WorkerMessage, 
                 nonce: SessionNonce(nonce),
             })
         }
-        MessageKind::ResolvePoint => Ok(WorkerMessage::ResolvePoint {
-            generation: header.generation,
-            point: PhysicalScreenPoint::new(
-                i32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]),
-                i32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]),
-            ),
-        }),
+        MessageKind::ResolvePoint => {
+            let point = PhysicalScreenPoint::new(read_i32(payload, 0), read_i32(payload, 4));
+            let pointer_span = PhysicalScreenSpan::try_new(
+                read_i32(payload, 8),
+                read_i32(payload, 12),
+                read_i32(payload, 16),
+                read_i32(payload, 20),
+            )
+            .ok_or(ProtocolError::InvalidPointerSpan)?;
+            if !pointer_span.contains(point) {
+                return Err(ProtocolError::InvalidPointerSpan);
+            }
+            Ok(WorkerMessage::ResolvePoint {
+                generation: header.generation,
+                point,
+                pointer_span,
+            })
+        }
         MessageKind::PreviewResult => {
             let (target_bounds, result) = decode_preview_response(payload)?;
             Ok(WorkerMessage::PreviewResult {
@@ -510,6 +540,14 @@ fn decode_payload(header: FrameHeader, payload: &[u8]) -> Result<WorkerMessage, 
             })
         }
     }
+}
+
+fn read_i32(bytes: &[u8], offset: usize) -> i32 {
+    i32::from_le_bytes(
+        bytes[offset..offset + 4]
+            .try_into()
+            .expect("validated fixed-size protocol payload contains a complete i32"),
+    )
 }
 
 fn encode_preview_response(
@@ -608,7 +646,7 @@ mod tests {
         VERSION, WorkerMessage, decode_frame, encode_message, read_message, write_message,
     };
     use crate::{
-        Generation, LegacyEncoding, PhysicalScreenPoint, PhysicalScreenRect,
+        Generation, LegacyEncoding, PhysicalScreenPoint, PhysicalScreenRect, PhysicalScreenSpan,
         payload::{PayloadError, PreviewResult, ResolverStatus, TextPreview},
     };
     use std::io::{self, ErrorKind, Read, Write};
@@ -647,6 +685,7 @@ mod tests {
         WorkerMessage::ResolvePoint {
             generation: Generation::from_raw(0x0102_0304_0506_0708),
             point: PhysicalScreenPoint::new(-2, 0x0102_0304),
+            pointer_span: PhysicalScreenSpan::try_new(-10, -20, 30, 0x0102_0304).unwrap(),
         }
     }
 
@@ -682,6 +721,7 @@ mod tests {
             ResolverStatus::Ambiguous,
             ResolverStatus::Unavailable,
             ResolverStatus::TimedOut,
+            ResolverStatus::PointerMoved,
         ] {
             let message = WorkerMessage::PreviewResult {
                 generation: Generation::from_raw(9),
@@ -775,6 +815,25 @@ mod tests {
     }
 
     #[test]
+    fn unordered_pointer_spans_fail_closed() {
+        let encoded = encode_message(request_message()).unwrap();
+        let mut inverted = encoded.bytes;
+        inverted[HEADER_LEN + 8..HEADER_LEN + 12].copy_from_slice(&31_i32.to_le_bytes());
+
+        assert_eq!(
+            decode_frame(&inverted),
+            Err(ProtocolError::InvalidPointerSpan)
+        );
+
+        let mut missing_point = encode_message(request_message()).unwrap().bytes;
+        missing_point[HEADER_LEN + 8..HEADER_LEN + 12].copy_from_slice(&(-1_i32).to_le_bytes());
+        assert_eq!(
+            decode_frame(&missing_point),
+            Err(ProtocolError::InvalidPointerSpan)
+        );
+    }
+
+    #[test]
     fn encoding_has_a_stable_little_endian_layout() {
         let encoded = encode_message(request_message()).unwrap();
         let bytes = encoded.as_bytes();
@@ -782,11 +841,15 @@ mod tests {
         assert_eq!(&bytes[..4], &MAGIC);
         assert_eq!(&bytes[4..6], &VERSION.to_le_bytes());
         assert_eq!(&bytes[6..8], &3_u16.to_le_bytes());
-        assert_eq!(&bytes[8..12], &8_u32.to_le_bytes());
+        assert_eq!(&bytes[8..12], &24_u32.to_le_bytes());
         assert_eq!(&bytes[12..16], &[0; 4]);
         assert_eq!(&bytes[16..24], &0x0102_0304_0506_0708_u64.to_le_bytes());
         assert_eq!(&bytes[24..28], &(-2_i32).to_le_bytes());
         assert_eq!(&bytes[28..32], &0x0102_0304_i32.to_le_bytes());
+        assert_eq!(&bytes[32..36], &(-10_i32).to_le_bytes());
+        assert_eq!(&bytes[36..40], &(-20_i32).to_le_bytes());
+        assert_eq!(&bytes[40..44], &30_i32.to_le_bytes());
+        assert_eq!(&bytes[44..48], &0x0102_0304_i32.to_le_bytes());
 
         let encoded = encode_message(hello(LegacyEncoding::Auto)).unwrap();
         let bytes = encoded.as_bytes();
@@ -924,6 +987,10 @@ mod tests {
         let message = WorkerMessage::ResolvePoint {
             generation: Generation::from_raw(42),
             point: PhysicalScreenPoint::new(i32::MIN, i32::MAX),
+            pointer_span: PhysicalScreenSpan::from_point(PhysicalScreenPoint::new(
+                i32::MIN,
+                i32::MAX,
+            )),
         };
         let mut writer = FragmentedWriter::default();
         write_message(&mut writer, message.clone()).unwrap();

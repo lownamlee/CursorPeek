@@ -4,26 +4,16 @@ use std::{
     rc::Rc,
 };
 
-use crate::hover::{HoverRectangle, PhysicalScreenPoint};
-
 use windows::{
     Win32::{
         Foundation::{HWND, LPARAM, POINT},
         UI::{
-            HiDpi::{
-                DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_UNAWARE, GetDpiForWindow,
-                SetThreadDpiAwarenessContext,
-            },
             Input::{
                 GetRawInputData, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT, RAWINPUTDEVICE,
                 RAWINPUTDEVICE_FLAGS, RAWINPUTHEADER, RAWMOUSE, RID_INPUT, RIDEV_INPUTSINK,
                 RIDEV_REMOVE, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE, RegisterRawInputDevices,
             },
-            WindowsAndMessaging::{
-                GetPhysicalCursorPos, SPI_GETMOUSEHOVERHEIGHT, SPI_GETMOUSEHOVERWIDTH,
-                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
-                WindowFromPhysicalPoint,
-            },
+            WindowsAndMessaging::GetPhysicalCursorPos,
         },
     },
     core::{Error, Result},
@@ -100,61 +90,6 @@ pub(super) fn physical_cursor_position() -> Result<POINT> {
     Ok(point)
 }
 
-pub(super) fn system_hover_rectangle(anchor: PhysicalScreenPoint) -> Result<HoverRectangle> {
-    let point = POINT {
-        x: anchor.x,
-        y: anchor.y,
-    };
-
-    // SAFETY: `point` contains physical screen coordinates from GetPhysicalCursorPos. The
-    // returned HWND is borrowed only long enough to query its DPI and is never released here.
-    let target = unsafe { WindowFromPhysicalPoint(point) };
-    if target.0.is_null() {
-        return Err(Error::from_thread());
-    }
-
-    // SAFETY: `target` is the live borrowed HWND returned immediately above. A zero result is
-    // documented as failure and is rejected before it reaches safe scaling arithmetic.
-    let target_dpi = unsafe { GetDpiForWindow(target) };
-    if target_dpi == 0 {
-        return Err(Error::from_thread());
-    }
-
-    let (width, height) = hover_dimensions_at_96_dpi()?;
-    HoverRectangle::from_96_dpi(width, height, target_dpi).ok_or_else(Error::from_thread)
-}
-
-fn hover_dimensions_at_96_dpi() -> Result<(u32, u32)> {
-    let mut context = ThreadDpiContext::enter_unaware()?;
-    let mut width = 0_u32;
-    let mut height = 0_u32;
-
-    let query_result: Result<()> = (|| {
-        // SAFETY: Each output pointer addresses one live, aligned u32 for the complete call.
-        // These GET actions require uiParam/fWinIni zero and write only their documented UINT.
-        unsafe {
-            SystemParametersInfoW(
-                SPI_GETMOUSEHOVERWIDTH,
-                0,
-                Some((&mut width as *mut u32).cast()),
-                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS::default(),
-            )?;
-            SystemParametersInfoW(
-                SPI_GETMOUSEHOVERHEIGHT,
-                0,
-                Some((&mut height as *mut u32).cast()),
-                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS::default(),
-            )?;
-        }
-        Ok(())
-    })();
-    let restore_result = context.restore();
-
-    query_result?;
-    restore_result?;
-    Ok((width, height))
-}
-
 pub(super) fn read_raw_input_activity(lparam: LPARAM) -> Result<Option<RawInputActivity>> {
     let handle = HRAWINPUT(lparam.0 as _);
     let mut raw_input = MaybeUninit::<RAWINPUT>::uninit();
@@ -198,55 +133,6 @@ pub(super) fn read_raw_input_activity(lparam: LPARAM) -> Result<Option<RawInputA
         Ok(Some(RawInputActivity::Keyboard))
     } else {
         Ok(None)
-    }
-}
-
-struct ThreadDpiContext {
-    previous: Option<DPI_AWARENESS_CONTEXT>,
-    _thread_affinity: PhantomData<Rc<()>>,
-}
-
-impl ThreadDpiContext {
-    fn enter_unaware() -> Result<Self> {
-        // SAFETY: This changes only the calling thread. The returned previous context is retained
-        // by this !Send guard and restored before the platform query returns.
-        let previous = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE) };
-        if previous.0.is_null() {
-            return Err(Error::from_thread());
-        }
-
-        Ok(Self {
-            previous: Some(previous),
-            _thread_affinity: PhantomData,
-        })
-    }
-
-    fn restore(&mut self) -> Result<()> {
-        let Some(previous) = self.previous else {
-            return Ok(());
-        };
-
-        // SAFETY: `previous` came from the successful context switch on this same thread. It is
-        // consumed only after Windows reports that the prior context was restored.
-        let replaced = unsafe { SetThreadDpiAwarenessContext(previous) };
-        if replaced.0.is_null() {
-            return Err(Error::from_thread());
-        }
-
-        self.previous = None;
-        Ok(())
-    }
-}
-
-impl Drop for ThreadDpiContext {
-    fn drop(&mut self) {
-        if let Some(previous) = self.previous.take() {
-            // SAFETY: The !Send guard drops on the thread where the successful switch occurred.
-            // This is the best-effort retry used only if explicit restoration reported failure.
-            unsafe {
-                let _ = SetThreadDpiAwarenessContext(previous);
-            }
-        }
     }
 }
 
@@ -334,10 +220,8 @@ pub(super) fn registered_raw_devices() -> Result<Vec<RAWINPUTDEVICE>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RawMouseActivity, physical_cursor_position, system_hover_rectangle};
-    use crate::hover::PhysicalScreenPoint;
+    use super::RawMouseActivity;
     use windows::Win32::UI::{
-        HiDpi::{AreDpiAwarenessContextsEqual, GetThreadDpiAwarenessContext},
         Input::{MOUSE_MOVE_ABSOLUTE, MOUSE_MOVE_RELATIVE, RAWMOUSE, RAWMOUSE_0, RAWMOUSE_0_0},
         WindowsAndMessaging::{RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_WHEEL},
     };
@@ -400,30 +284,6 @@ mod tests {
                 moved: true,
                 button_or_wheel: true,
             }
-        );
-    }
-
-    #[test]
-    fn system_hover_query_restores_the_calling_thread_context() {
-        // SAFETY: Reading the current thread context has no pointer or ownership requirements.
-        let before = unsafe { GetThreadDpiAwarenessContext() };
-        let cursor = physical_cursor_position().expect("the physical cursor should be available");
-        let anchor = PhysicalScreenPoint::new(cursor.x, cursor.y);
-
-        let rectangle =
-            system_hover_rectangle(anchor).expect("the system hover rectangle should be queryable");
-        assert!(
-            rectangle.contains(anchor, anchor),
-            "the normalized rectangle must contain its anchor"
-        );
-
-        // SAFETY: Both values are predefined/returned DPI context handles used only for equality.
-        let restored = unsafe {
-            AreDpiAwarenessContextsEqual(before, GetThreadDpiAwarenessContext()).as_bool()
-        };
-        assert!(
-            restored,
-            "the platform query must restore the thread context"
         );
     }
 

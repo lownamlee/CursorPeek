@@ -1,71 +1,37 @@
 use std::time::{Duration, Instant};
 
+use cursorpeek_core::{PhysicalScreenRect, PhysicalScreenSpan};
+
 use super::{Generation, PhysicalScreenPoint};
 
 pub(crate) const DEFAULT_DWELL_DELAY: Duration = Duration::from_millis(250);
 pub(crate) const PREVIEW_RESHOW_DELAY: Duration = Duration::from_millis(50);
 pub(crate) const PREVIEW_RESHOW_GRACE: Duration = Duration::from_millis(400);
-const BASE_DPI: u32 = 96;
-const MIN_HOVER_DIMENSION: u32 = 4;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct HoverRectangle {
-    width: u32,
-    height: u32,
-}
-
-impl HoverRectangle {
-    pub(crate) fn from_96_dpi(width: u32, height: u32, target_dpi: u32) -> Option<Self> {
-        if target_dpi == 0 {
-            return None;
-        }
-
-        Some(Self {
-            width: scale_up_from_96_dpi(width, target_dpi).max(MIN_HOVER_DIMENSION),
-            height: scale_up_from_96_dpi(height, target_dpi).max(MIN_HOVER_DIMENSION),
-        })
-    }
-
-    pub(crate) fn contains(self, anchor: PhysicalScreenPoint, point: PhysicalScreenPoint) -> bool {
-        contains_axis(anchor.x, point.x, self.width)
-            && contains_axis(anchor.y, point.y, self.height)
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DwellCandidate {
     generation: Generation,
     anchor: PhysicalScreenPoint,
+    point: PhysicalScreenPoint,
+    pointer_span: PhysicalScreenSpan,
 }
 
 impl DwellCandidate {
-    pub(crate) fn anchor(self) -> PhysicalScreenPoint {
-        self.anchor
+    pub(crate) fn include(mut self, point: PhysicalScreenPoint) -> Self {
+        self.point = point;
+        self.pointer_span.include(point);
+        self
     }
 
-    pub(crate) fn validate(
+    pub(crate) fn into_parts(
         self,
-        current: PhysicalScreenPoint,
-        hover_rectangle: HoverRectangle,
-    ) -> Option<ReadyDwell> {
-        hover_rectangle
-            .contains(self.anchor, current)
-            .then_some(ReadyDwell {
-                generation: self.generation,
-                point: current,
-            })
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ReadyDwell {
-    generation: Generation,
-    point: PhysicalScreenPoint,
-}
-
-impl ReadyDwell {
-    pub(crate) fn into_parts(self) -> (Generation, PhysicalScreenPoint) {
-        (self.generation, self.point)
+    ) -> (
+        Generation,
+        PhysicalScreenPoint,
+        PhysicalScreenPoint,
+        PhysicalScreenSpan,
+    ) {
+        (self.generation, self.anchor, self.point, self.pointer_span)
     }
 }
 
@@ -77,16 +43,18 @@ pub(crate) enum DwellTimerEvent {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PendingDwell {
+struct TrackedDwell {
     generation: Generation,
+    anchor: PhysicalScreenPoint,
     point: PhysicalScreenPoint,
-    deadline: Instant,
+    pointer_span: PhysicalScreenSpan,
+    deadline: Option<Instant>,
 }
 
 pub(crate) struct HoverState {
     delay: Duration,
     generation: Generation,
-    pending: Option<PendingDwell>,
+    tracked: Option<TrackedDwell>,
     reshow_until: Option<Instant>,
 }
 
@@ -97,7 +65,7 @@ impl HoverState {
         Self {
             delay,
             generation: Generation::default(),
-            pending: None,
+            tracked: None,
             reshow_until: None,
         }
     }
@@ -119,21 +87,56 @@ impl HoverState {
 
     fn schedule(&mut self, point: PhysicalScreenPoint, now: Instant, delay: Duration) -> Duration {
         self.advance_generation();
-        self.pending = Some(PendingDwell {
+        self.tracked = Some(TrackedDwell {
             generation: self.generation,
+            anchor: point,
             point,
-            deadline: now.checked_add(delay).unwrap_or(now),
+            pointer_span: PhysicalScreenSpan::from_point(point),
+            deadline: Some(now.checked_add(delay).unwrap_or(now)),
         });
         delay
     }
 
+    pub(crate) fn track_motion(&mut self, point: PhysicalScreenPoint) -> bool {
+        let Some(tracked) = self.tracked.as_mut() else {
+            return false;
+        };
+        tracked.point = point;
+        tracked.pointer_span.include(point);
+        true
+    }
+
+    pub(crate) fn tracking_anchor(&self) -> Option<PhysicalScreenPoint> {
+        self.tracked.map(|tracked| tracked.anchor)
+    }
+
+    pub(crate) fn tracked_span_fits(
+        &self,
+        generation: Generation,
+        target_bounds: PhysicalScreenRect,
+    ) -> bool {
+        self.tracked.is_some_and(|tracked| {
+            tracked.generation == generation && tracked.pointer_span.fits_within(target_bounds)
+        })
+    }
+
+    pub(crate) fn finish_resolution(&mut self, generation: Generation) {
+        if self
+            .tracked
+            .is_some_and(|tracked| tracked.generation == generation)
+        {
+            self.tracked = None;
+        }
+    }
+
     pub(crate) fn cancel(&mut self) {
         self.advance_generation();
-        self.pending = None;
+        self.tracked = None;
         self.reshow_until = None;
     }
 
     pub(crate) fn preview_shown(&mut self) {
+        self.tracked = None;
         self.reshow_until = None;
     }
 
@@ -152,18 +155,23 @@ impl HoverState {
     }
 
     pub(crate) fn on_timer(&mut self, now: Instant) -> DwellTimerEvent {
-        let Some(pending) = self.pending else {
+        let Some(tracked) = self.tracked.as_mut() else {
+            return DwellTimerEvent::Inactive;
+        };
+        let Some(deadline) = tracked.deadline else {
             return DwellTimerEvent::Inactive;
         };
 
-        if now < pending.deadline {
-            return DwellTimerEvent::Rearm(pending.deadline.duration_since(now));
+        if now < deadline {
+            return DwellTimerEvent::Rearm(deadline.duration_since(now));
         }
 
-        self.pending = None;
+        tracked.deadline = None;
         DwellTimerEvent::Candidate(DwellCandidate {
-            generation: pending.generation,
-            anchor: pending.point,
+            generation: tracked.generation,
+            anchor: tracked.anchor,
+            point: tracked.point,
+            pointer_span: tracked.pointer_span,
         })
     }
 
@@ -181,28 +189,12 @@ impl HoverState {
     }
 }
 
-fn scale_up_from_96_dpi(value: u32, target_dpi: u32) -> u32 {
-    let scaled = u64::from(value)
-        .saturating_mul(u64::from(target_dpi))
-        .div_ceil(u64::from(BASE_DPI));
-
-    scaled.min(u64::from(u32::MAX)) as u32
-}
-
-fn contains_axis(anchor: i32, point: i32, extent: u32) -> bool {
-    let extent = i64::from(extent);
-    let start = i64::from(anchor) - extent / 2;
-    let end = start + extent;
-    let point = i64::from(point);
-
-    start <= point && point < end
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_DWELL_DELAY, DwellCandidate, DwellTimerEvent, Generation, HoverRectangle,
-        HoverState, PREVIEW_RESHOW_DELAY, PREVIEW_RESHOW_GRACE, PhysicalScreenPoint, ReadyDwell,
+        DEFAULT_DWELL_DELAY, DwellCandidate, DwellTimerEvent, Generation, HoverState,
+        PREVIEW_RESHOW_DELAY, PREVIEW_RESHOW_GRACE, PhysicalScreenPoint, PhysicalScreenRect,
+        PhysicalScreenSpan,
     };
     use std::time::{Duration, Instant};
 
@@ -217,11 +209,13 @@ mod tests {
     }
 
     #[test]
-    fn activity_rearms_until_the_monotonic_deadline() {
+    fn motion_updates_the_pointer_span_without_postponing_the_deadline() {
         let start = Instant::now();
         let mut state = HoverState::new(DEFAULT_DWELL_DELAY);
 
         assert_eq!(state.restart(FIRST_POINT, start), DEFAULT_DWELL_DELAY);
+        assert_eq!(state.tracking_anchor(), Some(FIRST_POINT));
+        assert!(state.track_motion(PhysicalScreenPoint::new(-100, 50)));
         assert_eq!(
             state.on_timer(start + Duration::from_millis(125)),
             DwellTimerEvent::Rearm(Duration::from_millis(125))
@@ -231,6 +225,8 @@ mod tests {
             DwellTimerEvent::Candidate(DwellCandidate {
                 generation: Generation::from_raw(1),
                 anchor: FIRST_POINT,
+                point: PhysicalScreenPoint::new(-100, 50),
+                pointer_span: PhysicalScreenSpan::try_new(-120, 45, -100, 50).unwrap(),
             })
         );
         assert_eq!(
@@ -240,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_activity_replaces_the_pending_point_and_deadline() {
+    fn an_explicit_restart_replaces_the_tracked_item_and_deadline() {
         let start = Instant::now();
         let mut state = HoverState::new(DEFAULT_DWELL_DELAY);
 
@@ -256,6 +252,8 @@ mod tests {
             DwellTimerEvent::Candidate(DwellCandidate {
                 generation: Generation::from_raw(2),
                 anchor: SECOND_POINT,
+                point: SECOND_POINT,
+                pointer_span: PhysicalScreenSpan::from_point(SECOND_POINT),
             })
         );
     }
@@ -279,6 +277,8 @@ mod tests {
             DwellTimerEvent::Candidate(DwellCandidate {
                 generation: Generation::from_raw(3),
                 anchor: SECOND_POINT,
+                point: SECOND_POINT,
+                pointer_span: PhysicalScreenSpan::from_point(SECOND_POINT),
             })
         );
     }
@@ -317,6 +317,8 @@ mod tests {
             DwellTimerEvent::Candidate(DwellCandidate {
                 generation: Generation::from_raw(2),
                 anchor: SECOND_POINT,
+                point: SECOND_POINT,
+                pointer_span: PhysicalScreenSpan::from_point(SECOND_POINT),
             })
         );
 
@@ -360,88 +362,34 @@ mod tests {
             DwellTimerEvent::Candidate(DwellCandidate {
                 generation: Generation::from_raw(0),
                 anchor: FIRST_POINT,
+                point: FIRST_POINT,
+                pointer_span: PhysicalScreenSpan::from_point(FIRST_POINT),
             })
         );
     }
 
     #[test]
-    fn hover_rectangle_scales_up_and_keeps_a_physical_minimum() {
-        assert_eq!(
-            HoverRectangle::from_96_dpi(1, 3, 96),
-            Some(HoverRectangle {
-                width: 4,
-                height: 4,
-            })
-        );
-        assert_eq!(
-            HoverRectangle::from_96_dpi(4, 5, 120),
-            Some(HoverRectangle {
-                width: 5,
-                height: 7,
-            })
-        );
-        assert_eq!(HoverRectangle::from_96_dpi(4, 4, 0), None);
-    }
+    fn tracked_span_must_stay_inside_the_resolved_item() {
+        let start = Instant::now();
+        let mut state = HoverState::new(DEFAULT_DWELL_DELAY);
+        state.restart(PhysicalScreenPoint::new(110, 120), start);
+        state.track_motion(PhysicalScreenPoint::new(190, 180));
+        let generation = state.generation();
 
-    #[test]
-    fn hover_rectangle_uses_half_open_bounds_on_negative_desktops() {
-        let rectangle = HoverRectangle::from_96_dpi(4, 5, 96).unwrap();
-        let anchor = PhysicalScreenPoint::new(-100, -50);
-
-        for point in [
-            PhysicalScreenPoint::new(-102, -52),
-            PhysicalScreenPoint::new(-99, -48),
-            anchor,
-        ] {
-            assert!(rectangle.contains(anchor, point));
-        }
-
-        for point in [
-            PhysicalScreenPoint::new(-103, -50),
-            PhysicalScreenPoint::new(-98, -50),
-            PhysicalScreenPoint::new(-100, -53),
-            PhysicalScreenPoint::new(-100, -47),
-        ] {
-            assert!(!rectangle.contains(anchor, point));
-        }
-    }
-
-    #[test]
-    fn hover_rectangle_math_handles_coordinate_extremes() {
-        let rectangle = HoverRectangle::from_96_dpi(u32::MAX, u32::MAX, u32::MAX).unwrap();
-
-        assert!(rectangle.contains(
-            PhysicalScreenPoint::new(i32::MIN, i32::MAX),
-            PhysicalScreenPoint::new(i32::MIN, i32::MAX),
+        assert!(state.tracked_span_fits(
+            generation,
+            PhysicalScreenRect::try_new(100, 100, 200, 200).unwrap()
         ));
-        assert!(rectangle.contains(
-            PhysicalScreenPoint::new(i32::MAX, i32::MIN),
-            PhysicalScreenPoint::new(i32::MAX, i32::MIN),
+        assert!(!state.tracked_span_fits(
+            generation,
+            PhysicalScreenRect::try_new(120, 100, 200, 200).unwrap()
         ));
-    }
+        assert!(!state.tracked_span_fits(
+            Generation::from_raw(generation.get() + 1),
+            PhysicalScreenRect::try_new(100, 100, 200, 200).unwrap()
+        ));
 
-    #[test]
-    fn candidate_validation_emits_only_the_current_in_bounds_point() {
-        let candidate = DwellCandidate {
-            generation: Generation::from_raw(7),
-            anchor: FIRST_POINT,
-        };
-        let rectangle = HoverRectangle::from_96_dpi(4, 4, 96).unwrap();
-        let current = PhysicalScreenPoint::new(FIRST_POINT.x + 1, FIRST_POINT.y - 2);
-
-        assert_eq!(
-            candidate.validate(current, rectangle),
-            Some(ReadyDwell {
-                generation: Generation::from_raw(7),
-                point: current,
-            })
-        );
-        assert_eq!(
-            candidate.validate(
-                PhysicalScreenPoint::new(FIRST_POINT.x + 2, FIRST_POINT.y),
-                rectangle,
-            ),
-            None
-        );
+        state.finish_resolution(generation);
+        assert_eq!(state.tracking_anchor(), None);
     }
 }

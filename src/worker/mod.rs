@@ -21,10 +21,11 @@ use std::{
 use crate::resolver::{PointResolver, ResolveOutcome};
 use crate::settings::LegacyEncoding;
 use cache::{PreviewCache, PreviewCacheKey, PreviewProvider};
-use cursorpeek_core::PhysicalScreenRect;
+#[cfg(test)]
+use cursorpeek_core::PhysicalScreenPoint;
+use cursorpeek_core::{PhysicalScreenRect, PhysicalScreenSpan};
 use file::PreviewFile;
 use image::ImageDecodeResult;
-use payload::ResolverStatus;
 use protocol::{ProtocolStreamError, WorkerMessage};
 use text::TextDecodeResult;
 
@@ -36,7 +37,7 @@ pub(crate) use manager::{
 };
 #[cfg(test)]
 pub(crate) use payload::ImageFormat;
-pub(crate) use payload::{ImagePreview, PreviewResult, TextPreview};
+pub(crate) use payload::{ImagePreview, PreviewResult, ResolverStatus, TextPreview};
 
 pub(crate) fn run_session<R, W>(
     reader: &mut R,
@@ -60,13 +61,21 @@ where
     let mut cache = PreviewCache::with_entry_limit(cache_entries);
 
     loop {
-        let (generation, point) = match protocol::read_message(reader)? {
-            Some(WorkerMessage::ResolvePoint { generation, point }) => (generation, point),
+        let (generation, point, pointer_span) = match protocol::read_message(reader)? {
+            Some(WorkerMessage::ResolvePoint {
+                generation,
+                point,
+                pointer_span,
+            }) => (generation, point, pointer_span),
             Some(_) => return Err(WorkerSessionError::ExpectedResolvePoint),
             None => return Ok(()),
         };
-        let (target_bounds, result) =
-            resolver_result_with_cache(resolver.resolve(point), &legacy_encoding, &mut cache);
+        let (target_bounds, result) = resolver_result_with_cache(
+            resolver.resolve(point),
+            pointer_span,
+            &legacy_encoding,
+            &mut cache,
+        );
         protocol::write_message(
             writer,
             WorkerMessage::PreviewResult {
@@ -80,12 +89,16 @@ where
 
 fn resolver_result_with_cache(
     outcome: ResolveOutcome,
+    pointer_span: PhysicalScreenSpan,
     legacy_encoding: &LegacyEncoding,
     cache: &mut PreviewCache,
 ) -> (Option<PhysicalScreenRect>, PreviewResult) {
     match outcome {
         ResolveOutcome::Resolved(target) => {
             let target_bounds = target.target_bounds();
+            if !pointer_span.fits_within(target_bounds) {
+                return (None, PreviewResult::Status(ResolverStatus::PointerMoved));
+            }
             let result = match PreviewFile::open(target.path()) {
                 Ok(file) => preview_file_result(&file, legacy_encoding, cache),
                 Err(error) if error.is_unsupported() => {
@@ -165,7 +178,21 @@ fn preview_file_result(
 
 #[cfg(test)]
 fn resolver_result(outcome: ResolveOutcome, legacy_encoding: &LegacyEncoding) -> PreviewResult {
-    resolver_result_with_cache(outcome, legacy_encoding, &mut PreviewCache::default()).1
+    let pointer_span = match &outcome {
+        ResolveOutcome::Resolved(target) => PhysicalScreenSpan::from_point(
+            PhysicalScreenPoint::new(target.target_bounds().left(), target.target_bounds().top()),
+        ),
+        ResolveOutcome::Unsupported | ResolveOutcome::Ambiguous | ResolveOutcome::Unavailable => {
+            PhysicalScreenSpan::from_point(PhysicalScreenPoint::new(0, 0))
+        }
+    };
+    resolver_result_with_cache(
+        outcome,
+        pointer_span,
+        legacy_encoding,
+        &mut PreviewCache::default(),
+    )
+    .1
 }
 
 #[derive(Debug)]
@@ -215,7 +242,7 @@ mod tests {
     use crate::settings::LegacyEncoding;
     use crate::worker::payload::{PreviewResult, ResolverStatus};
     use ::image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
-    use cursorpeek_core::PhysicalScreenRect;
+    use cursorpeek_core::{PhysicalScreenRect, PhysicalScreenSpan};
     use protocol::{SessionNonce, WorkerMessage};
     use std::{
         env, fs,
@@ -384,6 +411,23 @@ mod tests {
     }
 
     #[test]
+    fn pointer_travel_must_fit_the_resolved_item_before_file_access() {
+        let missing = env::temp_dir().join(format!(
+            "cursorpeek-pointer-span-{}-{}.txt",
+            std::process::id(),
+            NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let (_, result) = resolver_result_with_cache(
+            ResolveOutcome::Resolved(resolved_target(missing)),
+            PhysicalScreenSpan::try_new(-101, 0, 0, 1).unwrap(),
+            &LegacyEncoding::Auto,
+            &mut PreviewCache::default(),
+        );
+
+        assert_eq!(result, PreviewResult::Status(ResolverStatus::PointerMoved));
+    }
+
+    #[test]
     fn verified_preview_cache_hits_and_file_changes_miss() {
         let path = env::temp_dir().join(format!(
             "cursorpeek-cache-session-{}-{}.txt",
@@ -395,6 +439,7 @@ mod tests {
         let resolve = |cache: &mut PreviewCache| {
             resolver_result_with_cache(
                 ResolveOutcome::Resolved(resolved_target(path.clone())),
+                PhysicalScreenSpan::from_point(PhysicalScreenPoint::new(0, 0)),
                 &LegacyEncoding::Auto,
                 cache,
             )
@@ -438,6 +483,10 @@ mod tests {
                 WorkerMessage::ResolvePoint {
                     generation,
                     point: PhysicalScreenPoint::new(-1_920 + index as i32, 1_080),
+                    pointer_span: PhysicalScreenSpan::from_point(PhysicalScreenPoint::new(
+                        -1_920 + index as i32,
+                        1_080,
+                    )),
                 },
             )
             .unwrap();

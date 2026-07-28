@@ -11,11 +11,11 @@ Read the [0.1 known limitations](KNOWN_LIMITATIONS.md) before installing or runn
 Run `CursorPeek.exe`. Its icon appears in the notification area. Windows may place the icon behind
 the notification-area overflow button.
 
-Open File Explorer and leave the pointer over a supported file for the configured dwell delay
-(250 ms by default). Pointer motion inside the same Explorer item keeps the preview visible.
+Open File Explorer and keep the pointer within a supported file item for the configured dwell delay
+(250 ms by default). The pointer may move inside that item before or after the preview appears.
 Moving directly to another file uses a brief re-show delay while the complete Explorer and file
-checks run again. Leaving Explorer, scrolling, clicking, pressing Escape, changing the active
-view, or switching applications dismisses the preview.
+checks run again. Leaving Explorer, scrolling, clicking, pressing Escape, changing the active view,
+or switching applications dismisses the preview.
 
 CursorPeek allows one normal instance in the current interactive session. Starting it again asks
 the existing instance to show its tray menu.
@@ -272,7 +272,7 @@ for normal use.
   archive viewer, or another file manager.
 - Confirm it is a local file and does not need cloud hydration.
 - Check that CursorPeek is not paused.
-- Leave the pointer still for at least the selected dwell delay.
+- Keep the pointer within one file item for at least the selected dwell delay.
 - Verify the extension or exact filename is eligible.
 - Try a small known-good file. Malformed, binary, oversized, ambiguous, or changing files are
   intentionally rejected.
@@ -282,8 +282,7 @@ for normal use.
 
 Leaving the hovered item, wheel input, clicks, Escape, foreground/selection changes, display
 changes, and Explorer lifecycle events dismiss it by design. Ordinary pointer motion inside the
-same item preserves the preview. Increase the dwell delay if movement before the preview appears
-continually restarts the timer.
+same item preserves the dwell deadline and the visible preview.
 
 ### OneDrive or another cloud file does not preview
 

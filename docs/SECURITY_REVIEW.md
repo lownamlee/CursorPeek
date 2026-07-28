@@ -61,12 +61,15 @@ the fuzz harness.
 
 ## IPC, file, and UI review
 
-- IPC parsing rejects invalid magic/version/kind/flags/order/length, nonce mismatch, stale
-  generation, trailing bytes, truncation, and allocation above the protocol cap.
+- IPC parsing rejects invalid magic/version/kind/flags/order/length, unordered pointer spans,
+  nonce mismatch, stale generation, trailing bytes, truncation, and allocation above the protocol
+  cap.
 - Worker launch uses explicit inherited handles, suspended Job assignment, required creation
   mitigations, post-creation mitigation queries, timeout termination, and zero-residue recovery.
 - File opening rejects relative/UNC/device paths, non-disk and remote-protocol handles, offline and
   recall-on-access content, invalid final-path shapes, directories, and changed identities.
+- The worker verifies that the complete pre-preview pointer span fits the resolved Explorer item
+  before file access; the coordinator repeats that geometry check before display.
 - Text and image pipelines enforce their format-specific size, arithmetic, decoding, and rendered
   payload bounds. Retained fuzz seeds and ordinary Windows replay cover malformed boundaries.
 - Preview callbacks preserve Explorer focus, use no-activate/click-eating behavior, and invalidate
