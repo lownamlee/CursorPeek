@@ -74,10 +74,36 @@
 
 Requires Windows 10 22H2 x64 or supported Windows 11 x64 with Windows File Explorer.
 
-| Package | Download | Use |
-| --- | --- | --- |
-| **Per-user installer** | **[Download v0.2.2](https://github.com/lownamlee/CursorPeek/releases/latest/download/CursorPeek-0.2.2-windows-x64-setup.exe)** | Recommended; installs without administrator elevation |
-| **Portable ZIP** | **[Download v0.2.2](https://github.com/lownamlee/CursorPeek/releases/latest/download/CursorPeek-0.2.2-windows-x64-portable.zip)** | Extract the archive and run `CursorPeek.exe` |
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <a href="https://github.com/lownamlee/CursorPeek/releases/latest/download/CursorPeek-0.2.2-windows-x64-setup.exe">
+        <img
+          alt="Download the CursorPeek installer"
+          src="assets/readme/CursorPeek_download_installer.png"
+          width="220"
+        />
+      </a>
+      <br />
+      <strong>Per-user installer</strong>
+      <br />
+      <sub>Recommended · installs without administrator elevation</sub>
+    </td>
+    <td align="center" width="50%">
+      <a href="https://github.com/lownamlee/CursorPeek/releases/latest/download/CursorPeek-0.2.2-windows-x64-portable.zip">
+        <img
+          alt="Download the CursorPeek portable ZIP"
+          src="assets/readme/CursorPeek_download_portable.png"
+          width="220"
+        />
+      </a>
+      <br />
+      <strong>Portable ZIP</strong>
+      <br />
+      <sub>Extract the archive and run CursorPeek.exe</sub>
+    </td>
+  </tr>
+</table>
 
 > [!NOTE]
 > Packages are not code-signed yet. Windows may show an unknown-publisher warning. Check downloads
