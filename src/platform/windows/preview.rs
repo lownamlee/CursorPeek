@@ -14,7 +14,9 @@ use crate::{
     settings::Theme,
     worker::{ImagePreview, TextPreview},
 };
-use cursorpeek_core::layout::fit_dimensions;
+use cursorpeek_core::{ExplorerWindowId, layout::fit_dimensions};
+
+use super::explorer::is_explorer_infotip_window;
 
 use windows::{
     Foundation::TypedEventHandler,
@@ -60,10 +62,11 @@ use windows::{
             Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
             HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow, SystemParametersInfoForDpi},
             WindowsAndMessaging::{
-                CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA,
-                GetClientRect, GetWindowLongPtrW, HWND_TOPMOST, MA_NOACTIVATEANDEAT,
-                NONCLIENTMETRICSW, PostMessageW, RegisterClassW, SPI_GETHIGHCONTRAST,
-                SPI_GETNONCLIENTMETRICS, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+                CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GW_HWNDPREV,
+                GWLP_USERDATA, GetClientRect, GetWindow, GetWindowLongPtrW, GetWindowRect,
+                HWND_TOPMOST, IsWindowVisible, MA_NOACTIVATEANDEAT, NONCLIENTMETRICSW,
+                PostMessageW, RegisterClassW, SPI_GETHIGHCONTRAST, SPI_GETNONCLIENTMETRICS,
+                SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
                 SWP_NOZORDER, SWP_SHOWWINDOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW,
                 SetWindowLongPtrW, SetWindowPos, SetWindowTextW, SystemParametersInfoW,
                 UnregisterClassW, WINDOW_EX_STYLE, WM_APP, WM_DISPLAYCHANGE, WM_DPICHANGED,
@@ -89,6 +92,7 @@ const IMAGE_MARGIN: f32 = 4.0;
 const IMAGE_METADATA_HEIGHT: f32 = 56.0;
 const IMAGE_MINIMUM_WIDTH: f32 = 158.0;
 const SYSTEM_APPEARANCE_CHANGED_MESSAGE: u32 = WM_APP + 20;
+const MAX_Z_ORDER_SCAN: usize = 64;
 
 pub(crate) struct PreviewWindow {
     hwnd: HWND,
@@ -315,10 +319,73 @@ impl PreviewWindow {
         }
     }
 
+    pub(crate) fn repair_explorer_infotip_overlap(
+        &self,
+        explorer_window: ExplorerWindowId,
+    ) -> Result<bool> {
+        // SAFETY: The preview HWND is owned by this UI thread. A hidden preview has no visual
+        // overlap to repair.
+        if !unsafe { IsWindowVisible(self.hwnd).as_bool() } {
+            return Ok(false);
+        }
+
+        let mut preview_bounds = RECT::default();
+        // SAFETY: `preview_bounds` is live writable storage and the preview HWND remains valid.
+        unsafe { GetWindowRect(self.hwnd, &mut preview_bounds) }?;
+        // SAFETY: The preview HWND remains live. GetWindow returns a borrowed adjacent top-level
+        // HWND or no relation; the bounded scan never stores a handle beyond this synchronous call.
+        let mut candidate = unsafe { GetWindow(self.hwnd, GW_HWNDPREV) }.ok();
+
+        for _ in 0..MAX_Z_ORDER_SCAN {
+            let Some(window) = candidate else {
+                return Ok(false);
+            };
+            // Query the next relation before inspecting the borrowed candidate so a window that
+            // disappears during inspection simply ends this bounded fallback scan.
+            // SAFETY: `window` is the borrowed live-or-stale result of the preceding synchronous
+            // Z-order query. A stale handle produces no relation and terminates the scan.
+            candidate = unsafe { GetWindow(window, GW_HWNDPREV) }.ok();
+
+            if !is_explorer_infotip_window(window, explorer_window) {
+                continue;
+            }
+
+            let mut infotip_bounds = RECT::default();
+            // SAFETY: `infotip_bounds` is writable storage. The borrowed cross-process HWND is
+            // queried synchronously and may disappear, in which case this candidate is ignored.
+            if unsafe { GetWindowRect(window, &mut infotip_bounds) }.is_err()
+                || !rectangles_overlap(preview_bounds, infotip_bounds)
+            {
+                continue;
+            }
+
+            self.raise_topmost_without_activation()?;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    fn raise_topmost_without_activation(&self) -> Result<()> {
+        // SAFETY: Reordering this live top-level HWND with no move, size, owner, or activation
+        // change affects only CursorPeek. HWND_TOPMOST restores it above a later topmost infotip.
+        unsafe {
+            SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER,
+            )
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn is_visible(&self) -> bool {
         // SAFETY: The handle is owned and live for self.
-        unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(self.hwnd).as_bool() }
+        unsafe { IsWindowVisible(self.hwnd).as_bool() }
     }
 
     pub(crate) fn eats_mouse_activation(&self) -> bool {
@@ -1583,6 +1650,17 @@ fn checked_window_rect(rect: &RECT) -> Result<(i32, i32, i32, i32)> {
     Ok((rect.left, rect.top, width, height))
 }
 
+fn rectangles_overlap(left: RECT, right: RECT) -> bool {
+    left.left < left.right
+        && left.top < left.bottom
+        && right.left < right.right
+        && right.top < right.bottom
+        && left.left < right.right
+        && right.left < left.right
+        && left.top < right.bottom
+        && right.top < left.bottom
+}
+
 fn preview_state(hwnd: HWND) -> Option<&'static RefCell<PreviewWindowState>> {
     // SAFETY: PreviewWindow stores a stable Box pointer at WM_NCCREATE and clears it before either
     // HWND or Box teardown. This helper is called only synchronously on the owning UI thread.
@@ -1599,11 +1677,11 @@ fn preview_state(hwnd: HWND) -> Option<&'static RefCell<PreviewWindowState>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContentLayouts, D2D_SIZE_U, PreviewColors, PreviewWindow, PreviewWindowState,
-        RetainedContent, TextContent, adjusted_window_pixel_size, checked_image_layout,
-        checked_window_rect, client_pixel_size, color_from_colorref, format_file_size,
-        image_client_pixel_size, image_destination_rect, image_preview_metadata, system_dark_mode,
-        system_message_font, text_preview_metadata,
+        ContentLayouts, D2D_SIZE_U, MAX_Z_ORDER_SCAN, PreviewColors, PreviewWindow,
+        PreviewWindowState, RetainedContent, TextContent, adjusted_window_pixel_size,
+        checked_image_layout, checked_window_rect, client_pixel_size, color_from_colorref,
+        format_file_size, image_client_pixel_size, image_destination_rect, image_preview_metadata,
+        rectangles_overlap, system_dark_mode, system_message_font, text_preview_metadata,
     };
     use crate::{
         hover::PhysicalScreenPoint,
@@ -1614,10 +1692,30 @@ mod tests {
     };
     use std::thread;
     use windows::Win32::{
-        Foundation::{LPARAM, RECT, WPARAM},
+        Foundation::{HWND, LPARAM, RECT, WPARAM},
         Graphics::DirectWrite::DWRITE_TEXT_METRICS,
-        UI::WindowsAndMessaging::{GetWindowRect, IsWindow, SendMessageW, WM_DPICHANGED},
+        UI::WindowsAndMessaging::{
+            GW_HWNDPREV, GetForegroundWindow, GetWindow, GetWindowRect, IsWindow, SWP_NOACTIVATE,
+            SWP_NOMOVE, SWP_NOSIZE, SendMessageW, SetWindowPos, WM_DPICHANGED,
+        },
     };
+
+    fn window_is_above(above: HWND, below: HWND) -> bool {
+        // SAFETY: Both HWND values belong to live test windows while this helper is called.
+        let mut candidate = unsafe { GetWindow(below, GW_HWNDPREV) }.ok();
+        for _ in 0..MAX_Z_ORDER_SCAN {
+            let Some(window) = candidate else {
+                return false;
+            };
+            if window == above {
+                return true;
+            }
+            // SAFETY: The candidate came from the preceding synchronous Z-order query and both
+            // test windows remain live for the bounded traversal.
+            candidate = unsafe { GetWindow(window, GW_HWNDPREV) }.ok();
+        }
+        false
+    }
 
     fn text_preview() -> TextPreview {
         TextPreview {
@@ -1668,6 +1766,86 @@ mod tests {
         })
         .join()
         .expect("the preview-window test thread should not panic");
+    }
+
+    #[test]
+    fn topmost_repair_changes_relative_order_without_activation() {
+        thread::spawn(|| {
+            let preview = PreviewWindow::create().expect("the preview window should be created");
+            let later_topmost =
+                PreviewWindow::create().expect("the later topmost window should be created");
+            preview
+                .show_at(PhysicalScreenPoint::new(200, 200))
+                .expect("the preview should be visible");
+            later_topmost
+                .show_at(PhysicalScreenPoint::new(220, 220))
+                .expect("the competing topmost window should be visible");
+
+            // SAFETY: Both topmost HWNDs are live on this test thread. This deliberately places
+            // the preview immediately below the competing window without activating either one.
+            unsafe {
+                SetWindowPos(
+                    preview.handle(),
+                    Some(later_topmost.handle()),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+                )
+            }
+            .expect("the test should establish the losing relative Z order");
+            assert!(window_is_above(later_topmost.handle(), preview.handle()));
+
+            // SAFETY: GetForegroundWindow performs a synchronous query with no ownership
+            // transfer. This short test makes no request that could change the foreground window.
+            let foreground_before = unsafe { GetForegroundWindow() };
+            preview
+                .raise_topmost_without_activation()
+                .expect("the preview should return to the top of the topmost band");
+            assert!(window_is_above(preview.handle(), later_topmost.handle()));
+            // SAFETY: GetForegroundWindow performs a synchronous query with no ownership transfer.
+            assert_eq!(unsafe { GetForegroundWindow() }, foreground_before);
+        })
+        .join()
+        .expect("the topmost-repair test thread should not panic");
+    }
+
+    #[test]
+    fn overlap_detection_uses_nonempty_half_open_rectangles() {
+        let preview = RECT {
+            left: 100,
+            top: 100,
+            right: 300,
+            bottom: 250,
+        };
+        assert!(rectangles_overlap(
+            preview,
+            RECT {
+                left: 250,
+                top: 200,
+                right: 350,
+                bottom: 300,
+            }
+        ));
+        assert!(!rectangles_overlap(
+            preview,
+            RECT {
+                left: 300,
+                top: 100,
+                right: 400,
+                bottom: 200,
+            }
+        ));
+        assert!(!rectangles_overlap(
+            preview,
+            RECT {
+                left: 150,
+                top: 150,
+                right: 150,
+                bottom: 200,
+            }
+        ));
     }
 
     #[test]

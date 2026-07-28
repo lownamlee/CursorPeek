@@ -11,7 +11,8 @@ use std::{
 
 use super::explorer::{
     belongs_to_explorer_window, explorer_window_at, explorer_window_is_available,
-    is_foreground_explorer_window_at, point_belongs_to_explorer_window,
+    is_explorer_infotip_window, is_foreground_explorer_window_at, point_belongs_to_explorer_window,
+    point_is_explorer_infotip,
 };
 #[cfg(test)]
 use super::input::registered_raw_devices;
@@ -45,15 +46,16 @@ use windows::{
         UI::{
             Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
             WindowsAndMessaging::{
-                CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-                EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND,
-                GetForegroundWindow, GetMessageW, KillTimer, MSG, PBT_APMRESUMEAUTOMATIC,
-                PBT_APMRESUMECRITICAL, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, PostMessageW,
-                RegisterClassW, RegisterWindowMessageW, SPI_SETWORKAREA, SetTimer,
-                TranslateMessage, USER_TIMER_MAXIMUM, USER_TIMER_MINIMUM, UnregisterClassW,
-                WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP, WM_DISPLAYCHANGE, WM_INPUT,
-                WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE,
-                WS_EX_TOOLWINDOW, WS_POPUP,
+                CHILDID_SELF, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+                EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW,
+                EVENT_SYSTEM_FOREGROUND, GetForegroundWindow, GetMessageW, KillTimer, MSG,
+                OBJID_WINDOW, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMECRITICAL, PBT_APMRESUMESUSPEND,
+                PBT_APMSUSPEND, PostMessageW, RegisterClassW, RegisterWindowMessageW,
+                SPI_SETWORKAREA, SetTimer, TranslateMessage, USER_TIMER_MAXIMUM,
+                USER_TIMER_MINIMUM, UnregisterClassW, WINEVENT_OUTOFCONTEXT,
+                WINEVENT_SKIPOWNPROCESS, WM_APP, WM_DISPLAYCHANGE, WM_INPUT, WM_POWERBROADCAST,
+                WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+                WS_POPUP,
             },
         },
     },
@@ -72,6 +74,7 @@ const PREVIEW_CONTEXT_INVALIDATED_MESSAGE: u32 = WM_APP + 6;
 const SYSTEM_LIFECYCLE_CHANGED_MESSAGE: u32 = WM_APP + 7;
 const TRAY_EVENT_MESSAGE: u32 = WM_APP + 8;
 const PREVIEW_CONTEXT_REVALIDATE_MESSAGE: u32 = WM_APP + 9;
+const PREVIEW_ZORDER_REPAIR_MESSAGE: u32 = WM_APP + 10;
 const DWELL_TIMER_ID: usize = 1;
 const INPUT_SAMPLE_TIMER_ID: usize = 2;
 const INPUT_DIAGNOSTIC_DEADLINE_TIMER_ID: usize = 3;
@@ -496,6 +499,12 @@ impl MessageWindow {
                 continue;
             }
 
+            if message.hwnd == self.hwnd && message.message == PREVIEW_ZORDER_REPAIR_MESSAGE {
+                self.handle_preview_context_revalidation(message.wParam.0);
+                self.record_ui_task(ui_task_started.elapsed());
+                continue;
+            }
+
             let raw_input = if message.hwnd == self.hwnd && message.message == WM_INPUT {
                 Some(read_raw_input_activity(message.lParam))
             } else {
@@ -582,7 +591,7 @@ impl MessageWindow {
                         let now = Instant::now();
                         let active_preview = self.active_preview;
                         let shares_target_explorer = active_preview.is_some_and(|active| {
-                            point_belongs_to_explorer_window(point, active.explorer_window)
+                            point_belongs_to_active_preview_context(point, active)
                         });
                         match classify_preview_pointer_motion(
                             active_preview,
@@ -1008,11 +1017,14 @@ impl MessageWindow {
             .ok()
             .map(|point| PhysicalScreenPoint::new(point.x, point.y));
         let target_explorer_is_current = explorer_window_is_available(active.explorer_window)
-            && current.is_some_and(|point| {
-                point_belongs_to_explorer_window(point, active.explorer_window)
-            });
+            && current.is_some_and(|point| point_belongs_to_active_preview_context(point, active));
         if !preview_context_is_current(active.target_bounds, current, target_explorer_is_current) {
             self.cancel_dwell();
+            return;
+        }
+
+        if let Some(preview) = self.preview_window.as_ref() {
+            let _ = preview.repair_explorer_infotip_overlap(active.explorer_window);
         }
     }
 
@@ -1402,6 +1414,15 @@ fn classify_preview_pointer_motion(
     }
 }
 
+fn point_belongs_to_active_preview_context(
+    point: PhysicalScreenPoint,
+    active: ActivePreview,
+) -> bool {
+    point_belongs_to_explorer_window(point, active.explorer_window)
+        || (active.target_bounds.contains(point)
+            && point_is_explorer_infotip(point, active.explorer_window))
+}
+
 fn preview_context_generation_matches(active: Option<ActivePreview>, generation: usize) -> bool {
     active.is_some_and(|active| usize::try_from(active.generation.get()) == Ok(generation))
 }
@@ -1414,9 +1435,15 @@ fn preview_input_requires_dismissal(raw_input: &Result<Option<RawInputActivity>>
     }
 }
 
-fn preview_event_message(event: u32, belongs_to_target_explorer: bool) -> Option<u32> {
+fn preview_event_message(
+    event: u32,
+    belongs_to_target_explorer: bool,
+    is_target_explorer_infotip: bool,
+) -> Option<u32> {
     if event == EVENT_SYSTEM_FOREGROUND {
         Some(PREVIEW_CONTEXT_REVALIDATE_MESSAGE)
+    } else if event == EVENT_OBJECT_SHOW && is_target_explorer_infotip {
+        Some(PREVIEW_ZORDER_REPAIR_MESSAGE)
     } else if belongs_to_target_explorer {
         Some(PREVIEW_CONTEXT_INVALIDATED_MESSAGE)
     } else {
@@ -1512,8 +1539,8 @@ unsafe extern "system" fn preview_event_callback(
     _hook: HWINEVENTHOOK,
     event: u32,
     event_window: HWND,
-    _object_id: i32,
-    _child_id: i32,
+    object_id: i32,
+    child_id: i32,
     _event_thread: u32,
     _event_time: u32,
 ) {
@@ -1522,9 +1549,14 @@ unsafe extern "system" fn preview_event_callback(
             let Some(target) = target.get() else {
                 return;
             };
+            let is_target_infotip = event == EVENT_OBJECT_SHOW
+                && object_id == OBJID_WINDOW.0
+                && child_id == CHILDID_SELF as i32
+                && is_explorer_infotip_window(event_window, target.active.explorer_window);
             let Some(message) = preview_event_message(
                 event,
                 belongs_to_explorer_window(event_window, target.active.explorer_window),
+                is_target_infotip,
             ) else {
                 return;
             };
@@ -1846,13 +1878,13 @@ fn system_lifecycle_change_for_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivePreview, CLASS_NAME, DWELL_TIMER_ID, EVENT_OBJECT_LOCATIONCHANGE,
+        ActivePreview, CLASS_NAME, DWELL_TIMER_ID, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW,
         EVENT_SYSTEM_FOREGROUND, IsWindow, LPARAM, MessageWindow,
         PREVIEW_CONTEXT_INVALIDATED_MESSAGE, PREVIEW_CONTEXT_REVALIDATE_MESSAGE,
-        PREVIEW_WINDOW_DIAGNOSTIC_DURATION, PREVIEW_WINDOW_PRACTICE_DURATION, PreviewPointerMotion,
-        SYSTEM_LIFECYCLE_CHANGED_MESSAGE, SystemLifecycleChange, TASKBAR_CREATED_MESSAGE,
-        TEST_PANIC_MESSAGE, TRAY_CALLBACK_MESSAGE, TRAY_EVENT_MESSAGE, WPARAM,
-        accept_worker_completion, classify_preview_pointer_motion,
+        PREVIEW_WINDOW_DIAGNOSTIC_DURATION, PREVIEW_WINDOW_PRACTICE_DURATION,
+        PREVIEW_ZORDER_REPAIR_MESSAGE, PreviewPointerMotion, SYSTEM_LIFECYCLE_CHANGED_MESSAGE,
+        SystemLifecycleChange, TASKBAR_CREATED_MESSAGE, TEST_PANIC_MESSAGE, TRAY_CALLBACK_MESSAGE,
+        TRAY_EVENT_MESSAGE, WPARAM, accept_worker_completion, classify_preview_pointer_motion,
         pointer_motion_stays_on_active_target, post_worker_result,
         preview_context_generation_matches, preview_context_is_current, preview_event_message,
         preview_input_requires_dismissal, registered_raw_devices, timer_interval_ms, tray_status,
@@ -2331,17 +2363,22 @@ mod tests {
     #[test]
     fn foreground_changes_revalidate_while_target_object_changes_invalidate() {
         assert_eq!(
-            preview_event_message(EVENT_SYSTEM_FOREGROUND, false),
+            preview_event_message(EVENT_SYSTEM_FOREGROUND, false, false),
             Some(PREVIEW_CONTEXT_REVALIDATE_MESSAGE)
         );
         assert_eq!(
-            preview_event_message(EVENT_OBJECT_LOCATIONCHANGE, true),
+            preview_event_message(EVENT_OBJECT_SHOW, false, true),
+            Some(PREVIEW_ZORDER_REPAIR_MESSAGE)
+        );
+        assert_eq!(
+            preview_event_message(EVENT_OBJECT_LOCATIONCHANGE, true, false),
             Some(PREVIEW_CONTEXT_INVALIDATED_MESSAGE)
         );
         assert_eq!(
-            preview_event_message(EVENT_OBJECT_LOCATIONCHANGE, false),
+            preview_event_message(EVENT_OBJECT_LOCATIONCHANGE, false, false),
             None
         );
+        assert_eq!(preview_event_message(EVENT_OBJECT_SHOW, false, false), None);
     }
 
     fn assert_raw_input_registrations(target: windows::Win32::Foundation::HWND) {

@@ -22,6 +22,7 @@ const CLASS_NAME_CAPACITY: usize = 64;
 const PROCESS_IMAGE_CAPACITY: usize = 512;
 const CABINET_WINDOW_CLASS: &[u8] = b"CabinetWClass";
 const EXPLORE_WINDOW_CLASS: &[u8] = b"ExploreWClass";
+const TOOLTIP_WINDOW_CLASS: &[u8] = b"tooltips_class32";
 const EXPLORER_IMAGE_NAME: &[u8] = b"explorer.exe";
 
 pub(super) fn explorer_window_at(point: PhysicalScreenPoint) -> Option<ExplorerWindowId> {
@@ -33,6 +34,29 @@ pub(super) fn point_belongs_to_explorer_window(
     expected: ExplorerWindowId,
 ) -> bool {
     root_window(window_at(point)).and_then(window_id) == Some(expected)
+}
+
+pub(super) fn point_is_explorer_infotip(
+    point: PhysicalScreenPoint,
+    expected: ExplorerWindowId,
+) -> bool {
+    is_explorer_infotip_window(window_at(point), expected)
+}
+
+pub(super) fn is_explorer_infotip_window(window: HWND, expected: ExplorerWindowId) -> bool {
+    let Some(explorer) = window_from_id(expected) else {
+        return false;
+    };
+    let Some(expected_process) = window_process_id(explorer) else {
+        return false;
+    };
+
+    // SAFETY: `window` is a copied HWND supplied by Windows. These synchronous queries return
+    // false or zero if it has already been destroyed.
+    let visible = unsafe { IsWindowVisible(window).as_bool() };
+    visible
+        && has_window_class(window, TOOLTIP_WINDOW_CLASS)
+        && window_process_id(window) == Some(expected_process)
 }
 
 pub(super) fn explorer_window_is_available(expected: ExplorerWindowId) -> bool {
@@ -118,10 +142,14 @@ fn is_explorer_root(root: HWND) -> bool {
         return false;
     }
 
-    explorer_process_id(root).is_some_and(process_image_is_explorer)
+    window_process_id(root).is_some_and(process_image_is_explorer)
 }
 
 fn has_explorer_frame_class(window: HWND) -> bool {
+    has_window_class(window, CABINET_WINDOW_CLASS) || has_window_class(window, EXPLORE_WINDOW_CLASS)
+}
+
+fn has_window_class(window: HWND, expected: &[u8]) -> bool {
     let mut class_name = [0_u16; CLASS_NAME_CAPACITY];
 
     // SAFETY: `class_name` is live writable storage. The HWND is borrowed for this synchronous
@@ -132,11 +160,10 @@ fn has_explorer_frame_class(window: HWND) -> bool {
     }
 
     let class_name = &class_name[..length as usize];
-    wide_ascii_eq_ignore_case(class_name, CABINET_WINDOW_CLASS)
-        || wide_ascii_eq_ignore_case(class_name, EXPLORE_WINDOW_CLASS)
+    wide_ascii_eq_ignore_case(class_name, expected)
 }
 
-fn explorer_process_id(window: HWND) -> Option<u32> {
+fn window_process_id(window: HWND) -> Option<u32> {
     let mut process_id = 0_u32;
 
     // SAFETY: `process_id` is valid writable storage. The borrowed HWND remains live for this
@@ -218,8 +245,8 @@ fn ascii_lowercase(character: u16) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CABINET_WINDOW_CLASS, EXPLORE_WINDOW_CLASS, EXPLORER_IMAGE_NAME, process_image_is_explorer,
-        wide_ascii_eq_ignore_case, wide_path_basename_matches,
+        CABINET_WINDOW_CLASS, EXPLORE_WINDOW_CLASS, EXPLORER_IMAGE_NAME, TOOLTIP_WINDOW_CLASS,
+        process_image_is_explorer, wide_ascii_eq_ignore_case, wide_path_basename_matches,
     };
     use windows::Win32::System::Threading::GetCurrentProcessId;
 
@@ -247,6 +274,27 @@ mod tests {
             assert!(!wide_ascii_eq_ignore_case(
                 &class_name,
                 EXPLORE_WINDOW_CLASS
+            ));
+        }
+    }
+
+    #[test]
+    fn explorer_infotip_class_requires_an_exact_match() {
+        for class_name in ["tooltips_class32", "TOOLTIPS_CLASS32"] {
+            let class_name = class_name.encode_utf16().collect::<Vec<_>>();
+            assert!(wide_ascii_eq_ignore_case(&class_name, TOOLTIP_WINDOW_CLASS));
+        }
+
+        for class_name in [
+            "tooltips_class32_child",
+            "xtooltips_class32",
+            "tooltips_class3",
+            "CursorPeek.PreviewWindow",
+        ] {
+            let class_name = class_name.encode_utf16().collect::<Vec<_>>();
+            assert!(!wide_ascii_eq_ignore_case(
+                &class_name,
+                TOOLTIP_WINDOW_CLASS
             ));
         }
     }
