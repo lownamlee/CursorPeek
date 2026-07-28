@@ -132,6 +132,14 @@ settings, and uninstall details.
 2. Rest the pointer over a supported file in File Explorer.
 3. Move off the file to dismiss the preview; right-click the tray icon for controls.
 
+<p align="center">
+  <img
+    alt="CursorPeek previewing files in Windows File Explorer"
+    src="assets/readme/CursorPeek_demo.webp"
+    width="960"
+  />
+</p>
+
 ## 🗂️ Supported files
 
 | Type | Supported extensions or filenames |
@@ -153,6 +161,14 @@ Matching is case-insensitive. Images and text are validated before previewing. S
 
 Right-click the tray icon to pause previews or change the dwell delay, maximum preview size, theme,
 and startup behavior. See [settings and configuration](docs/USER_GUIDE.md#tray-menu).
+
+<p align="center">
+  <img
+    alt="CursorPeek notification-area menu"
+    src="assets/readme/CursorPeek_tray.png"
+    width="227"
+  />
+</p>
 
 ## 🛡️ Privacy and security
 
