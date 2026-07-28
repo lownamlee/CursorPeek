@@ -368,7 +368,23 @@ fn release_notes_render_downloads_highlights_and_verification() {
     );
 
     let output_path = fixture_root.join("release-notes.md");
-    let changelog_path = repository_path("CHANGELOG.md");
+    let changelog_path = fixture_root.join("CHANGELOG.md");
+    fs::write(
+        &changelog_path,
+        format!(
+            "# Changelog\n\n## [{version}] - 2026-07-28\n\n\
+             This release makes previews faster, more compact, and available from visible inactive Explorer\n\
+             windows.\n\n\
+             ### Added\n\n\
+             - Preview supported files in an unobscured Explorer window even while another application remains\n\
+               active.\n\n\
+             ### Changed\n\n\
+             - Size image previews from their natural dimensions.\n\n\
+             ### Security\n\n\
+             - Bind each request to its Explorer root.\n"
+        ),
+    )
+    .expect("the wrapped changelog fixture should be writable");
     let tag = format!("v{version}");
     let arguments = [
         "-Version",
@@ -409,6 +425,10 @@ fn release_notes_render_downloads_highlights_and_verification() {
     assert!(notes.contains("### Added"));
     assert!(notes.contains("### Changed"));
     assert!(notes.contains("### Security"));
+    assert!(notes.contains("visible inactive Explorer windows."));
+    assert!(notes.contains("another application remains active."));
+    assert!(!notes.contains("Explorer\nwindows."));
+    assert!(!notes.contains("remains\n  active."));
     assert!(notes.contains("## Verification"));
     assert!(notes.contains("[SHA256SUMS.txt]"));
     assert!(notes.contains("[CycloneDX SBOM]"));

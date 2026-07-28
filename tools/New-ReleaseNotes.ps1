@@ -44,6 +44,58 @@ function Resolve-RepositoryPath {
     return [System.IO.Path]::GetFullPath((Join-Path $repoRoot $Path))
 }
 
+function ConvertTo-ReleaseMarkdown {
+    param([Parameter(Mandatory = $true)][string] $Markdown)
+
+    $output = [System.Collections.Generic.List[string]]::new()
+    $pending = ''
+
+    foreach ($line in ($Markdown -replace "`r`n", "`n") -split "`n") {
+        $trimmed = $line.Trim()
+
+        if ([string]::IsNullOrWhiteSpace($trimmed)) {
+            if (-not [string]::IsNullOrWhiteSpace($pending)) {
+                $output.Add($pending)
+                $pending = ''
+            }
+            if ($output.Count -gt 0 -and $output[$output.Count - 1] -ne '') {
+                $output.Add('')
+            }
+            continue
+        }
+
+        if ($trimmed -match '^(#{1,6}\s|>|```|~~~|\|)') {
+            if (-not [string]::IsNullOrWhiteSpace($pending)) {
+                $output.Add($pending)
+                $pending = ''
+            }
+            $output.Add($trimmed)
+            continue
+        }
+
+        if ($trimmed -match '^([-+*]\s|\d+\.\s)') {
+            if (-not [string]::IsNullOrWhiteSpace($pending)) {
+                $output.Add($pending)
+            }
+            $pending = $trimmed
+            continue
+        }
+
+        if ([string]::IsNullOrWhiteSpace($pending)) {
+            $pending = $trimmed
+        }
+        else {
+            $pending = "$pending $trimmed"
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($pending)) {
+        $output.Add($pending)
+    }
+
+    return ($output -join "`n").Trim()
+}
+
 function Get-Sha256Hex {
     param([Parameter(Mandatory = $true)][string] $LiteralPath)
 
@@ -143,7 +195,7 @@ $releaseSection = [regex]::Match(
 if (-not $releaseSection.Success) {
     throw "The changelog has no release section for '$Version'."
 }
-$highlights = $releaseSection.Groups['body'].Value.Trim()
+$highlights = ConvertTo-ReleaseMarkdown $releaseSection.Groups['body'].Value
 if ([string]::IsNullOrWhiteSpace($highlights)) {
     throw "The '$Version' changelog section is empty."
 }
