@@ -33,7 +33,7 @@ const MAX_UNKNOWN_SETTINGS: usize = 64;
 const MAX_KNOWN_FOLDER_UNITS: usize = 32_767;
 const TEMPORARY_FILE_ATTEMPTS: usize = 32;
 
-const MIN_DWELL_DELAY_MS: u64 = 150;
+const MIN_DWELL_DELAY_MS: u64 = 50;
 const MAX_DWELL_DELAY_MS: u64 = 2_000;
 const MIN_PREVIEW_WIDTH: u16 = 320;
 const MAX_PREVIEW_WIDTH: u16 = 960;
@@ -73,13 +73,20 @@ impl Theme {
         }
     }
 
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::System => "system",
             Self::Light => "light",
             Self::Dark => "dark",
         }
     }
+}
+
+#[cfg(feature = "diagnostic-log")]
+pub(crate) fn diagnostics_directory() -> Result<PathBuf, SettingsError> {
+    Ok(current_local_app_data()?
+        .join(APPLICATION_DIRECTORY)
+        .join("diagnostics"))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -96,7 +103,7 @@ pub(crate) struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            dwell_delay_ms: 250,
+            dwell_delay_ms: 50,
             preview_width: 640,
             preview_height: 480,
             cache_entries: DEFAULT_PREVIEW_CACHE_ENTRIES,
@@ -390,7 +397,7 @@ const DUPLICATE_KEY: &str = "duplicate key";
 const TOO_MANY_UNKNOWN: &str = "more than 64 unknown settings are not allowed";
 const ENCODED_CONFIG_TOO_LARGE: &str = "encoded configuration exceeds 32768 bytes";
 const INVALID_UNSIGNED_INTEGER: &str = "expected an unsigned decimal integer";
-const INVALID_DWELL_DELAY: &str = "invalid `dwell_delay_ms` value: expected 150-2000";
+const INVALID_DWELL_DELAY: &str = "invalid `dwell_delay_ms` value: expected 50-2000";
 const INVALID_PREVIEW_WIDTH: &str = "invalid `preview_width` value: expected 320-960";
 const INVALID_PREVIEW_HEIGHT: &str = "invalid `preview_height` value: expected 240-720";
 const INVALID_CACHE_ENTRIES: &str = "invalid `cache_entries` value: expected 0-512";
@@ -908,7 +915,7 @@ mod tests {
         assert_eq!(
             text,
             "# CursorPeek settings\n\
-             dwell_delay_ms=250\n\
+             dwell_delay_ms=50\n\
              preview_width=640\n\
              preview_height=480\n\
              cache_entries=128\n\
@@ -920,16 +927,13 @@ mod tests {
             SettingsDocument::parse(text).expect("canonical defaults should parse"),
             document
         );
-        assert_eq!(
-            document.settings().dwell_delay(),
-            Duration::from_millis(250)
-        );
+        assert_eq!(document.settings().dwell_delay(), Duration::from_millis(50));
     }
 
     #[test]
     fn valid_values_and_unknown_settings_survive_canonical_save() {
         let input = "\u{feff}; user edit\n\
-             dwell_delay_ms = 150\n\
+             dwell_delay_ms = 50\n\
              preview_width=960\n\
              preview_height=720\n\
              cache_entries=512\n\
@@ -939,7 +943,7 @@ mod tests {
                      future.setting = 保留\n";
         let document = SettingsDocument::parse(input).expect("valid settings should parse");
 
-        assert_eq!(document.settings.dwell_delay_ms, 150);
+        assert_eq!(document.settings.dwell_delay_ms, 50);
         assert_eq!(document.settings.preview_width, 960);
         assert_eq!(document.settings.preview_height, 720);
         assert_eq!(document.settings.cache_entries, 512);
@@ -995,7 +999,7 @@ mod tests {
                 .contains("future=keep")
         );
 
-        assert!(document.set_dwell_delay_ms(149).is_err());
+        assert!(document.set_dwell_delay_ms(49).is_err());
         assert!(document.set_preview_size(319, 240).is_err());
         assert_eq!(document.settings().dwell_delay_ms(), 700);
         assert_eq!(document.settings().preview_width(), 800);
@@ -1004,7 +1008,7 @@ mod tests {
     #[test]
     fn malformed_duplicate_and_invalid_known_values_fail_closed() {
         for (input, expected) in [
-            ("dwell_delay_ms=149\n", "expected 150-2000"),
+            ("dwell_delay_ms=49\n", "expected 50-2000"),
             ("dwell_delay_ms=+400\n", "unsigned decimal"),
             ("preview_width=961\n", "expected 320-960"),
             ("preview_height=239\n", "expected 240-720"),
@@ -1106,7 +1110,7 @@ mod tests {
         let path = file.path();
         fs::create_dir_all(path.parent().expect("config has a parent"))
             .expect("config directory should be created");
-        let invalid = b"dwell_delay_ms=99\n";
+        let invalid = b"dwell_delay_ms=49\n";
         fs::write(path, invalid).expect("invalid fixture should be written");
 
         let error = file

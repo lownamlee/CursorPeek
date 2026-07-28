@@ -345,18 +345,18 @@ impl PopupMenu {
         let dwell = Self::new()?;
         dwell.append_command(
             DWELL_FAST_COMMAND,
-            w!("Fast (250 ms)"),
-            state.dwell_delay_ms == 250,
+            w!("Fast (50 ms)"),
+            state.dwell_delay_ms == 50,
         )?;
         dwell.append_command(
             DWELL_STANDARD_COMMAND,
-            w!("Standard (400 ms)"),
-            state.dwell_delay_ms == 400,
+            w!("Standard (100 ms)"),
+            state.dwell_delay_ms == 100,
         )?;
         dwell.append_command(
             DWELL_RELAXED_COMMAND,
-            w!("Relaxed (700 ms)"),
-            state.dwell_delay_ms == 700,
+            w!("Relaxed (250 ms)"),
+            state.dwell_delay_ms == 250,
         )?;
         settings.append_submenu(dwell, w!("Dwell delay"))?;
 
@@ -493,9 +493,9 @@ fn callback_anchor(wparam: WPARAM, lparam: LPARAM) -> Option<CallbackAnchor> {
 fn command_from_id(id: usize) -> Option<TrayCommand> {
     match id {
         TOGGLE_PAUSE_COMMAND => Some(TrayCommand::TogglePaused),
-        DWELL_FAST_COMMAND => Some(TrayCommand::SetDwellDelay(250)),
-        DWELL_STANDARD_COMMAND => Some(TrayCommand::SetDwellDelay(400)),
-        DWELL_RELAXED_COMMAND => Some(TrayCommand::SetDwellDelay(700)),
+        DWELL_FAST_COMMAND => Some(TrayCommand::SetDwellDelay(50)),
+        DWELL_STANDARD_COMMAND => Some(TrayCommand::SetDwellDelay(100)),
+        DWELL_RELAXED_COMMAND => Some(TrayCommand::SetDwellDelay(250)),
         PREVIEW_COMPACT_COMMAND => Some(TrayCommand::SetPreviewSize(480, 360)),
         PREVIEW_STANDARD_COMMAND => Some(TrayCommand::SetPreviewSize(640, 480)),
         PREVIEW_LARGE_COMMAND => Some(TrayCommand::SetPreviewSize(800, 600)),
@@ -595,15 +595,15 @@ mod tests {
         assert_eq!(command_from_id(EXIT_COMMAND), Some(TrayCommand::Exit));
         assert_eq!(
             command_from_id(DWELL_FAST_COMMAND),
-            Some(TrayCommand::SetDwellDelay(250))
+            Some(TrayCommand::SetDwellDelay(50))
         );
         assert_eq!(
             command_from_id(DWELL_STANDARD_COMMAND),
-            Some(TrayCommand::SetDwellDelay(400))
+            Some(TrayCommand::SetDwellDelay(100))
         );
         assert_eq!(
             command_from_id(DWELL_RELAXED_COMMAND),
-            Some(TrayCommand::SetDwellDelay(700))
+            Some(TrayCommand::SetDwellDelay(250))
         );
         assert_eq!(
             command_from_id(PREVIEW_COMPACT_COMMAND),
@@ -641,7 +641,7 @@ mod tests {
     fn settings_submenus_reflect_the_saved_product_state() {
         let menu = PopupMenu::create(TrayMenuState {
             paused: false,
-            dwell_delay_ms: 700,
+            dwell_delay_ms: 250,
             preview_width: 480,
             preview_height: 360,
             theme: Theme::Dark,

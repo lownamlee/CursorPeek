@@ -466,7 +466,7 @@ try {
         $utf8WithoutBom
     )
     $preservedConfig = $configText.Replace(
-        'dwell_delay_ms=250',
+        'dwell_delay_ms=50',
         'dwell_delay_ms=700'
     ) + "future_installer_test=preserved`n"
     [System.IO.File]::WriteAllText($configPath, $preservedConfig, $utf8WithoutBom)

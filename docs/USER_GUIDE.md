@@ -12,7 +12,7 @@ Run `CursorPeek.exe`. Its icon appears in the notification area. Windows may pla
 the notification-area overflow button.
 
 Open File Explorer and keep the pointer within a supported file item for the configured dwell delay
-(250 ms by default). The pointer may move inside that item before or after the preview appears.
+(50 ms by default). The pointer may move inside that item before or after the preview appears.
 Moving directly to another file uses a brief re-show delay while the complete Explorer and file
 checks run again. Leaving Explorer, scrolling, clicking, pressing Escape, changing the active view,
 or covering the hovered item dismisses the preview. Activating another application by itself does
@@ -30,9 +30,9 @@ Right-click the CursorPeek icon:
 
 - **Pause** / **Resume** — temporarily stops or resumes new previews. Pause is not persisted.
 - **Settings > Dwell delay**
-  - Fast: 250 ms
-  - Standard: 400 ms
-  - Relaxed: 700 ms
+  - Fast: 50 ms
+  - Standard: 100 ms
+  - Relaxed: 250 ms
 - **Settings > Maximum preview size**
   - Compact: 480 x 360
   - Standard: 640 x 480
@@ -186,7 +186,7 @@ The canonical file contains:
 
 ```ini
 # CursorPeek settings
-dwell_delay_ms=250
+dwell_delay_ms=50
 preview_width=640
 preview_height=480
 cache_entries=128
@@ -197,7 +197,7 @@ start_with_windows=false
 
 | Key | Accepted value |
 | --- | --- |
-| `dwell_delay_ms` | integer from 150 through 2000 |
+| `dwell_delay_ms` | integer from 50 through 2000 |
 | `preview_width` | maximum preview client width, from 320 through 960 |
 | `preview_height` | maximum preview client height, from 240 through 720 |
 | `cache_entries` | retained preview count from 0 through 512; `0` disables caching |

@@ -4,8 +4,8 @@ use cursorpeek_core::{PhysicalScreenRect, PhysicalScreenSpan};
 
 use super::{Generation, PhysicalScreenPoint};
 
-pub(crate) const DEFAULT_DWELL_DELAY: Duration = Duration::from_millis(250);
-pub(crate) const PREVIEW_RESHOW_DELAY: Duration = Duration::from_millis(50);
+pub(crate) const DEFAULT_DWELL_DELAY: Duration = Duration::from_millis(50);
+pub(crate) const PREVIEW_RESHOW_DELAY: Duration = Duration::from_millis(25);
 pub(crate) const PREVIEW_RESHOW_GRACE: Duration = Duration::from_millis(400);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -217,8 +217,8 @@ mod tests {
         assert_eq!(state.tracking_anchor(), Some(FIRST_POINT));
         assert!(state.track_motion(PhysicalScreenPoint::new(-100, 50)));
         assert_eq!(
-            state.on_timer(start + Duration::from_millis(125)),
-            DwellTimerEvent::Rearm(Duration::from_millis(125))
+            state.on_timer(start + Duration::from_millis(25)),
+            DwellTimerEvent::Rearm(Duration::from_millis(25))
         );
         assert_eq!(
             state.on_timer(start + DEFAULT_DWELL_DELAY),
@@ -309,11 +309,11 @@ mod tests {
             PREVIEW_RESHOW_DELAY
         );
         assert_eq!(
-            state.restart(SECOND_POINT, start + Duration::from_millis(200)),
+            state.restart(SECOND_POINT, start + Duration::from_millis(20)),
             PREVIEW_RESHOW_DELAY
         );
         assert_eq!(
-            state.on_timer(start + Duration::from_millis(250)),
+            state.on_timer(start + Duration::from_millis(45)),
             DwellTimerEvent::Candidate(DwellCandidate {
                 generation: Generation::from_raw(2),
                 anchor: SECOND_POINT,

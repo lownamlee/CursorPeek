@@ -544,13 +544,13 @@ try {
     $portableConfig = Join-Path $extractedRoot 'config.ini'
     $configText = Read-StrictUtf8 $portableConfig
     if (-not $configText.StartsWith("# CursorPeek settings`n") -or
-        -not $configText.Contains("dwell_delay_ms=250`n") -or
+        -not $configText.Contains("dwell_delay_ms=50`n") -or
         -not $configText.Contains("cache_entries=128`n") -or
         -not $configText.Contains("start_with_windows=false`n")) {
         throw 'Portable configuration does not contain canonical defaults.'
     }
     $preservedConfig = $configText.Replace(
-        "dwell_delay_ms=250`n",
+        "dwell_delay_ms=50`n",
         "dwell_delay_ms=700`n"
     ) + "future_portable_test=preserved`n"
     [System.IO.File]::WriteAllText(
