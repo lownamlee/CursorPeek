@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{
-    Generation, LegacyEncoding, PhysicalScreenPoint,
+    Generation, LegacyEncoding, PhysicalScreenPoint, PhysicalScreenRect,
     payload::{
         MAX_PREVIEW_PAYLOAD_LEN, MIN_PREVIEW_RESULT_LEN, PayloadError, PreviewResult,
         decode_result, encode_result,
@@ -13,10 +13,16 @@ use crate::{
 };
 
 const MAGIC: [u8; 4] = *b"CPWK";
-const VERSION: u16 = 5;
+const VERSION: u16 = 6;
 const HEADER_LEN: usize = 24;
 const NONCE_LEN: usize = 16;
 const MAX_LEGACY_ENCODING_WIRE_LEN: usize = 40;
+const TARGET_BOUNDS_FLAG_LEN: usize = 1;
+const TARGET_BOUNDS_LEN: usize = 16;
+const MIN_PREVIEW_RESPONSE_LEN: usize = TARGET_BOUNDS_FLAG_LEN + MIN_PREVIEW_RESULT_LEN;
+const MAX_PREVIEW_RESPONSE_LEN: usize =
+    TARGET_BOUNDS_FLAG_LEN + TARGET_BOUNDS_LEN + MAX_PREVIEW_PAYLOAD_LEN;
+const MAX_PROTOCOL_PAYLOAD_LEN: usize = MAX_PREVIEW_RESPONSE_LEN;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SessionNonce([u8; NONCE_LEN]);
@@ -42,6 +48,7 @@ pub enum WorkerMessage {
     },
     PreviewResult {
         generation: Generation,
+        target_bounds: Option<PhysicalScreenRect>,
         result: PreviewResult,
     },
 }
@@ -90,7 +97,7 @@ impl MessageKind {
             Self::Hello => (NONCE_LEN + 3, NONCE_LEN + MAX_LEGACY_ENCODING_WIRE_LEN),
             Self::Ready => (NONCE_LEN, NONCE_LEN),
             Self::ResolvePoint => (8, 8),
-            Self::PreviewResult => (MIN_PREVIEW_RESULT_LEN, MAX_PREVIEW_PAYLOAD_LEN),
+            Self::PreviewResult => (MIN_PREVIEW_RESPONSE_LEN, MAX_PREVIEW_RESPONSE_LEN),
         }
     }
 
@@ -119,7 +126,7 @@ impl FrameHeader {
 
         let kind = MessageKind::from_raw(u16::from_le_bytes([bytes[6], bytes[7]]))?;
         let payload_len = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-        if payload_len > MAX_PREVIEW_PAYLOAD_LEN as u32 {
+        if payload_len > MAX_PROTOCOL_PAYLOAD_LEN as u32 {
             return Err(ProtocolError::PayloadTooLarge(payload_len));
         }
 
@@ -171,6 +178,10 @@ pub enum ProtocolError {
         actual: usize,
     },
     InvalidLegacyEncoding,
+    InvalidTargetBoundsFlag(u8),
+    InvalidTargetBounds,
+    MissingTargetBounds,
+    UnexpectedTargetBounds,
     FrameLengthMismatch {
         expected: usize,
         actual: usize,
@@ -232,6 +243,24 @@ impl fmt::Display for ProtocolError {
             ),
             Self::InvalidLegacyEncoding => {
                 write!(formatter, "invalid legacy encoding in worker handshake")
+            }
+            Self::InvalidTargetBoundsFlag(flag) => {
+                write!(formatter, "invalid target-bounds presence flag {flag}")
+            }
+            Self::InvalidTargetBounds => {
+                write!(formatter, "worker returned an unordered target rectangle")
+            }
+            Self::MissingTargetBounds => {
+                write!(
+                    formatter,
+                    "successful preview result omitted its target rectangle"
+                )
+            }
+            Self::UnexpectedTargetBounds => {
+                write!(
+                    formatter,
+                    "status result unexpectedly included a target rectangle"
+                )
             }
             Self::FrameLengthMismatch { expected, actual } => write!(
                 formatter,
@@ -383,7 +412,11 @@ fn encode_message(message: WorkerMessage) -> Result<EncodedMessage, ProtocolErro
             payload.extend_from_slice(&point.y.to_le_bytes());
             payload
         }
-        WorkerMessage::PreviewResult { result, .. } => encode_result(&result)?,
+        WorkerMessage::PreviewResult {
+            target_bounds,
+            result,
+            ..
+        } => encode_preview_response(target_bounds, &result)?,
     };
     let payload_len =
         u32::try_from(payload.len()).map_err(|_| ProtocolError::PayloadTooLarge(u32::MAX))?;
@@ -443,10 +476,80 @@ fn decode_payload(header: FrameHeader, payload: &[u8]) -> Result<WorkerMessage, 
                 i32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]),
             ),
         }),
-        MessageKind::PreviewResult => Ok(WorkerMessage::PreviewResult {
-            generation: header.generation,
-            result: decode_result(payload)?,
-        }),
+        MessageKind::PreviewResult => {
+            let (target_bounds, result) = decode_preview_response(payload)?;
+            Ok(WorkerMessage::PreviewResult {
+                generation: header.generation,
+                target_bounds,
+                result,
+            })
+        }
+    }
+}
+
+fn encode_preview_response(
+    target_bounds: Option<PhysicalScreenRect>,
+    result: &PreviewResult,
+) -> Result<Vec<u8>, ProtocolError> {
+    validate_target_bounds(target_bounds, result)?;
+    let encoded_result = encode_result(result)?;
+    let mut payload = Vec::with_capacity(
+        TARGET_BOUNDS_FLAG_LEN
+            + target_bounds.map_or(0, |_| TARGET_BOUNDS_LEN)
+            + encoded_result.len(),
+    );
+    match target_bounds {
+        Some(bounds) => {
+            payload.push(1);
+            payload.extend_from_slice(&bounds.left().to_le_bytes());
+            payload.extend_from_slice(&bounds.top().to_le_bytes());
+            payload.extend_from_slice(&bounds.right().to_le_bytes());
+            payload.extend_from_slice(&bounds.bottom().to_le_bytes());
+        }
+        None => payload.push(0),
+    }
+    payload.extend_from_slice(&encoded_result);
+    Ok(payload)
+}
+
+fn decode_preview_response(
+    payload: &[u8],
+) -> Result<(Option<PhysicalScreenRect>, PreviewResult), ProtocolError> {
+    let (target_bounds, result_offset) = match payload[0] {
+        0 => (None, TARGET_BOUNDS_FLAG_LEN),
+        1 => {
+            if payload.len() < TARGET_BOUNDS_FLAG_LEN + TARGET_BOUNDS_LEN {
+                return Err(ProtocolError::InvalidTargetBounds);
+            }
+            let edge = |offset| {
+                i32::from_le_bytes(
+                    payload[offset..offset + 4]
+                        .try_into()
+                        .expect("the target-bounds length check guarantees four bytes"),
+                )
+            };
+            let bounds = PhysicalScreenRect::try_new(edge(1), edge(5), edge(9), edge(13))
+                .ok_or(ProtocolError::InvalidTargetBounds)?;
+            (Some(bounds), TARGET_BOUNDS_FLAG_LEN + TARGET_BOUNDS_LEN)
+        }
+        flag => return Err(ProtocolError::InvalidTargetBoundsFlag(flag)),
+    };
+    let result = decode_result(&payload[result_offset..])?;
+    validate_target_bounds(target_bounds, &result)?;
+    Ok((target_bounds, result))
+}
+
+fn validate_target_bounds(
+    target_bounds: Option<PhysicalScreenRect>,
+    result: &PreviewResult,
+) -> Result<(), ProtocolError> {
+    match (target_bounds, result) {
+        (Some(_), PreviewResult::Text(_) | PreviewResult::Image(_))
+        | (None, PreviewResult::Status(_)) => Ok(()),
+        (None, PreviewResult::Text(_) | PreviewResult::Image(_)) => {
+            Err(ProtocolError::MissingTargetBounds)
+        }
+        (Some(_), PreviewResult::Status(_)) => Err(ProtocolError::UnexpectedTargetBounds),
     }
 }
 
@@ -475,11 +578,12 @@ fn decode_frame(bytes: &[u8]) -> Result<WorkerMessage, ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HEADER_LEN, MAGIC, NONCE_LEN, ProtocolError, ProtocolStreamError, SessionNonce, VERSION,
-        WorkerMessage, decode_frame, encode_message, read_message, write_message,
+        HEADER_LEN, MAGIC, MAX_PROTOCOL_PAYLOAD_LEN, NONCE_LEN, ProtocolError, ProtocolStreamError,
+        SessionNonce, VERSION, WorkerMessage, decode_frame, encode_message, read_message,
+        write_message,
     };
     use crate::{
-        Generation, LegacyEncoding, PhysicalScreenPoint,
+        Generation, LegacyEncoding, PhysicalScreenPoint, PhysicalScreenRect,
         payload::{PayloadError, PreviewResult, ResolverStatus, TextPreview},
     };
     use std::io::{self, ErrorKind, Read, Write};
@@ -496,6 +600,7 @@ mod tests {
             request_message(),
             WorkerMessage::PreviewResult {
                 generation: Generation::from_raw(u64::MAX),
+                target_bounds: None,
                 result: PreviewResult::Status(ResolverStatus::TimedOut),
             },
         ]
@@ -548,13 +653,93 @@ mod tests {
         ] {
             let message = WorkerMessage::PreviewResult {
                 generation: Generation::from_raw(9),
+                target_bounds: None,
                 result: PreviewResult::Status(status),
             };
             let encoded = encode_message(message.clone()).unwrap();
 
-            assert_eq!(encoded.as_bytes().len(), HEADER_LEN + 8);
+            assert_eq!(encoded.as_bytes().len(), HEADER_LEN + 9);
             assert_eq!(decode_frame(encoded.as_bytes()), Ok(message));
         }
+    }
+
+    #[test]
+    fn successful_previews_require_ordered_target_bounds() {
+        let preview = PreviewResult::Text(TextPreview {
+            file_size: 6,
+            last_write_time: 10,
+            linked_content: false,
+            encoding_was_guessed: false,
+            truncated: false,
+            display_name: "sample.txt".to_owned(),
+            encoding: "utf-8".to_owned(),
+            text: "sample".to_owned(),
+        });
+        let bounds = PhysicalScreenRect::try_new(-100, 20, 300, 400).unwrap();
+        let message = WorkerMessage::PreviewResult {
+            generation: Generation::from_raw(11),
+            target_bounds: Some(bounds),
+            result: preview.clone(),
+        };
+        let encoded = encode_message(message.clone()).unwrap();
+        assert_eq!(decode_frame(encoded.as_bytes()), Ok(message));
+
+        assert!(matches!(
+            encode_message(WorkerMessage::PreviewResult {
+                generation: Generation::from_raw(11),
+                target_bounds: None,
+                result: preview,
+            }),
+            Err(ProtocolError::MissingTargetBounds)
+        ));
+        assert!(matches!(
+            encode_message(WorkerMessage::PreviewResult {
+                generation: Generation::from_raw(11),
+                target_bounds: Some(bounds),
+                result: PreviewResult::Status(ResolverStatus::Unavailable),
+            }),
+            Err(ProtocolError::UnexpectedTargetBounds)
+        ));
+    }
+
+    #[test]
+    fn malformed_target_bound_envelopes_fail_closed() {
+        let status = encode_message(WorkerMessage::PreviewResult {
+            generation: Generation::from_raw(1),
+            target_bounds: None,
+            result: PreviewResult::Status(ResolverStatus::Unavailable),
+        })
+        .unwrap();
+        let mut bad_flag = status.bytes;
+        bad_flag[HEADER_LEN] = 2;
+        assert_eq!(
+            decode_frame(&bad_flag),
+            Err(ProtocolError::InvalidTargetBoundsFlag(2))
+        );
+
+        let preview = PreviewResult::Text(TextPreview {
+            file_size: 1,
+            last_write_time: 0,
+            linked_content: false,
+            encoding_was_guessed: false,
+            truncated: false,
+            display_name: "a.txt".to_owned(),
+            encoding: "utf-8".to_owned(),
+            text: "a".to_owned(),
+        });
+        let bounds = PhysicalScreenRect::try_new(10, 20, 30, 40).unwrap();
+        let encoded = encode_message(WorkerMessage::PreviewResult {
+            generation: Generation::from_raw(2),
+            target_bounds: Some(bounds),
+            result: preview,
+        })
+        .unwrap();
+        let mut inverted = encoded.bytes;
+        inverted[HEADER_LEN + 9..HEADER_LEN + 13].copy_from_slice(&10_i32.to_le_bytes());
+        assert_eq!(
+            decode_frame(&inverted),
+            Err(ProtocolError::InvalidTargetBounds)
+        );
     }
 
     #[test]
@@ -595,10 +780,11 @@ mod tests {
         );
 
         let mut oversized = encoded.bytes.clone();
-        oversized[8..12].copy_from_slice(&(4 * 1024 * 1024_u32 + 1).to_le_bytes());
+        let oversized_length = u32::try_from(MAX_PROTOCOL_PAYLOAD_LEN + 1).unwrap();
+        oversized[8..12].copy_from_slice(&oversized_length.to_le_bytes());
         assert_eq!(
             decode_frame(&oversized),
-            Err(ProtocolError::PayloadTooLarge(4 * 1024 * 1024 + 1))
+            Err(ProtocolError::PayloadTooLarge(oversized_length))
         );
 
         let mut reserved = encoded.bytes.clone();
@@ -660,11 +846,12 @@ mod tests {
 
         let result = encode_message(WorkerMessage::PreviewResult {
             generation: Generation::from_raw(7),
+            target_bounds: None,
             result: PreviewResult::Status(ResolverStatus::Resolved),
         })
         .unwrap();
         let mut bad_status = result.bytes;
-        bad_status[HEADER_LEN + 4..HEADER_LEN + 8].copy_from_slice(&99_u32.to_le_bytes());
+        bad_status[HEADER_LEN + 5..HEADER_LEN + 9].copy_from_slice(&99_u32.to_le_bytes());
         assert_eq!(
             decode_frame(&bad_status),
             Err(ProtocolError::Payload(PayloadError::UnknownResolverStatus(
@@ -692,6 +879,7 @@ mod tests {
     fn stream_allocates_only_the_validated_variable_payload() {
         let message = WorkerMessage::PreviewResult {
             generation: Generation::from_raw(77),
+            target_bounds: PhysicalScreenRect::try_new(-20, 30, 200, 300),
             result: PreviewResult::Text(TextPreview {
                 file_size: 1_000_000,
                 last_write_time: 133_000_000_000_000_000,

@@ -29,6 +29,7 @@ use crate::worker::{
     CompletionNotifier, PendingWorkerPoll, PendingWorkerResolution, PreviewResult, WorkerManager,
     WorkerManagerError,
 };
+use cursorpeek_core::PhysicalScreenRect;
 
 use super::{PreviewWindow, StartupRegistration, TrayCommand, TrayIcon, TrayMenuState, TrayStatus};
 
@@ -558,10 +559,22 @@ impl MessageWindow {
         }
 
         match raw_input {
-            Ok(Some(RawInputActivity::Mouse(activity))) if activity.is_relevant() => {
+            Ok(Some(RawInputActivity::Mouse(activity))) if activity.interrupted() => {
+                self.cancel_dwell();
+            }
+            Ok(Some(RawInputActivity::Mouse(activity))) if activity.moved() => {
                 match physical_cursor_position() {
-                    Ok(point) => self
-                        .restart_dwell(PhysicalScreenPoint::new(point.x, point.y), Instant::now()),
+                    Ok(point) => {
+                        let point = PhysicalScreenPoint::new(point.x, point.y);
+                        if pointer_motion_stays_on_active_target(self.active_preview, point)
+                            && self.active_preview.is_some_and(|active| {
+                                is_foreground_explorer_window_at(active.anchor)
+                            })
+                        {
+                            return;
+                        }
+                        self.restart_dwell(point, Instant::now());
+                    }
                     Err(_) => self.cancel_dwell(),
                 }
             }
@@ -742,7 +755,12 @@ impl MessageWindow {
                             (generation, anchor)
                             && generation == anchor_generation
                         {
-                            self.show_worker_result(point, resolution.into_result());
+                            let (target_bounds, result) = resolution.into_parts();
+                            if let Some(target_bounds) = target_bounds {
+                                self.show_worker_result(point, target_bounds, result);
+                            } else {
+                                self.hide_product_preview();
+                            }
                         } else {
                             self.hide_product_preview();
                         }
@@ -788,8 +806,17 @@ impl MessageWindow {
         }
     }
 
-    fn show_worker_result(&mut self, anchor: PhysicalScreenPoint, result: PreviewResult) {
+    fn show_worker_result(
+        &mut self,
+        anchor: PhysicalScreenPoint,
+        target_bounds: PhysicalScreenRect,
+        result: PreviewResult,
+    ) {
         if matches!(result, PreviewResult::Status(_)) {
+            self.hide_product_preview();
+            return;
+        }
+        if !target_bounds.contains(anchor) {
             self.hide_product_preview();
             return;
         }
@@ -826,7 +853,11 @@ impl MessageWindow {
                     self.hide_product_preview();
                     return;
                 };
-                let active = ActivePreview { generation, anchor };
+                let active = ActivePreview {
+                    generation,
+                    anchor,
+                    target_bounds,
+                };
                 self.active_preview = Some(active);
                 PreviewEventHooks::set_target(Some(PreviewEventTarget {
                     message_window: self.hwnd,
@@ -856,7 +887,7 @@ impl MessageWindow {
             .ok()
             .map(|point| PhysicalScreenPoint::new(point.x, point.y));
         if !preview_context_is_current(
-            active.anchor,
+            active.target_bounds,
             current,
             is_foreground_explorer_window_at(active.anchor),
         ) {
@@ -1202,11 +1233,18 @@ fn accept_worker_completion(
 }
 
 fn preview_context_is_current(
-    anchor: PhysicalScreenPoint,
+    target_bounds: PhysicalScreenRect,
     current: Option<PhysicalScreenPoint>,
     foreground_explorer: bool,
 ) -> bool {
-    current == Some(anchor) && foreground_explorer
+    current.is_some_and(|point| target_bounds.contains(point)) && foreground_explorer
+}
+
+fn pointer_motion_stays_on_active_target(
+    active: Option<ActivePreview>,
+    current: PhysicalScreenPoint,
+) -> bool {
+    active.is_some_and(|active| active.target_bounds.contains(current))
 }
 
 fn preview_context_generation_matches(active: Option<ActivePreview>, generation: usize) -> bool {
@@ -1225,6 +1263,7 @@ fn preview_input_requires_dismissal(raw_input: &Result<Option<RawInputActivity>>
 struct ActivePreview {
     generation: Generation,
     anchor: PhysicalScreenPoint,
+    target_bounds: PhysicalScreenRect,
 }
 
 #[derive(Clone, Copy)]
@@ -1645,15 +1684,16 @@ mod tests {
         PREVIEW_WINDOW_DIAGNOSTIC_DURATION, PREVIEW_WINDOW_PRACTICE_DURATION,
         SYSTEM_LIFECYCLE_CHANGED_MESSAGE, SystemLifecycleChange, TASKBAR_CREATED_MESSAGE,
         TEST_PANIC_MESSAGE, TRAY_CALLBACK_MESSAGE, TRAY_EVENT_MESSAGE, WPARAM,
-        accept_worker_completion, post_worker_result, preview_context_generation_matches,
-        preview_context_is_current, preview_input_requires_dismissal, registered_raw_devices,
-        timer_interval_ms, tray_status,
+        accept_worker_completion, pointer_motion_stays_on_active_target, post_worker_result,
+        preview_context_generation_matches, preview_context_is_current,
+        preview_input_requires_dismissal, registered_raw_devices, timer_interval_ms, tray_status,
     };
     use crate::hover::{Generation, PhysicalScreenPoint};
     use crate::platform::windows::TrayStatus;
     use crate::platform::windows::explorer::is_explorer_window;
     use crate::platform::windows::input::{RawInputActivity, RawMouseActivity};
     use crate::worker::WorkerManager;
+    use cursorpeek_core::PhysicalScreenRect;
     use std::{
         sync::atomic::Ordering,
         thread,
@@ -2023,16 +2063,45 @@ mod tests {
     }
 
     #[test]
-    fn preview_guard_requires_the_exact_anchor_and_foreground_explorer() {
+    fn preview_guard_accepts_the_complete_target_rectangle_only_while_explorer_is_foreground() {
         let anchor = PhysicalScreenPoint::new(-400, 250);
-        assert!(preview_context_is_current(anchor, Some(anchor), true));
-        assert!(!preview_context_is_current(
-            anchor,
-            Some(PhysicalScreenPoint::new(-399, 250)),
+        let bounds = PhysicalScreenRect::try_new(-400, 250, -350, 300).unwrap();
+        assert!(preview_context_is_current(bounds, Some(anchor), true));
+        assert!(preview_context_is_current(
+            bounds,
+            Some(PhysicalScreenPoint::new(-351, 299)),
             true
         ));
-        assert!(!preview_context_is_current(anchor, Some(anchor), false));
-        assert!(!preview_context_is_current(anchor, None, true));
+        assert!(!preview_context_is_current(
+            bounds,
+            Some(PhysicalScreenPoint::new(-350, 299)),
+            true
+        ));
+        assert!(!preview_context_is_current(bounds, Some(anchor), false));
+        assert!(!preview_context_is_current(bounds, None, true));
+    }
+
+    #[test]
+    fn pointer_motion_preserves_only_the_active_target() {
+        let bounds = PhysicalScreenRect::try_new(100, 200, 300, 400).unwrap();
+        let active = Some(ActivePreview {
+            generation: Generation::from_raw(24),
+            anchor: PhysicalScreenPoint::new(150, 250),
+            target_bounds: bounds,
+        });
+
+        assert!(pointer_motion_stays_on_active_target(
+            active,
+            PhysicalScreenPoint::new(299, 399)
+        ));
+        assert!(!pointer_motion_stays_on_active_target(
+            active,
+            PhysicalScreenPoint::new(300, 399)
+        ));
+        assert!(!pointer_motion_stays_on_active_target(
+            None,
+            PhysicalScreenPoint::new(150, 250)
+        ));
     }
 
     #[test]
@@ -2041,6 +2110,7 @@ mod tests {
         let active = Some(ActivePreview {
             generation,
             anchor: PhysicalScreenPoint::new(300, 200),
+            target_bounds: PhysicalScreenRect::try_new(250, 150, 350, 250).unwrap(),
         });
 
         assert!(!preview_context_generation_matches(active, 24));

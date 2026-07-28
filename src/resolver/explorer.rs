@@ -757,6 +757,7 @@ fn shell_rejection_reason(reason: shell::ShellRejection) -> CorpusReason {
         ShellRejection::CandidateChangedDuringVerification => {
             CorpusReason::new("shell.candidate_changed")
         }
+        ShellRejection::InvalidTargetBounds => CorpusReason::new("shell.invalid_target_bounds"),
         ShellRejection::ViewItemFailed { index, code } => {
             CorpusReason::with_context("shell.view_item_failed", i64::from(index), i64::from(code))
         }

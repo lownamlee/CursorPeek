@@ -21,6 +21,7 @@ use std::{
 use crate::resolver::{PointResolver, ResolveOutcome};
 use crate::settings::LegacyEncoding;
 use cache::{PreviewCache, PreviewCacheKey, PreviewProvider};
+use cursorpeek_core::PhysicalScreenRect;
 use file::PreviewFile;
 use image::ImageDecodeResult;
 use payload::ResolverStatus;
@@ -63,9 +64,16 @@ where
             Some(_) => return Err(WorkerSessionError::ExpectedResolvePoint),
             None => return Ok(()),
         };
-        let result =
+        let (target_bounds, result) =
             resolver_result_with_cache(resolver.resolve(point), &legacy_encoding, &mut cache);
-        protocol::write_message(writer, WorkerMessage::PreviewResult { generation, result })?;
+        protocol::write_message(
+            writer,
+            WorkerMessage::PreviewResult {
+                generation,
+                target_bounds,
+                result,
+            },
+        )?;
     }
 }
 
@@ -73,18 +81,26 @@ fn resolver_result_with_cache(
     outcome: ResolveOutcome,
     legacy_encoding: &LegacyEncoding,
     cache: &mut PreviewCache,
-) -> PreviewResult {
+) -> (Option<PhysicalScreenRect>, PreviewResult) {
     match outcome {
-        ResolveOutcome::Resolved(target) => match PreviewFile::open(target.path()) {
-            Ok(file) => preview_file_result(&file, legacy_encoding, cache),
-            Err(error) if error.is_unsupported() => {
-                PreviewResult::Status(ResolverStatus::Unsupported)
-            }
-            Err(_) => PreviewResult::Status(ResolverStatus::Unavailable),
-        },
-        ResolveOutcome::Unsupported => PreviewResult::Status(ResolverStatus::Unsupported),
-        ResolveOutcome::Ambiguous => PreviewResult::Status(ResolverStatus::Ambiguous),
-        ResolveOutcome::Unavailable => PreviewResult::Status(ResolverStatus::Unavailable),
+        ResolveOutcome::Resolved(target) => {
+            let target_bounds = target.target_bounds();
+            let result = match PreviewFile::open(target.path()) {
+                Ok(file) => preview_file_result(&file, legacy_encoding, cache),
+                Err(error) if error.is_unsupported() => {
+                    PreviewResult::Status(ResolverStatus::Unsupported)
+                }
+                Err(_) => PreviewResult::Status(ResolverStatus::Unavailable),
+            };
+            (
+                matches!(result, PreviewResult::Text(_) | PreviewResult::Image(_))
+                    .then_some(target_bounds),
+                result,
+            )
+        }
+        ResolveOutcome::Unsupported => (None, PreviewResult::Status(ResolverStatus::Unsupported)),
+        ResolveOutcome::Ambiguous => (None, PreviewResult::Status(ResolverStatus::Ambiguous)),
+        ResolveOutcome::Unavailable => (None, PreviewResult::Status(ResolverStatus::Unavailable)),
     }
 }
 
@@ -148,7 +164,7 @@ fn preview_file_result(
 
 #[cfg(test)]
 fn resolver_result(outcome: ResolveOutcome, legacy_encoding: &LegacyEncoding) -> PreviewResult {
-    resolver_result_with_cache(outcome, legacy_encoding, &mut PreviewCache::default())
+    resolver_result_with_cache(outcome, legacy_encoding, &mut PreviewCache::default()).1
 }
 
 #[derive(Debug)]
@@ -198,10 +214,12 @@ mod tests {
     use crate::settings::LegacyEncoding;
     use crate::worker::payload::{PreviewResult, ResolverStatus};
     use ::image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
+    use cursorpeek_core::PhysicalScreenRect;
     use protocol::{SessionNonce, WorkerMessage};
     use std::{
         env, fs,
         io::Cursor,
+        path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
     };
 
@@ -210,6 +228,13 @@ mod tests {
         0x01,
     ]);
     static NEXT_TEST_FILE: AtomicU64 = AtomicU64::new(1);
+
+    fn resolved_target(path: PathBuf) -> ResolvedTarget {
+        ResolvedTarget::new(
+            path,
+            PhysicalScreenRect::try_new(-100, -50, 200, 250).unwrap(),
+        )
+    }
 
     struct UnavailableResolver;
 
@@ -231,7 +256,7 @@ mod tests {
             .expect("the resolved fixture should open")
             .is_linked_content();
         let PreviewResult::Text(preview) = resolver_result(
-            ResolveOutcome::Resolved(ResolvedTarget::new(path.clone())),
+            ResolveOutcome::Resolved(resolved_target(path.clone())),
             &LegacyEncoding::Auto,
         ) else {
             panic!("the resolved UTF-8 fixture should produce a text preview");
@@ -250,7 +275,7 @@ mod tests {
         fs::remove_file(&path).expect("the resolved fixture should be removed");
         assert_eq!(
             resolver_result(
-                ResolveOutcome::Resolved(ResolvedTarget::new(path)),
+                ResolveOutcome::Resolved(resolved_target(path)),
                 &LegacyEncoding::Auto,
             ),
             PreviewResult::Status(ResolverStatus::Unavailable)
@@ -264,7 +289,7 @@ mod tests {
             .expect("the disguised binary fixture should be written");
         assert_eq!(
             resolver_result(
-                ResolveOutcome::Resolved(ResolvedTarget::new(binary_path.clone())),
+                ResolveOutcome::Resolved(resolved_target(binary_path.clone())),
                 &LegacyEncoding::Auto,
             ),
             PreviewResult::Status(ResolverStatus::Unsupported)
@@ -280,7 +305,7 @@ mod tests {
             .expect("the malformed image fixture should be written");
         assert_eq!(
             resolver_result(
-                ResolveOutcome::Resolved(ResolvedTarget::new(malformed_image_path.clone())),
+                ResolveOutcome::Resolved(resolved_target(malformed_image_path.clone())),
                 &LegacyEncoding::Auto,
             ),
             PreviewResult::Status(ResolverStatus::Unavailable)
@@ -301,7 +326,7 @@ mod tests {
         fs::write(&image_path, encoded.into_inner())
             .expect("the valid image fixture should be written");
         let PreviewResult::Image(preview) = resolver_result(
-            ResolveOutcome::Resolved(ResolvedTarget::new(image_path.clone())),
+            ResolveOutcome::Resolved(resolved_target(image_path.clone())),
             &LegacyEncoding::Auto,
         ) else {
             panic!("the valid PNG should produce an image preview");
@@ -326,7 +351,7 @@ mod tests {
         ));
         fs::write(&legacy_path, b"I\x92").expect("the legacy text fixture should be written");
         let PreviewResult::Text(preview) = resolver_result(
-            ResolveOutcome::Resolved(ResolvedTarget::new(legacy_path.clone())),
+            ResolveOutcome::Resolved(resolved_target(legacy_path.clone())),
             &LegacyEncoding::Auto,
         ) else {
             panic!("the detected legacy fixture should produce a text preview");
@@ -336,7 +361,7 @@ mod tests {
         assert!(preview.encoding_was_guessed);
         assert_eq!(
             resolver_result(
-                ResolveOutcome::Resolved(ResolvedTarget::new(legacy_path.clone())),
+                ResolveOutcome::Resolved(resolved_target(legacy_path.clone())),
                 &LegacyEncoding::Off,
             ),
             PreviewResult::Status(ResolverStatus::Unsupported)
@@ -368,7 +393,7 @@ mod tests {
         let mut cache = PreviewCache::default();
         let resolve = |cache: &mut PreviewCache| {
             resolver_result_with_cache(
-                ResolveOutcome::Resolved(ResolvedTarget::new(path.clone())),
+                ResolveOutcome::Resolved(resolved_target(path.clone())),
                 &LegacyEncoding::Auto,
                 cache,
             )
@@ -382,9 +407,10 @@ mod tests {
         assert_eq!(cache.hit_count(), 1);
 
         fs::write(&path, b"second version").expect("the changed cache fixture should be written");
-        let PreviewResult::Text(changed) = resolve(&mut cache) else {
+        let (Some(bounds), PreviewResult::Text(changed)) = resolve(&mut cache) else {
             panic!("the changed file should still produce text");
         };
+        assert!(bounds.contains(PhysicalScreenPoint::new(0, 0)));
         assert_eq!(changed.text, "second version");
         assert_eq!(cache.hit_count(), 1);
         assert_eq!(cache.len(), 2);
@@ -433,6 +459,7 @@ mod tests {
                 protocol::read_message(&mut output).unwrap(),
                 Some(WorkerMessage::PreviewResult {
                     generation,
+                    target_bounds: None,
                     result: PreviewResult::Status(ResolverStatus::Unavailable),
                 })
             );
@@ -453,6 +480,7 @@ mod tests {
             &mut wrong_first,
             WorkerMessage::PreviewResult {
                 generation: Generation::from_raw(1),
+                target_bounds: None,
                 result: PreviewResult::Status(ResolverStatus::Unavailable),
             },
         )

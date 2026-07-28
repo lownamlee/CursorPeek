@@ -28,6 +28,7 @@ use windows::{
 };
 
 use crate::{hover::PhysicalScreenPoint, resolver::ResolvedTarget};
+use cursorpeek_core::PhysicalScreenRect;
 
 use super::candidate::CandidateEvidence;
 
@@ -93,6 +94,7 @@ pub(super) enum ShellRejection {
     NoCandidateViewAtPoint { inspected: i32 },
     CandidateRevalidationFailed(i32),
     CandidateChangedDuringVerification,
+    InvalidTargetBounds,
     ViewItemFailed { index: u32, code: i32 },
     ViewItemPathFailed { index: u32, code: i32 },
     ViewItemPathMalformed { index: u32 },
@@ -165,11 +167,23 @@ pub(super) fn verify(
         return rejected(ShellOutcome::Unavailable, reason);
     }
 
+    let Some(target_bounds) = PhysicalScreenRect::try_new(
+        evidence.item_bounds.left,
+        evidence.item_bounds.top,
+        evidence.item_bounds.right,
+        evidence.item_bounds.bottom,
+    ) else {
+        return rejected(
+            ShellOutcome::Unavailable,
+            ShellRejection::InvalidTargetBounds,
+        );
+    };
     let resolution = matching_item(
         &active_view.folder_view,
         evidence.path_units,
         evidence.display_name_units,
         evidence.view_index,
+        target_bounds,
     );
     if let Err(reason) = active_view.revalidate(point, evidence.item_native_window) {
         return rejected(ShellOutcome::Unavailable, reason);
@@ -493,6 +507,7 @@ fn matching_item(
     candidate_path: Option<&[u16]>,
     candidate_display_name: Option<&[u16]>,
     view_index: Option<u32>,
+    target_bounds: PhysicalScreenRect,
 ) -> Result<(ResolvedTarget, u32), ShellRejection> {
     // SAFETY: the view is apartment-local. The returned array/items are binding-owned COM
     // interfaces. GetDisplayName allocates with the COM task allocator; OwnedShellPath frees every
@@ -577,7 +592,7 @@ fn matching_item(
         }
 
         let path = PathBuf::from(OsString::from_wide(&path_units));
-        Ok((ResolvedTarget::new(path), count))
+        Ok((ResolvedTarget::new(path, target_bounds), count))
     }
 }
 

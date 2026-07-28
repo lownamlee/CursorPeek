@@ -3,6 +3,7 @@ mod explorer;
 use std::path::{Path, PathBuf};
 
 use crate::hover::PhysicalScreenPoint;
+use cursorpeek_core::PhysicalScreenRect;
 
 pub(crate) use explorer::{ExplorerResolver, ResolverError};
 
@@ -17,15 +18,23 @@ pub(crate) enum ResolveOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ResolvedTarget {
     path: PathBuf,
+    target_bounds: PhysicalScreenRect,
 }
 
 impl ResolvedTarget {
-    pub(crate) fn new(path: PathBuf) -> Self {
-        Self { path }
+    pub(crate) fn new(path: PathBuf, target_bounds: PhysicalScreenRect) -> Self {
+        Self {
+            path,
+            target_bounds,
+        }
     }
 
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) const fn target_bounds(&self) -> PhysicalScreenRect {
+        self.target_bounds
     }
 }
 

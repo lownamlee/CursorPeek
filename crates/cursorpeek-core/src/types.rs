@@ -27,6 +27,49 @@ impl PhysicalScreenPoint {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhysicalScreenRect {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+impl PhysicalScreenRect {
+    pub const fn try_new(left: i32, top: i32, right: i32, bottom: i32) -> Option<Self> {
+        if left < right && top < bottom {
+            Some(Self {
+                left,
+                top,
+                right,
+                bottom,
+            })
+        } else {
+            None
+        }
+    }
+
+    pub const fn left(self) -> i32 {
+        self.left
+    }
+
+    pub const fn top(self) -> i32 {
+        self.top
+    }
+
+    pub const fn right(self) -> i32 {
+        self.right
+    }
+
+    pub const fn bottom(self) -> i32 {
+        self.bottom
+    }
+
+    pub const fn contains(self, point: PhysicalScreenPoint) -> bool {
+        self.left <= point.x && point.x < self.right && self.top <= point.y && point.y < self.bottom
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LegacyEncoding {
     Auto,
@@ -82,7 +125,7 @@ fn is_encoding_label(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Generation, LegacyEncoding, PhysicalScreenPoint};
+    use super::{Generation, LegacyEncoding, PhysicalScreenPoint, PhysicalScreenRect};
 
     #[test]
     fn protocol_value_types_preserve_extreme_values() {
@@ -106,5 +149,18 @@ mod tests {
         assert_eq!(LegacyEncoding::parse("utf-8"), None);
         assert_eq!(LegacyEncoding::parse("x-user-defined"), None);
         assert_eq!(LegacyEncoding::parse("not-an-encoding"), None);
+    }
+
+    #[test]
+    fn physical_rectangles_are_ordered_and_use_half_open_edges() {
+        assert_eq!(PhysicalScreenRect::try_new(1, 2, 1, 3), None);
+        assert_eq!(PhysicalScreenRect::try_new(1, 2, 3, 2), None);
+
+        let bounds = PhysicalScreenRect::try_new(-10, -20, 30, 40).unwrap();
+        assert!(bounds.contains(PhysicalScreenPoint::new(-10, -20)));
+        assert!(bounds.contains(PhysicalScreenPoint::new(29, 39)));
+        assert!(!bounds.contains(PhysicalScreenPoint::new(30, 39)));
+        assert!(!bounds.contains(PhysicalScreenPoint::new(29, 40)));
+        assert!(!bounds.contains(PhysicalScreenPoint::new(-11, -20)));
     }
 }

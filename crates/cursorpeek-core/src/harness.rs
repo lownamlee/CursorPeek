@@ -156,6 +156,7 @@ mod tests {
             &mut result_frame,
             WorkerMessage::PreviewResult {
                 generation: Generation::from_raw(u64::MAX),
+                target_bounds: None,
                 result: PreviewResult::Status(ResolverStatus::Unavailable),
             },
         )

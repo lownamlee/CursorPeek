@@ -94,7 +94,8 @@ panics before they could unwind across the system ABI.
 ### Focus, click, and on-screen disclosure
 
 The preview uses a no-activate window, no-activate positioning, and
-`MA_NOACTIVATEANDEAT`. Foreground Explorer and anchor context remain prerequisites. Movement,
+`MA_NOACTIVATEANDEAT`. Foreground Explorer and the resolver-validated item rectangle remain
+prerequisites. Pointer motion inside that rectangle preserves the active generation. Leaving it,
 buttons, wheel input, Escape, selection/foreground changes, lifecycle changes, or a newer
 generation dismiss or invalidate the preview.
 

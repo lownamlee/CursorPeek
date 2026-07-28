@@ -24,6 +24,7 @@ use crate::{
     platform::{ContainedWorker, ProcessError, WorkerPipes},
     settings::LegacyEncoding,
 };
+use cursorpeek_core::PhysicalScreenRect;
 
 use super::{
     payload::{PreviewResult, ResolverStatus},
@@ -323,6 +324,7 @@ impl Drop for WorkerManager {
 pub(crate) struct WorkerResolution {
     generation: Generation,
     session_id: u64,
+    target_bounds: Option<PhysicalScreenRect>,
     result: PreviewResult,
 }
 
@@ -331,8 +333,8 @@ impl WorkerResolution {
         self.generation
     }
 
-    pub(crate) fn into_result(self) -> PreviewResult {
-        self.result
+    pub(crate) fn into_parts(self) -> (Option<PhysicalScreenRect>, PreviewResult) {
+        (self.target_bounds, self.result)
     }
 }
 
@@ -620,7 +622,8 @@ fn manager_loop(
                             Ok(WorkerResolution {
                                 generation,
                                 session_id,
-                                result,
+                                target_bounds: result.target_bounds,
+                                result: result.result,
                             }),
                         );
                     }
@@ -757,7 +760,7 @@ impl WorkerSession {
         &self,
         generation: Generation,
         point: PhysicalScreenPoint,
-    ) -> Result<PreviewResult, WorkerManagerError> {
+    ) -> Result<WorkerResponse, WorkerManagerError> {
         let (response_sender, response_receiver) = mpsc::sync_channel(1);
         self.command_sender
             .as_ref()
@@ -831,7 +834,12 @@ impl WorkerSession {
 struct ProtocolCommand {
     generation: Generation,
     point: PhysicalScreenPoint,
-    response_sender: SyncSender<Result<PreviewResult, WorkerManagerError>>,
+    response_sender: SyncSender<Result<WorkerResponse, WorkerManagerError>>,
+}
+
+struct WorkerResponse {
+    target_bounds: Option<PhysicalScreenRect>,
+    result: PreviewResult,
 }
 
 fn protocol_loop(
@@ -869,7 +877,11 @@ fn protocol_loop(
                     point: command.point,
                 },
             )?;
-            validate_result(protocol::read_message(&mut stdout)?, command.generation)
+            validate_result(
+                protocol::read_message(&mut stdout)?,
+                command.generation,
+                command.point,
+            )
         })();
         let failed = result.is_err();
         let _ = command.response_sender.send(result);
@@ -896,12 +908,21 @@ fn validate_ready(
 fn validate_result(
     message: Option<WorkerMessage>,
     expected_generation: Generation,
-) -> Result<PreviewResult, WorkerManagerError> {
+    expected_point: PhysicalScreenPoint,
+) -> Result<WorkerResponse, WorkerManagerError> {
     match message {
-        Some(WorkerMessage::PreviewResult { generation, result })
-            if generation == expected_generation =>
-        {
-            Ok(result)
+        Some(WorkerMessage::PreviewResult {
+            generation,
+            target_bounds,
+            result,
+        }) if generation == expected_generation => {
+            if target_bounds.is_some_and(|bounds| !bounds.contains(expected_point)) {
+                return Err(WorkerManagerError::TargetBoundsMismatch);
+            }
+            Ok(WorkerResponse {
+                target_bounds,
+                result,
+            })
         }
         Some(WorkerMessage::PreviewResult { .. }) => Err(WorkerManagerError::GenerationMismatch),
         Some(_) => Err(WorkerManagerError::UnexpectedResult),
@@ -997,6 +1018,7 @@ pub(crate) enum WorkerManagerError {
     WorkerExitedBeforeResult,
     UnexpectedResult,
     GenerationMismatch,
+    TargetBoundsMismatch,
     UnexpectedDiagnosticStatus,
     DeadlineExceeded,
     ProtocolChannelDisconnected,
@@ -1062,6 +1084,12 @@ impl fmt::Display for WorkerManagerError {
                 write!(formatter, "worker returned an unexpected result frame")
             }
             Self::GenerationMismatch => write!(formatter, "worker returned the wrong generation"),
+            Self::TargetBoundsMismatch => {
+                write!(
+                    formatter,
+                    "worker returned target bounds outside the requested point"
+                )
+            }
             Self::UnexpectedDiagnosticStatus => {
                 write!(formatter, "worker returned an unexpected diagnostic status")
             }
@@ -1158,6 +1186,7 @@ impl Error for WorkerManagerError {
             | Self::WorkerExitedBeforeResult
             | Self::UnexpectedResult
             | Self::GenerationMismatch
+            | Self::TargetBoundsMismatch
             | Self::UnexpectedDiagnosticStatus
             | Self::DeadlineExceeded
             | Self::ProtocolChannelDisconnected
@@ -1207,6 +1236,7 @@ mod tests {
             protocol::{SessionNonce, WorkerMessage},
         },
     };
+    use cursorpeek_core::PhysicalScreenRect;
     use std::{
         sync::atomic::{AtomicUsize, Ordering},
         thread,
@@ -1252,11 +1282,39 @@ mod tests {
             validate_result(
                 Some(WorkerMessage::PreviewResult {
                     generation: Generation::from_raw(2),
+                    target_bounds: None,
                     result: PreviewResult::Status(ResolverStatus::Unavailable),
                 }),
                 Generation::from_raw(1),
+                PhysicalScreenPoint::new(10, 20),
             ),
             Err(WorkerManagerError::GenerationMismatch)
+        ));
+    }
+
+    #[test]
+    fn parent_rejects_preview_bounds_that_do_not_contain_the_requested_point() {
+        let target_bounds = PhysicalScreenRect::try_new(100, 100, 200, 200).unwrap();
+        assert!(matches!(
+            validate_result(
+                Some(WorkerMessage::PreviewResult {
+                    generation: Generation::from_raw(1),
+                    target_bounds: Some(target_bounds),
+                    result: PreviewResult::Text(cursorpeek_core::payload::TextPreview {
+                        file_size: 1,
+                        last_write_time: 0,
+                        linked_content: false,
+                        encoding_was_guessed: false,
+                        truncated: false,
+                        display_name: "sample.txt".to_owned(),
+                        encoding: "utf-8".to_owned(),
+                        text: "sample".to_owned(),
+                    }),
+                }),
+                Generation::from_raw(1),
+                PhysicalScreenPoint::new(200, 150),
+            ),
+            Err(WorkerManagerError::TargetBoundsMismatch)
         ));
     }
 
@@ -1287,6 +1345,7 @@ mod tests {
             .send(Ok(WorkerResolution {
                 generation: Generation::from_raw(2),
                 session_id: 7,
+                target_bounds: None,
                 result: PreviewResult::Status(ResolverStatus::Unavailable),
             }))
             .unwrap();
@@ -1295,6 +1354,7 @@ mod tests {
             WorkerResolution {
                 generation: Generation::from_raw(2),
                 session_id: 7,
+                target_bounds: None,
                 result: PreviewResult::Status(ResolverStatus::Unavailable),
             }
         );
@@ -1334,6 +1394,7 @@ mod tests {
             .send(Ok(WorkerResolution {
                 generation: Generation::from_raw(9),
                 session_id: 4,
+                target_bounds: None,
                 result: PreviewResult::Status(ResolverStatus::Resolved),
             }))
             .unwrap();
@@ -1459,6 +1520,7 @@ mod tests {
             .send(Ok(WorkerResolution {
                 generation: Generation::from_raw(1),
                 session_id: 1,
+                target_bounds: None,
                 result: PreviewResult::Status(ResolverStatus::Unavailable),
             }))
             .unwrap();
@@ -1476,6 +1538,7 @@ mod tests {
             .send(Ok(WorkerResolution {
                 generation: Generation::from_raw(10_000),
                 session_id: 1,
+                target_bounds: None,
                 result: PreviewResult::Status(ResolverStatus::Unavailable),
             }))
             .unwrap();

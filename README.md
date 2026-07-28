@@ -90,7 +90,7 @@ settings, and uninstall details.
 
 1. Run `CursorPeek.exe`.
 2. Rest the pointer over a supported file in File Explorer.
-3. Move the pointer to dismiss the preview; right-click the tray icon for controls.
+3. Move off the file to dismiss the preview; right-click the tray icon for controls.
 
 ## 🗂️ Supported files
 
