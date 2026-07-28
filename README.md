@@ -179,6 +179,12 @@ cargo build --locked --release
 
 See the [development setup](CONTRIBUTING.md#development-setup) for tests and packaging.
 
+## 🙏 Acknowledgements
+
+CursorPeek is inspired by [QTTabBar](https://github.com/indiff/qttabbar) and its file-preview
+experience. QTTabBar was originally created by [Quizo](http://qttabbar.wikidot.com/) and later
+carried forward by open-source maintainers and contributors.
+
 ## 🤝 Contributing
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Report vulnerabilities
