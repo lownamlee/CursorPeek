@@ -31,6 +31,7 @@ use windows::{
 };
 
 use crate::{
+    diagnostics,
     hover::PhysicalScreenPoint,
     platform::{ApartmentKind, ComApartment},
 };
@@ -54,6 +55,8 @@ pub(crate) struct ExplorerResolver {
 
 impl ExplorerResolver {
     pub(crate) fn initialize() -> Result<Self, ResolverError> {
+        let started = diagnostics::counter();
+        diagnostics::record("resolver.initialize", format_args!("state=started"));
         let apartment = ComApartment::initialize(ApartmentKind::MultiThreaded)?;
         let timeout_ms = u32::try_from(UI_AUTOMATION_TIMEOUT.as_millis())
             .expect("the fixed UI Automation timeout fits DWORD milliseconds");
@@ -141,7 +144,7 @@ impl ExplorerResolver {
         };
         let shell_windows = shell::create_collection()?;
 
-        Ok(Self {
+        let resolver = Self {
             automation,
             cache_request,
             control_walker,
@@ -151,7 +154,16 @@ impl ExplorerResolver {
             item_index_property,
             last_trace: None,
             _apartment: apartment,
-        })
+        };
+        diagnostics::record(
+            "resolver.initialize",
+            format_args!(
+                "state=ready uia_timeout_ms={} elapsed_us={}",
+                UI_AUTOMATION_TIMEOUT.as_millis(),
+                diagnostics::elapsed_us(started).unwrap_or(0)
+            ),
+        );
+        Ok(resolver)
     }
 
     fn select_active_view(
@@ -458,10 +470,23 @@ impl PointResolver for ExplorerResolver {
         point: PhysicalScreenPoint,
         explorer_window: Option<cursorpeek_core::ExplorerWindowId>,
     ) -> ResolveOutcome {
+        let uia_started = diagnostics::counter();
         let PointInspection {
             trace: uia,
             item_element,
         } = self.inspect_point(point);
+        diagnostics::record(
+            "resolver.uia",
+            format_args!(
+                "outcome={} elapsed_us={}",
+                match &uia {
+                    ResolutionTrace::Candidate(_) => "candidate",
+                    ResolutionTrace::Rejected(_) => "rejected",
+                },
+                diagnostics::elapsed_us(uia_started).unwrap_or(0)
+            ),
+        );
+        let shell_started = diagnostics::counter();
         let (outcome, shell) = match &uia {
             ResolutionTrace::Rejected(_) => (
                 ResolveOutcome::Unavailable,
@@ -513,8 +538,34 @@ impl PointResolver for ExplorerResolver {
         };
         let trace = ExplorerTrace { uia, shell };
         debug_assert!(trace.invariant_holds(point));
+        diagnostics::record(
+            "resolver.shell",
+            format_args!(
+                "stage={} outcome={} elapsed_us={}",
+                shell_stage_kind(&trace.shell),
+                resolve_outcome_kind(&outcome),
+                diagnostics::elapsed_us(shell_started).unwrap_or(0)
+            ),
+        );
         self.last_trace = Some(trace);
         outcome
+    }
+}
+
+fn resolve_outcome_kind(outcome: &ResolveOutcome) -> &'static str {
+    match outcome {
+        ResolveOutcome::Resolved(_) => "resolved",
+        ResolveOutcome::Unsupported => "unsupported",
+        ResolveOutcome::Ambiguous => "ambiguous",
+        ResolveOutcome::Unavailable => "unavailable",
+    }
+}
+
+fn shell_stage_kind(stage: &ShellStageTrace) -> &'static str {
+    match stage {
+        ShellStageTrace::NotAttemptedAfterUiaRejection => "not-attempted-uia-rejection",
+        ShellStageTrace::NotAttempted(_) => "not-attempted-missing-evidence",
+        ShellStageTrace::Attempted(_) => "attempted",
     }
 }
 

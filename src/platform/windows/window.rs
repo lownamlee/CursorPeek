@@ -20,6 +20,7 @@ use super::input::{
     RawInputActivity, RawInputRegistration, physical_cursor_position, read_raw_input_activity,
 };
 
+use crate::diagnostics;
 use crate::hover::{
     DEFAULT_DWELL_DELAY, DwellTimerEvent, Generation, HoverState, INPUT_SAMPLE_INTERVAL,
     InputCoverage, InputCoverageReport, PhysicalScreenPoint,
@@ -582,12 +583,23 @@ impl MessageWindow {
 
         match raw_input {
             Ok(Some(RawInputActivity::Mouse(activity))) if activity.interrupted() => {
+                diagnostics::record(
+                    "input.mouse",
+                    format_args!(
+                        "action=interrupt generation={}",
+                        self.hover_state.generation().get()
+                    ),
+                );
                 self.cancel_dwell();
             }
             Ok(Some(RawInputActivity::Mouse(activity))) if activity.moved() => {
                 match physical_cursor_position() {
                     Ok(point) => {
                         let point = PhysicalScreenPoint::new(point.x, point.y);
+                        diagnostics::record(
+                            "input.mouse",
+                            format_args!("action=move x={} y={}", point.x, point.y),
+                        );
                         let now = Instant::now();
                         let active_preview = self.active_preview;
                         let preview_handle =
@@ -613,12 +625,25 @@ impl MessageWindow {
                             PreviewPointerMotion::Cancel => self.cancel_dwell(),
                         }
                     }
-                    Err(_) => self.cancel_dwell(),
+                    Err(_) => {
+                        diagnostics::record("input.mouse", format_args!("action=position_failed"));
+                        self.cancel_dwell();
+                    }
                 }
             }
             Ok(Some(RawInputActivity::Mouse(_))) => {}
-            Ok(Some(RawInputActivity::Keyboard)) => self.cancel_dwell(),
-            Ok(None) | Err(_) => self.cancel_dwell(),
+            Ok(Some(RawInputActivity::Keyboard)) => {
+                diagnostics::record("input.keyboard", format_args!("action=interrupt"));
+                self.cancel_dwell();
+            }
+            Ok(None) => {
+                diagnostics::record("input.raw", format_args!("action=empty"));
+                self.cancel_dwell();
+            }
+            Err(_) => {
+                diagnostics::record("input.raw", format_args!("action=read_failed"));
+                self.cancel_dwell();
+            }
         }
     }
 
@@ -697,16 +722,40 @@ impl MessageWindow {
     ) {
         self.tracked_explorer_window = Some(explorer_window);
         let interval = self.hover_state.restart(point, now);
+        diagnostics::record(
+            "hover.dwell.started",
+            format_args!(
+                "generation={} x={} y={} explorer={} delay_us={} reshow=false",
+                self.hover_state.generation().get(),
+                point.x,
+                point.y,
+                explorer_window.get(),
+                interval.as_micros()
+            ),
+        );
         self.arm_dwell(interval);
     }
 
     fn track_or_restart_dwell(&mut self, point: PhysicalScreenPoint, now: Instant) {
         if self.hover_state.tracking_anchor().is_some()
-            && let Some(tracked) = self.tracked_explorer_window
-            && point_belongs_to_explorer_window(point, tracked)
+            && let Some(tracked_explorer) = self.tracked_explorer_window
+            && point_belongs_to_explorer_window(point, tracked_explorer)
         {
-            let tracked = self.hover_state.track_motion(point);
-            debug_assert!(tracked, "a retained anchor belongs to tracked hover state");
+            let motion_tracked = self.hover_state.track_motion(point);
+            debug_assert!(
+                motion_tracked,
+                "a retained anchor belongs to tracked hover state"
+            );
+            diagnostics::record(
+                "hover.dwell.motion",
+                format_args!(
+                    "generation={} x={} y={} explorer={}",
+                    self.hover_state.generation().get(),
+                    point.x,
+                    point.y,
+                    tracked_explorer.get()
+                ),
+            );
             return;
         }
 
@@ -724,6 +773,17 @@ impl MessageWindow {
     ) {
         self.tracked_explorer_window = Some(explorer_window);
         let interval = self.hover_state.restart_after_preview(point, now);
+        diagnostics::record(
+            "hover.dwell.started",
+            format_args!(
+                "generation={} x={} y={} explorer={} delay_us={} reshow=true",
+                self.hover_state.generation().get(),
+                point.x,
+                point.y,
+                explorer_window.get(),
+                interval.as_micros()
+            ),
+        );
         self.arm_dwell(interval);
     }
 
@@ -733,6 +793,14 @@ impl MessageWindow {
             .dwell_timer
             .as_mut()
             .is_some_and(|timer| timer.arm(interval).is_ok());
+        diagnostics::record(
+            "hover.timer.armed",
+            format_args!(
+                "generation={} delay_us={} success={armed}",
+                self.hover_state.generation().get(),
+                interval.as_micros()
+            ),
+        );
 
         if !armed {
             self.cancel_dwell();
@@ -740,6 +808,15 @@ impl MessageWindow {
     }
 
     fn cancel_dwell(&mut self) {
+        diagnostics::record(
+            "hover.cancelled",
+            format_args!(
+                "generation={} tracked={} preview_visible={}",
+                self.hover_state.generation().get(),
+                self.hover_state.tracking_anchor().is_some(),
+                self.active_preview.is_some()
+            ),
+        );
         self.invalidate_worker_delivery();
         self.hover_state.cancel();
         self.tracked_explorer_window = None;
@@ -763,6 +840,14 @@ impl MessageWindow {
         match self.hover_state.on_timer(now) {
             DwellTimerEvent::Inactive => {}
             DwellTimerEvent::Rearm(remaining) => {
+                diagnostics::record(
+                    "hover.timer.rearmed",
+                    format_args!(
+                        "generation={} remaining_us={}",
+                        self.hover_state.generation().get(),
+                        remaining.as_micros()
+                    ),
+                );
                 let armed = self
                     .dwell_timer
                     .as_mut()
@@ -784,6 +869,19 @@ impl MessageWindow {
                 // Keep the validated generation attached through the manager, protocol, and UI
                 // delivery boundaries so later input can invalidate this exact request.
                 let (generation, anchor, point, pointer_span) = candidate.into_parts();
+                diagnostics::record(
+                    "hover.dwell.completed",
+                    format_args!(
+                        "generation={} anchor_x={} anchor_y={} current_x={} current_y={} \
+                         explorer={}",
+                        generation.get(),
+                        anchor.x,
+                        anchor.y,
+                        point.x,
+                        point.y,
+                        explorer_window.get()
+                    ),
+                );
                 if !point_belongs_to_explorer_window(anchor, explorer_window)
                     || !point_belongs_to_explorer_window(point, explorer_window)
                 {
@@ -808,12 +906,24 @@ impl MessageWindow {
                     notifier,
                 ) {
                     Ok(pending) => pending,
-                    Err(_) => {
+                    Err(error) => {
+                        diagnostics::record(
+                            "worker.request.submit",
+                            format_args!(
+                                "generation={} outcome=error category={}",
+                                generation.get(),
+                                error.category()
+                            ),
+                        );
                         self.hover_state.finish_resolution(generation);
                         self.set_worker_recovering(true);
                         return;
                     }
                 };
+                diagnostics::record(
+                    "worker.request.submit",
+                    format_args!("generation={} outcome=queued", generation.get()),
+                );
 
                 self.pending_worker_resolution = Some(pending);
                 self.pending_worker_anchor = Some((generation, point, explorer_window));
@@ -833,6 +943,14 @@ impl MessageWindow {
                 let anchor = self.pending_worker_anchor.take();
                 match result {
                     Ok(resolution) => {
+                        diagnostics::record(
+                            "worker.request.completed",
+                            format_args!(
+                                "generation={} outcome=success session={}",
+                                resolution.generation().get(),
+                                resolution.session_id()
+                            ),
+                        );
                         self.set_worker_recovering(false);
                         let generation = accept_worker_completion(
                             self.hover_state.generation(),
@@ -845,6 +963,15 @@ impl MessageWindow {
                             && generation == anchor_generation
                         {
                             let (target_bounds, result) = resolution.into_parts();
+                            diagnostics::record(
+                                "worker.result.validated",
+                                format_args!(
+                                    "generation={} kind={} target_bounds={}",
+                                    generation.get(),
+                                    preview_result_kind(&result),
+                                    target_bounds.is_some()
+                                ),
+                            );
                             let current = self.refresh_tracked_pointer();
                             if result.status() == Some(ResolverStatus::PointerMoved) {
                                 self.restart_after_pointer_span_rejection(current);
@@ -871,6 +998,14 @@ impl MessageWindow {
                         }
                     }
                     Err(error) => {
+                        diagnostics::record(
+                            "worker.request.completed",
+                            format_args!(
+                                "generation={} outcome=error category={}",
+                                self.hover_state.generation().get(),
+                                error.category()
+                            ),
+                        );
                         if !error.is_request_cancellation() {
                             self.set_worker_recovering(true);
                         }
@@ -940,7 +1075,26 @@ impl MessageWindow {
         target_bounds: PhysicalScreenRect,
         result: PreviewResult,
     ) {
+        let show_started = diagnostics::counter();
+        let generation = self.latest_worker_completion.map_or(0, Generation::get);
+        let result_kind = preview_result_kind(&result);
+        diagnostics::record(
+            "preview.show.requested",
+            format_args!(
+                "generation={generation} kind={} target_left={} target_top={} \
+                 target_right={} target_bottom={}",
+                result_kind,
+                target_bounds.left(),
+                target_bounds.top(),
+                target_bounds.right(),
+                target_bounds.bottom()
+            ),
+        );
         if matches!(result, PreviewResult::Status(_)) {
+            diagnostics::record(
+                "preview.show.rejected",
+                format_args!("generation={generation} reason=status"),
+            );
             self.hide_product_preview();
             return;
         }
@@ -948,6 +1102,10 @@ impl MessageWindow {
             || !point_belongs_to_explorer_window(anchor, explorer_window)
             || !explorer_window_is_available(explorer_window)
         {
+            diagnostics::record(
+                "preview.show.rejected",
+                format_args!("generation={generation} reason=context_changed"),
+            );
             self.hide_product_preview();
             return;
         }
@@ -964,8 +1122,16 @@ impl MessageWindow {
                 .settings()
                 .theme();
             let Ok(preview) = PreviewWindow::create_with_theme(theme) else {
+                diagnostics::record(
+                    "preview.window.create",
+                    format_args!("generation={generation} outcome=error"),
+                );
                 return;
             };
+            diagnostics::record(
+                "preview.window.create",
+                format_args!("generation={generation} outcome=success"),
+            );
             self.preview_window = Some(preview);
         }
 
@@ -980,6 +1146,14 @@ impl MessageWindow {
         };
         match shown {
             Ok(_) => {
+                diagnostics::record(
+                    "preview.visible",
+                    format_args!(
+                        "generation={generation} kind={} show_us={}",
+                        result_kind,
+                        diagnostics::elapsed_us(show_started).unwrap_or(0)
+                    ),
+                );
                 let Some(generation) = self.latest_worker_completion else {
                     self.hide_product_preview();
                     return;
@@ -1004,6 +1178,13 @@ impl MessageWindow {
                 }
             }
             Err(_) => {
+                diagnostics::record(
+                    "preview.show.failed",
+                    format_args!(
+                        "generation={generation} show_us={}",
+                        diagnostics::elapsed_us(show_started).unwrap_or(0)
+                    ),
+                );
                 self.clear_product_preview_state();
                 drop(self.preview_window.take());
             }
@@ -1081,6 +1262,15 @@ impl MessageWindow {
     }
 
     fn hide_product_preview(&mut self) {
+        if self.active_preview.is_some() {
+            diagnostics::record(
+                "preview.hidden",
+                format_args!(
+                    "generation={}",
+                    self.latest_worker_completion.map_or(0, Generation::get)
+                ),
+            );
+        }
         self.clear_product_preview_state();
         if self.preview_diagnostics.is_none()
             && let Some(preview) = self.preview_window.as_ref()
@@ -1416,6 +1606,14 @@ fn classify_preview_pointer_motion(
         }
         Some(_) => PreviewPointerMotion::Reshow,
         None => PreviewPointerMotion::Restart,
+    }
+}
+
+fn preview_result_kind(result: &PreviewResult) -> &'static str {
+    match result {
+        PreviewResult::Status(_) => "status",
+        PreviewResult::Text(_) => "text",
+        PreviewResult::Image(_) => "image",
     }
 }
 

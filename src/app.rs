@@ -3,6 +3,7 @@ use std::{error::Error, fmt, io, time::Instant};
 #[cfg(feature = "resolver-corpus")]
 use crate::corpus;
 use crate::{
+    diagnostics,
     hover::INPUT_DIAGNOSTIC_DURATION,
     mode::ProcessMode,
     platform::{
@@ -18,13 +19,45 @@ use crate::{
 };
 
 pub(crate) fn run(process_mode: ProcessMode) -> Result<(), AppError> {
+    #[cfg(feature = "diagnostic-log")]
+    let _diagnostic_guard = diagnostics::initialize(process_mode.as_str()).ok();
+    #[cfg(not(feature = "diagnostic-log"))]
+    let _diagnostic_guard =
+        diagnostics::initialize(process_mode.as_str()).unwrap_or_else(|never| match never {});
+
+    diagnostics::record(
+        "process.start",
+        format_args!(
+            "version={} mode={} diagnostic_build={}",
+            env!("CARGO_PKG_VERSION"),
+            process_mode.as_str(),
+            cfg!(feature = "diagnostic-log")
+        ),
+    );
+    let result = run_inner(process_mode);
+    match &result {
+        Ok(()) => diagnostics::record("process.stop", format_args!("outcome=success")),
+        Err(error) => diagnostics::record(
+            "process.stop",
+            format_args!("outcome=error category={}", error.category()),
+        ),
+    }
+    result
+}
+
+fn run_inner(process_mode: ProcessMode) -> Result<(), AppError> {
     let startup_started = Instant::now();
     verify_per_monitor_v2()?;
+    diagnostics::record("startup.dpi", format_args!("per_monitor_v2=true"));
 
     let _single_instance_guard = if process_mode == ProcessMode::Main {
         match SingleInstance::acquire()? {
             Some(instance) => Some(instance),
             None => {
+                diagnostics::record(
+                    "startup.single_instance",
+                    format_args!("outcome=activate_existing"),
+                );
                 activate_existing_instance()?;
                 return Ok(());
             }
@@ -32,6 +65,10 @@ pub(crate) fn run(process_mode: ProcessMode) -> Result<(), AppError> {
     } else {
         None
     };
+    diagnostics::record(
+        "startup.single_instance",
+        format_args!("owned={}", _single_instance_guard.is_some()),
+    );
 
     let _apartment = match process_mode {
         ProcessMode::Main
@@ -53,11 +90,30 @@ pub(crate) fn run(process_mode: ProcessMode) -> Result<(), AppError> {
         #[cfg(feature = "resolver-corpus")]
         ProcessMode::ResolverCorpusProbe => None,
     };
+    diagnostics::record(
+        "startup.com",
+        format_args!("initialized={}", _apartment.is_some()),
+    );
 
     match process_mode {
         ProcessMode::Main => {
             let settings_file = SettingsFile::discover()?;
             let settings = settings_file.load_or_create()?;
+            diagnostics::record(
+                "settings.loaded",
+                format_args!(
+                    "mode={} dwell_ms={} preview_width={} preview_height={} cache_entries={} \
+                     theme={} legacy_encoding={:?} startup={}",
+                    settings_file.mode().as_str(),
+                    settings.settings().dwell_delay_ms(),
+                    settings.settings().preview_width(),
+                    settings.settings().preview_height(),
+                    settings.settings().cache_entries(),
+                    settings.settings().theme().as_str(),
+                    settings.settings().legacy_encoding(),
+                    settings.settings().start_with_windows()
+                ),
+            );
             let preview_size = PreviewSize::new(
                 u32::from(settings.settings().preview_width()),
                 u32::from(settings.settings().preview_height()),
@@ -70,6 +126,10 @@ pub(crate) fn run(process_mode: ProcessMode) -> Result<(), AppError> {
                 settings.settings().legacy_encoding().clone(),
                 settings.settings().cache_entries(),
             )?;
+            diagnostics::record(
+                "worker.manager",
+                format_args!("state=started prewarm=requested"),
+            );
             message_window.run_application(worker_manager, settings_file, settings)?;
         }
         ProcessMode::InputDiagnostics => {
@@ -232,6 +292,21 @@ impl Error for AppError {
             Self::Settings(error) => Some(error),
             #[cfg(feature = "resolver-corpus")]
             Self::Corpus(error) => Some(error),
+        }
+    }
+}
+
+impl AppError {
+    const fn category(&self) -> &'static str {
+        match self {
+            Self::Windows(_) => "windows",
+            Self::DpiAwareness(_) => "dpi-awareness",
+            Self::WorkerManager(_) => "worker-manager",
+            Self::Worker(_) => "worker-protocol",
+            Self::Resolver(_) => "explorer-resolver",
+            Self::Settings(_) => "settings",
+            #[cfg(feature = "resolver-corpus")]
+            Self::Corpus(_) => "resolver-corpus",
         }
     }
 }

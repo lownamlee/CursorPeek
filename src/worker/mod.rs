@@ -18,8 +18,11 @@ use std::{
     io::{Read, Write},
 };
 
-use crate::resolver::{PointResolver, ResolveOutcome};
-use crate::settings::LegacyEncoding;
+use crate::{
+    diagnostics,
+    resolver::{PointResolver, ResolveOutcome},
+    settings::LegacyEncoding,
+};
 use cache::{PreviewCache, PreviewCacheKey, PreviewProvider};
 #[cfg(test)]
 use cursorpeek_core::PhysicalScreenPoint;
@@ -48,6 +51,10 @@ where
     R: Read,
     W: Write,
 {
+    diagnostics::record(
+        "worker.process.session",
+        format_args!("state=waiting_hello"),
+    );
     let (nonce, legacy_encoding, cache_entries) = match protocol::read_message(reader)? {
         Some(WorkerMessage::Hello {
             nonce,
@@ -58,6 +65,13 @@ where
         None => return Err(WorkerSessionError::MissingHello),
     };
     protocol::write_message(writer, WorkerMessage::Ready { nonce })?;
+    diagnostics::record(
+        "worker.process.session",
+        format_args!(
+            "state=ready cache_entries={} legacy_encoding={legacy_encoding:?}",
+            cache_entries
+        ),
+    );
     let mut cache = PreviewCache::with_entry_limit(cache_entries);
 
     loop {
@@ -72,12 +86,38 @@ where
                 Some(_) => return Err(WorkerSessionError::ExpectedResolvePoint),
                 None => return Ok(()),
             };
-        let (target_bounds, result) = resolver_result_with_cache(
-            resolver.resolve(point, explorer_window),
-            pointer_span,
-            &legacy_encoding,
-            &mut cache,
+        let request_started = diagnostics::counter();
+        diagnostics::record(
+            "worker.process.request",
+            format_args!(
+                "generation={} x={} y={} explorer={}",
+                generation.get(),
+                point.x,
+                point.y,
+                explorer_window.map_or(0, cursorpeek_core::ExplorerWindowId::get)
+            ),
         );
+        let resolver_started = diagnostics::counter();
+        let outcome = resolver.resolve(point, explorer_window);
+        diagnostics::record(
+            "worker.resolver.completed",
+            format_args!(
+                "generation={} outcome={} elapsed_us={}",
+                generation.get(),
+                resolve_outcome_kind(&outcome),
+                diagnostics::elapsed_us(resolver_started).unwrap_or(0)
+            ),
+        );
+        let (target_bounds, result) =
+            resolver_result_with_cache(outcome, pointer_span, &legacy_encoding, &mut cache);
+        record_preview_result(
+            "worker.preview.completed",
+            generation,
+            target_bounds,
+            &result,
+            request_started,
+        );
+        let write_started = diagnostics::counter();
         protocol::write_message(
             writer,
             WorkerMessage::PreviewResult {
@@ -86,6 +126,15 @@ where
                 result,
             },
         )?;
+        diagnostics::record(
+            "worker.process.response",
+            format_args!(
+                "generation={} write_us={} total_us={}",
+                generation.get(),
+                diagnostics::elapsed_us(write_started).unwrap_or(0),
+                diagnostics::elapsed_us(request_started).unwrap_or(0)
+            ),
+        );
     }
 }
 
@@ -99,14 +148,46 @@ fn resolver_result_with_cache(
         ResolveOutcome::Resolved(target) => {
             let target_bounds = target.target_bounds();
             if !pointer_span.fits_within(target_bounds) {
+                diagnostics::record(
+                    "worker.pointer_span",
+                    format_args!("outcome=rejected reason=outside_target"),
+                );
                 return (None, PreviewResult::Status(ResolverStatus::PointerMoved));
             }
+            diagnostics::record("worker.pointer_span", format_args!("outcome=accepted"));
+            let open_started = diagnostics::counter();
             let result = match PreviewFile::open(target.path()) {
-                Ok(file) => preview_file_result(&file, legacy_encoding, cache),
+                Ok(file) => {
+                    diagnostics::record(
+                        "worker.file.open",
+                        format_args!(
+                            "outcome=success file_size={} elapsed_us={}",
+                            file.file_size(),
+                            diagnostics::elapsed_us(open_started).unwrap_or(0)
+                        ),
+                    );
+                    preview_file_result(&file, legacy_encoding, cache)
+                }
                 Err(error) if error.is_unsupported() => {
+                    diagnostics::record(
+                        "worker.file.open",
+                        format_args!(
+                            "outcome=unsupported elapsed_us={}",
+                            diagnostics::elapsed_us(open_started).unwrap_or(0)
+                        ),
+                    );
                     PreviewResult::Status(ResolverStatus::Unsupported)
                 }
-                Err(_) => PreviewResult::Status(ResolverStatus::Unavailable),
+                Err(_) => {
+                    diagnostics::record(
+                        "worker.file.open",
+                        format_args!(
+                            "outcome=unavailable elapsed_us={}",
+                            diagnostics::elapsed_us(open_started).unwrap_or(0)
+                        ),
+                    );
+                    PreviewResult::Status(ResolverStatus::Unavailable)
+                }
             };
             (
                 matches!(result, PreviewResult::Text(_) | PreviewResult::Image(_))
@@ -126,14 +207,32 @@ fn preview_file_result(
     cache: &mut PreviewCache,
 ) -> PreviewResult {
     let Some(provider) = PreviewProvider::for_path(file.final_path()) else {
+        diagnostics::record(
+            "worker.provider",
+            format_args!("outcome=unsupported file_size={}", file.file_size()),
+        );
         return PreviewResult::Status(ResolverStatus::Unsupported);
     };
+    diagnostics::record(
+        "worker.provider",
+        format_args!(
+            "outcome=selected provider={provider:?} file_size={}",
+            file.file_size()
+        ),
+    );
     let key = PreviewCacheKey::new(file, provider, legacy_encoding);
     match file.is_unchanged() {
         Ok(true) => {}
         Ok(false) | Err(_) => return PreviewResult::Status(ResolverStatus::Unavailable),
     }
     if let Some(mut result) = cache.get(&key) {
+        diagnostics::record(
+            "worker.cache",
+            format_args!(
+                "outcome=hit provider={provider:?} entries={}",
+                cache.entry_count()
+            ),
+        );
         match &mut result {
             PreviewResult::Text(preview) => {
                 preview.display_name = file.display_name();
@@ -151,6 +250,14 @@ fn preview_file_result(
         };
     }
 
+    diagnostics::record(
+        "worker.cache",
+        format_args!(
+            "outcome=miss provider={provider:?} entries={}",
+            cache.entry_count()
+        ),
+    );
+    let decode_started = diagnostics::counter();
     let result = match provider {
         PreviewProvider::Text => match text::decode(file, legacy_encoding) {
             Ok(TextDecodeResult::Preview(preview)) => PreviewResult::Text(preview),
@@ -174,8 +281,102 @@ fn preview_file_result(
             Err(_) => PreviewResult::Status(ResolverStatus::Unavailable),
         },
     };
-    cache.insert(key, result.clone());
+    diagnostics::record(
+        "worker.decode",
+        format_args!(
+            "provider={provider:?} kind={} elapsed_us={}",
+            preview_result_kind(&result),
+            diagnostics::elapsed_us(decode_started).unwrap_or(0)
+        ),
+    );
+    let retained = cache.insert(key, result.clone());
+    diagnostics::record(
+        "worker.cache",
+        format_args!(
+            "outcome=insert retained={retained} entries={}",
+            cache.entry_count()
+        ),
+    );
     result
+}
+
+fn resolve_outcome_kind(outcome: &ResolveOutcome) -> &'static str {
+    match outcome {
+        ResolveOutcome::Resolved(_) => "resolved",
+        ResolveOutcome::Unsupported => "unsupported",
+        ResolveOutcome::Ambiguous => "ambiguous",
+        ResolveOutcome::Unavailable => "unavailable",
+    }
+}
+
+fn preview_result_kind(result: &PreviewResult) -> &'static str {
+    match result {
+        PreviewResult::Status(status) => match status {
+            ResolverStatus::Resolved => "status-resolved",
+            ResolverStatus::Unsupported => "status-unsupported",
+            ResolverStatus::Ambiguous => "status-ambiguous",
+            ResolverStatus::Unavailable => "status-unavailable",
+            ResolverStatus::TimedOut => "status-timed-out",
+            ResolverStatus::PointerMoved => "status-pointer-moved",
+        },
+        PreviewResult::Text(_) => "text",
+        PreviewResult::Image(_) => "image",
+    }
+}
+
+fn record_preview_result(
+    event: &'static str,
+    generation: cursorpeek_core::Generation,
+    target_bounds: Option<PhysicalScreenRect>,
+    result: &PreviewResult,
+    started: i64,
+) {
+    let elapsed = diagnostics::elapsed_us(started).unwrap_or(0);
+    match result {
+        PreviewResult::Status(status) => diagnostics::record(
+            event,
+            format_args!(
+                "generation={} kind={} status={status:?} target_bounds={} elapsed_us={elapsed}",
+                generation.get(),
+                preview_result_kind(result),
+                target_bounds.is_some()
+            ),
+        ),
+        PreviewResult::Text(preview) => diagnostics::record(
+            event,
+            format_args!(
+                "generation={} kind=text file_size={} text_bytes={} encoding={} truncated={} \
+                 guessed={} linked={} target_bounds={} elapsed_us={elapsed}",
+                generation.get(),
+                preview.file_size,
+                preview.text.len(),
+                preview.encoding,
+                preview.truncated,
+                preview.encoding_was_guessed,
+                preview.linked_content,
+                target_bounds.is_some()
+            ),
+        ),
+        PreviewResult::Image(preview) => diagnostics::record(
+            event,
+            format_args!(
+                "generation={} kind=image file_size={} format={:?} source_width={} \
+                 source_height={} decoded_width={} decoded_height={} decoded_bytes={} \
+                 first_frame_only={} linked={} target_bounds={} elapsed_us={elapsed}",
+                generation.get(),
+                preview.file_size,
+                preview.format,
+                preview.source_width,
+                preview.source_height,
+                preview.width,
+                preview.height,
+                preview.premultiplied_bgra.len(),
+                preview.first_frame_only,
+                preview.linked_content,
+                target_bounds.is_some()
+            ),
+        ),
+    }
 }
 
 #[cfg(test)]

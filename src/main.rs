@@ -5,6 +5,7 @@
 mod app;
 #[cfg(feature = "resolver-corpus")]
 mod corpus;
+mod diagnostics;
 mod hover;
 mod mode;
 mod platform;

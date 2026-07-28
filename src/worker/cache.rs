@@ -209,6 +209,10 @@ impl PreviewCache {
         true
     }
 
+    pub(super) fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
     #[cfg(test)]
     pub(super) const fn hit_count(&self) -> usize {
         self.hit_count
@@ -216,7 +220,7 @@ impl PreviewCache {
 
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
-        self.entries.len()
+        self.entry_count()
     }
 }
 

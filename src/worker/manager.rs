@@ -20,6 +20,7 @@ use windows::{
 };
 
 use crate::{
+    diagnostics,
     hover::{Generation, PhysicalScreenPoint},
     platform::{ContainedWorker, ProcessError, WorkerPipes},
     settings::LegacyEncoding,
@@ -200,6 +201,15 @@ impl WorkerManager {
     }
 
     fn start_with_config(config: WorkerManagerConfig) -> Result<Self, WorkerManagerError> {
+        diagnostics::record(
+            "worker.manager.start",
+            format_args!(
+                "idle_ms={} cache_entries={} legacy_encoding={:?}",
+                config.idle_lifetime.as_millis(),
+                config.cache_entries,
+                config.legacy_encoding
+            ),
+        );
         let manager_config = config.clone();
         let requests = Arc::new(LatestRequestMailbox::new_prewarmed());
         let manager_requests = Arc::clone(&requests);
@@ -350,6 +360,10 @@ pub(crate) struct WorkerResolution {
 impl WorkerResolution {
     pub(crate) const fn generation(&self) -> Generation {
         self.generation
+    }
+
+    pub(crate) const fn session_id(&self) -> u64 {
+        self.session_id
     }
 
     pub(crate) fn into_parts(self) -> (Option<PhysicalScreenRect>, PreviewResult) {
@@ -524,8 +538,27 @@ impl LatestRequestMailbox {
         };
 
         if let Some(replaced) = replaced {
+            diagnostics::record(
+                "worker.mailbox.superseded",
+                format_args!(
+                    "old_generation={} new_generation={}",
+                    replaced.generation.get(),
+                    generation.get()
+                ),
+            );
             complete_request(replaced, Err(WorkerManagerError::RequestSuperseded));
         }
+        diagnostics::record(
+            "worker.mailbox.queued",
+            format_args!(
+                "generation={} x={} y={} explorer={} notifier={}",
+                generation.get(),
+                point.x,
+                point.y,
+                explorer_window.map_or(0, ExplorerWindowId::get),
+                completion_notifier.is_some()
+            ),
+        );
         self.changed.notify_one();
         Ok(response_receiver)
     }
@@ -663,6 +696,18 @@ fn manager_loop(
                 response_sender,
                 completion_notifier,
             }) => {
+                let request_started = diagnostics::counter();
+                diagnostics::record(
+                    "worker.manager.dequeued",
+                    format_args!(
+                        "generation={} session_live={} x={} y={} explorer={}",
+                        generation.get(),
+                        session.is_some(),
+                        point.x,
+                        point.y,
+                        explorer_window.map_or(0, ExplorerWindowId::get)
+                    ),
+                );
                 if session.is_none() {
                     match spawn_worker_session(
                         &mut next_session_id,
@@ -670,9 +715,25 @@ fn manager_loop(
                         config.cache_entries,
                     ) {
                         Ok(started) => {
+                            diagnostics::record(
+                                "worker.session.prepared",
+                                format_args!(
+                                    "generation={} session={} outcome=success",
+                                    generation.get(),
+                                    started.id
+                                ),
+                            );
                             session = Some(started);
                         }
                         Err(error) => {
+                            diagnostics::record(
+                                "worker.session.prepared",
+                                format_args!(
+                                    "generation={} outcome=error category={}",
+                                    generation.get(),
+                                    error.category()
+                                ),
+                            );
                             send_completion(response_sender, completion_notifier, Err(error));
                             continue;
                         }
@@ -691,6 +752,16 @@ fn manager_loop(
                             .as_ref()
                             .expect("a successful request keeps its session")
                             .id;
+                        diagnostics::record(
+                            "worker.manager.resolved",
+                            format_args!(
+                                "generation={} session={} kind={} elapsed_us={}",
+                                generation.get(),
+                                session_id,
+                                preview_result_kind(&result.result),
+                                diagnostics::elapsed_us(request_started).unwrap_or(0)
+                            ),
+                        );
                         send_completion(
                             response_sender,
                             completion_notifier,
@@ -703,6 +774,15 @@ fn manager_loop(
                         );
                     }
                     Err(operation) => {
+                        diagnostics::record(
+                            "worker.manager.resolved",
+                            format_args!(
+                                "generation={} outcome=error category={} elapsed_us={}",
+                                generation.get(),
+                                operation.category(),
+                                diagnostics::elapsed_us(request_started).unwrap_or(0)
+                            ),
+                        );
                         let failed = session
                             .take()
                             .expect("a failed request still owns its session");
@@ -718,6 +798,11 @@ fn manager_loop(
                 }
             }
             MailboxTake::Prewarm => {
+                let prewarm_started = diagnostics::counter();
+                diagnostics::record(
+                    "worker.prewarm.started",
+                    format_args!("session_live={}", session.is_some()),
+                );
                 if session.is_none()
                     && let Ok(started) = spawn_worker_session(
                         &mut next_session_id,
@@ -730,16 +815,32 @@ fn manager_loop(
                 if session.is_some() {
                     last_used = Instant::now();
                 }
+                diagnostics::record(
+                    "worker.prewarm.completed",
+                    format_args!(
+                        "session_live={} elapsed_us={}",
+                        session.is_some(),
+                        diagnostics::elapsed_us(prewarm_started).unwrap_or(0)
+                    ),
+                );
             }
             MailboxTake::TimedOut => {
                 let expired = session
                     .take()
                     .expect("only a live session supplies an idle timeout");
                 let session_id = expired.id;
+                diagnostics::record(
+                    "worker.session.idle_expired",
+                    format_args!("session={session_id}"),
+                );
                 expired.shutdown()?;
                 let _ = idle_sender.send(session_id);
             }
             MailboxTake::RecycleSession => {
+                diagnostics::record(
+                    "worker.session.recycle",
+                    format_args!("session_live={}", session.is_some()),
+                );
                 if let Some(retained) = session.take() {
                     retained.terminate_and_join()?;
                 }
@@ -800,6 +901,11 @@ impl WorkerSession {
         legacy_encoding: LegacyEncoding,
         cache_entries: u16,
     ) -> Result<Self, WorkerManagerError> {
+        let spawn_started = diagnostics::counter();
+        diagnostics::record(
+            "worker.session.spawn.started",
+            format_args!("session={id} cache_entries={cache_entries}"),
+        );
         let nonce = generate_nonce()?;
         let executable = env::current_exe().map_err(WorkerManagerError::CurrentExecutable)?;
         let mut worker = ContainedWorker::spawn(&executable)?;
@@ -848,12 +954,28 @@ impl WorkerSession {
         };
 
         if let Err(error) = startup_result {
+            diagnostics::record(
+                "worker.session.spawn.completed",
+                format_args!(
+                    "session={id} outcome=error category={} elapsed_us={}",
+                    error.category(),
+                    diagnostics::elapsed_us(spawn_started).unwrap_or(0)
+                ),
+            );
             worker.terminate_and_wait()?;
             drop(command_sender);
             join_protocol(protocol_thread)?;
             join_stderr(stderr_thread)?;
             return Err(error);
         }
+
+        diagnostics::record(
+            "worker.session.spawn.completed",
+            format_args!(
+                "session={id} outcome=ready elapsed_us={}",
+                diagnostics::elapsed_us(spawn_started).unwrap_or(0)
+            ),
+        );
 
         Ok(Self {
             id,
@@ -871,6 +993,18 @@ impl WorkerSession {
         explorer_window: Option<ExplorerWindowId>,
         pointer_span: PhysicalScreenSpan,
     ) -> Result<WorkerResponse, WorkerManagerError> {
+        let started = diagnostics::counter();
+        diagnostics::record(
+            "worker.protocol.request",
+            format_args!(
+                "session={} generation={} x={} y={} explorer={}",
+                self.id,
+                generation.get(),
+                point.x,
+                point.y,
+                explorer_window.map_or(0, ExplorerWindowId::get)
+            ),
+        );
         let (response_sender, response_receiver) = mpsc::sync_channel(1);
         self.command_sender
             .as_ref()
@@ -885,7 +1019,19 @@ impl WorkerSession {
             .map_err(|_| WorkerManagerError::ProtocolChannelDisconnected)?;
 
         match response_receiver.recv_timeout(WORKER_DEADLINE) {
-            Ok(result) => result,
+            Ok(result) => {
+                diagnostics::record(
+                    "worker.protocol.response",
+                    format_args!(
+                        "session={} generation={} outcome={} elapsed_us={}",
+                        self.id,
+                        generation.get(),
+                        if result.is_ok() { "success" } else { "error" },
+                        diagnostics::elapsed_us(started).unwrap_or(0)
+                    ),
+                );
+                result
+            }
             Err(RecvTimeoutError::Timeout) => Err(WorkerManagerError::DeadlineExceeded),
             Err(RecvTimeoutError::Disconnected) => {
                 Err(WorkerManagerError::ProtocolChannelDisconnected)
@@ -965,6 +1111,7 @@ fn protocol_loop(
     command_receiver: Receiver<ProtocolCommand>,
     ready_sender: SyncSender<Result<(), WorkerManagerError>>,
 ) {
+    let handshake_started = diagnostics::counter();
     let handshake = (|| {
         protocol::write_message(
             &mut stdin,
@@ -977,14 +1124,30 @@ fn protocol_loop(
         validate_ready(protocol::read_message(&mut stdout)?, nonce)
     })();
     if let Err(error) = handshake {
+        diagnostics::record(
+            "worker.protocol.handshake",
+            format_args!(
+                "outcome=error category={} elapsed_us={}",
+                error.category(),
+                diagnostics::elapsed_us(handshake_started).unwrap_or(0)
+            ),
+        );
         let _ = ready_sender.send(Err(error));
         return;
     }
+    diagnostics::record(
+        "worker.protocol.handshake",
+        format_args!(
+            "outcome=ready elapsed_us={}",
+            diagnostics::elapsed_us(handshake_started).unwrap_or(0)
+        ),
+    );
     if ready_sender.send(Ok(())).is_err() {
         return;
     }
 
     while let Ok(command) = command_receiver.recv() {
+        let started = diagnostics::counter();
         let result = (|| {
             protocol::write_message(
                 &mut stdin,
@@ -1002,10 +1165,34 @@ fn protocol_loop(
             )
         })();
         let failed = result.is_err();
+        diagnostics::record(
+            "worker.protocol.roundtrip",
+            format_args!(
+                "generation={} outcome={} elapsed_us={}",
+                command.generation.get(),
+                if failed { "error" } else { "success" },
+                diagnostics::elapsed_us(started).unwrap_or(0)
+            ),
+        );
         let _ = command.response_sender.send(result);
         if failed {
             return;
         }
+    }
+}
+
+fn preview_result_kind(result: &PreviewResult) -> &'static str {
+    match result {
+        PreviewResult::Status(status) => match status {
+            ResolverStatus::Resolved => "status-resolved",
+            ResolverStatus::Unsupported => "status-unsupported",
+            ResolverStatus::Ambiguous => "status-ambiguous",
+            ResolverStatus::Unavailable => "status-unavailable",
+            ResolverStatus::TimedOut => "status-timed-out",
+            ResolverStatus::PointerMoved => "status-pointer-moved",
+        },
+        PreviewResult::Text(_) => "text",
+        PreviewResult::Image(_) => "image",
     }
 }
 
@@ -1176,6 +1363,47 @@ pub(crate) enum WorkerManagerError {
 impl WorkerManagerError {
     pub(crate) const fn is_request_cancellation(&self) -> bool {
         matches!(self, Self::RequestSuperseded | Self::RequestCancelled)
+    }
+
+    pub(crate) const fn category(&self) -> &'static str {
+        match self {
+            Self::CurrentExecutable(_) => "current-executable",
+            Self::Process(_) => "contained-process",
+            Self::Random(_) => "random",
+            Self::Lifecycle(_) => "lifecycle",
+            Self::ThreadStart(_) => "thread-start",
+            Self::Protocol(_) => "protocol",
+            Self::Stderr(_) => "stderr",
+            Self::WorkerExitedBeforeReady => "worker-exited-before-ready",
+            Self::UnexpectedReady => "unexpected-ready",
+            Self::NonceMismatch => "nonce-mismatch",
+            Self::WorkerExitedBeforeResult => "worker-exited-before-result",
+            Self::UnexpectedResult => "unexpected-result",
+            Self::GenerationMismatch => "generation-mismatch",
+            Self::TargetBoundsMismatch => "target-bounds-mismatch",
+            Self::UnexpectedDiagnosticStatus => "unexpected-diagnostic-status",
+            Self::DeadlineExceeded => "deadline-exceeded",
+            Self::ProtocolChannelDisconnected => "protocol-channel-disconnected",
+            Self::ManagerChannelDisconnected => "manager-channel-disconnected",
+            Self::RequestMailboxPoisoned => "request-mailbox-poisoned",
+            Self::RequestSuperseded => "request-superseded",
+            Self::RequestCancelled => "request-cancelled",
+            Self::IdleNotificationTimeout => "idle-notification-timeout",
+            Self::UnexpectedIdleSession => "unexpected-idle-session",
+            Self::SessionNotReused => "session-not-reused",
+            Self::SessionNotRestarted => "session-not-restarted",
+            Self::SessionNotRecycled => "session-not-recycled",
+            Self::UnexpectedLifecycleSignal => "unexpected-lifecycle-signal",
+            Self::UnexpectedLifecycleState => "unexpected-lifecycle-state",
+            Self::SessionIdExhausted => "session-id-exhausted",
+            Self::UnexpectedExit { .. } => "unexpected-exit",
+            Self::ProtocolThreadPanicked => "protocol-thread-panicked",
+            Self::StderrThreadPanicked => "stderr-thread-panicked",
+            Self::ManagerThreadPanicked => "manager-thread-panicked",
+            Self::RecoveryCleanupFailed { .. } => "recovery-cleanup-failed",
+            Self::RestartAfterFailure { .. } => "restart-after-failure",
+            Self::ShutdownAfterFailure { .. } => "shutdown-after-failure",
+        }
     }
 }
 

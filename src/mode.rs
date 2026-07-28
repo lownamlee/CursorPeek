@@ -40,6 +40,29 @@ pub(crate) enum ProcessMode {
     ResolverCorpusProbe,
 }
 
+impl ProcessMode {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::InputDiagnostics => "input-diagnostics",
+            Self::DpiDiagnostics => "dpi-diagnostics",
+            Self::PreviewWindowDiagnostics => "preview-window-diagnostics",
+            Self::PreviewWindowPracticeDiagnostics => "preview-window-practice-diagnostics",
+            Self::WorkerDiagnostics => "worker-diagnostics",
+            Self::WorkerTimeoutDiagnostics => "worker-timeout-diagnostics",
+            Self::RecoverySoakDiagnostics => "recovery-soak-diagnostics",
+            Self::PerformanceDiagnostics => "performance-diagnostics",
+            Self::SettingsDiagnostics => "settings-diagnostics",
+            Self::ShutdownExisting => "shutdown-existing",
+            Self::SetStartupEnabled => "set-startup-enabled",
+            Self::SetStartupDisabled => "set-startup-disabled",
+            Self::PreviewWorker => "preview-worker",
+            #[cfg(feature = "resolver-corpus")]
+            Self::ResolverCorpusProbe => "resolver-corpus-probe",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Command {
     Run(ProcessMode),
