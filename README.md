@@ -88,6 +88,13 @@ Requires Windows 10 22H2 x64 or supported Windows 11 x64 with Windows File Explo
       <strong>Per-user installer</strong>
       <br />
       <sub>Recommended · installs without administrator elevation</sub>
+      <br /><br />
+      <a href="https://github.com/lownamlee/CursorPeek/releases/latest/download/CursorPeek-0.2.2-windows-x64-setup.exe">
+        <img
+          alt="Download the CursorPeek installer"
+          src="https://img.shields.io/badge/-Download-2563eb?style=for-the-badge"
+        />
+      </a>
     </td>
     <td align="center" width="50%">
       <a href="https://github.com/lownamlee/CursorPeek/releases/latest/download/CursorPeek-0.2.2-windows-x64-portable.zip">
@@ -101,6 +108,13 @@ Requires Windows 10 22H2 x64 or supported Windows 11 x64 with Windows File Explo
       <strong>Portable ZIP</strong>
       <br />
       <sub>Extract the archive and run CursorPeek.exe</sub>
+      <br /><br />
+      <a href="https://github.com/lownamlee/CursorPeek/releases/latest/download/CursorPeek-0.2.2-windows-x64-portable.zip">
+        <img
+          alt="Download the CursorPeek portable ZIP"
+          src="https://img.shields.io/badge/-Download-2563eb?style=for-the-badge"
+        />
+      </a>
     </td>
   </tr>
 </table>
