@@ -40,6 +40,27 @@ pub(super) fn is_foreground_explorer_window_at(point: PhysicalScreenPoint) -> bo
     point_root == foreground_root && is_explorer_root(point_root)
 }
 
+pub(super) fn points_share_foreground_explorer(
+    first: PhysicalScreenPoint,
+    second: PhysicalScreenPoint,
+) -> bool {
+    let Some(first_root) = root_window(window_at(first)) else {
+        return false;
+    };
+    let Some(second_root) = root_window(window_at(second)) else {
+        return false;
+    };
+
+    // SAFETY: This has no pointer or ownership requirements. A null or changing foreground HWND
+    // fails the equality check and therefore cannot authorize a fast re-show transition.
+    let foreground = unsafe { GetForegroundWindow() };
+    let Some(foreground_root) = root_window(foreground) else {
+        return false;
+    };
+
+    first_root == second_root && first_root == foreground_root && is_explorer_root(first_root)
+}
+
 pub(super) fn is_explorer_window(window: HWND) -> bool {
     root_window(window).is_some_and(is_explorer_root)
 }

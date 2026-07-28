@@ -2,7 +2,9 @@ use std::time::{Duration, Instant};
 
 use super::{Generation, PhysicalScreenPoint};
 
-pub(crate) const DEFAULT_DWELL_DELAY: Duration = Duration::from_millis(400);
+pub(crate) const DEFAULT_DWELL_DELAY: Duration = Duration::from_millis(250);
+pub(crate) const PREVIEW_RESHOW_DELAY: Duration = Duration::from_millis(50);
+pub(crate) const PREVIEW_RESHOW_GRACE: Duration = Duration::from_millis(400);
 const BASE_DPI: u32 = 96;
 const MIN_HOVER_DIMENSION: u32 = 4;
 
@@ -85,6 +87,7 @@ pub(crate) struct HoverState {
     delay: Duration,
     generation: Generation,
     pending: Option<PendingDwell>,
+    reshow_until: Option<Instant>,
 }
 
 impl HoverState {
@@ -95,22 +98,43 @@ impl HoverState {
             delay,
             generation: Generation::default(),
             pending: None,
+            reshow_until: None,
         }
     }
 
     pub(crate) fn restart(&mut self, point: PhysicalScreenPoint, now: Instant) -> Duration {
+        let delay = self.current_delay(now);
+        self.schedule(point, now, delay)
+    }
+
+    pub(crate) fn restart_after_preview(
+        &mut self,
+        point: PhysicalScreenPoint,
+        now: Instant,
+    ) -> Duration {
+        self.reshow_until = now.checked_add(PREVIEW_RESHOW_GRACE);
+        let delay = self.current_delay(now);
+        self.schedule(point, now, delay)
+    }
+
+    fn schedule(&mut self, point: PhysicalScreenPoint, now: Instant, delay: Duration) -> Duration {
         self.advance_generation();
         self.pending = Some(PendingDwell {
             generation: self.generation,
             point,
-            deadline: now.checked_add(self.delay).unwrap_or(now),
+            deadline: now.checked_add(delay).unwrap_or(now),
         });
-        self.delay
+        delay
     }
 
     pub(crate) fn cancel(&mut self) {
         self.advance_generation();
         self.pending = None;
+        self.reshow_until = None;
+    }
+
+    pub(crate) fn preview_shown(&mut self) {
+        self.reshow_until = None;
     }
 
     pub(crate) fn set_delay(&mut self, delay: Duration) {
@@ -146,6 +170,15 @@ impl HoverState {
     fn advance_generation(&mut self) {
         self.generation = Generation::from_raw(self.generation.get().wrapping_add(1));
     }
+
+    fn current_delay(&mut self, now: Instant) -> Duration {
+        if self.reshow_until.is_some_and(|deadline| now < deadline) {
+            self.delay.min(PREVIEW_RESHOW_DELAY)
+        } else {
+            self.reshow_until = None;
+            self.delay
+        }
+    }
 }
 
 fn scale_up_from_96_dpi(value: u32, target_dpi: u32) -> u32 {
@@ -169,7 +202,7 @@ fn contains_axis(anchor: i32, point: i32, extent: u32) -> bool {
 mod tests {
     use super::{
         DEFAULT_DWELL_DELAY, DwellCandidate, DwellTimerEvent, Generation, HoverRectangle,
-        HoverState, PhysicalScreenPoint, ReadyDwell,
+        HoverState, PREVIEW_RESHOW_DELAY, PREVIEW_RESHOW_GRACE, PhysicalScreenPoint, ReadyDwell,
     };
     use std::time::{Duration, Instant};
 
@@ -191,7 +224,7 @@ mod tests {
         assert_eq!(state.restart(FIRST_POINT, start), DEFAULT_DWELL_DELAY);
         assert_eq!(
             state.on_timer(start + Duration::from_millis(125)),
-            DwellTimerEvent::Rearm(Duration::from_millis(275))
+            DwellTimerEvent::Rearm(Duration::from_millis(125))
         );
         assert_eq!(
             state.on_timer(start + DEFAULT_DWELL_DELAY),
@@ -263,6 +296,54 @@ mod tests {
         assert_eq!(
             state.on_timer(start + DEFAULT_DWELL_DELAY),
             DwellTimerEvent::Inactive
+        );
+    }
+
+    #[test]
+    fn preview_departure_uses_a_bounded_fast_reshow_window() {
+        let start = Instant::now();
+        let mut state = HoverState::new(DEFAULT_DWELL_DELAY);
+
+        assert_eq!(
+            state.restart_after_preview(FIRST_POINT, start),
+            PREVIEW_RESHOW_DELAY
+        );
+        assert_eq!(
+            state.restart(SECOND_POINT, start + Duration::from_millis(200)),
+            PREVIEW_RESHOW_DELAY
+        );
+        assert_eq!(
+            state.on_timer(start + Duration::from_millis(250)),
+            DwellTimerEvent::Candidate(DwellCandidate {
+                generation: Generation::from_raw(2),
+                anchor: SECOND_POINT,
+            })
+        );
+
+        assert_eq!(
+            state.restart(FIRST_POINT, start + PREVIEW_RESHOW_GRACE),
+            DEFAULT_DWELL_DELAY,
+            "ordinary motion must not extend the fixed re-show grace period"
+        );
+    }
+
+    #[test]
+    fn cancellation_and_success_clear_fast_reshow_state() {
+        let start = Instant::now();
+        let mut state = HoverState::new(DEFAULT_DWELL_DELAY);
+
+        state.restart_after_preview(FIRST_POINT, start);
+        state.cancel();
+        assert_eq!(
+            state.restart(SECOND_POINT, start + Duration::from_millis(10)),
+            DEFAULT_DWELL_DELAY
+        );
+
+        state.restart_after_preview(FIRST_POINT, start + Duration::from_millis(20));
+        state.preview_shown();
+        assert_eq!(
+            state.restart(SECOND_POINT, start + Duration::from_millis(30)),
+            DEFAULT_DWELL_DELAY
         );
     }
 

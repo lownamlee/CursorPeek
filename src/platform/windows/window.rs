@@ -11,6 +11,7 @@ use std::{
 
 use super::explorer::{
     belongs_to_explorer_window_at, is_explorer_window_at, is_foreground_explorer_window_at,
+    points_share_foreground_explorer,
 };
 #[cfg(test)]
 use super::input::registered_raw_devices;
@@ -110,6 +111,10 @@ impl SystemLifecycleChange {
 
     const fn recycles_worker(self) -> bool {
         matches!(self, Self::TaskbarCreated | Self::Suspend | Self::Resume)
+    }
+
+    const fn prewarms_worker(self) -> bool {
+        matches!(self, Self::TaskbarCreated | Self::Resume)
     }
 }
 
@@ -566,14 +571,25 @@ impl MessageWindow {
                 match physical_cursor_position() {
                     Ok(point) => {
                         let point = PhysicalScreenPoint::new(point.x, point.y);
-                        if pointer_motion_stays_on_active_target(self.active_preview, point)
-                            && self.active_preview.is_some_and(|active| {
-                                is_foreground_explorer_window_at(active.anchor)
-                            })
-                        {
-                            return;
+                        let now = Instant::now();
+                        let shares_foreground_explorer =
+                            self.active_preview.is_some_and(|active| {
+                                points_share_foreground_explorer(active.anchor, point)
+                            });
+                        match classify_preview_pointer_motion(
+                            self.active_preview,
+                            point,
+                            shares_foreground_explorer,
+                        ) {
+                            PreviewPointerMotion::Preserve => {}
+                            PreviewPointerMotion::Reshow => {
+                                self.restart_dwell_after_preview(point, now);
+                            }
+                            PreviewPointerMotion::Restart => {
+                                self.restart_dwell(point, now);
+                            }
+                            PreviewPointerMotion::Cancel => self.cancel_dwell(),
                         }
-                        self.restart_dwell(point, Instant::now());
                     }
                     Err(_) => self.cancel_dwell(),
                 }
@@ -644,8 +660,17 @@ impl MessageWindow {
     }
 
     fn restart_dwell(&mut self, point: PhysicalScreenPoint, now: Instant) {
-        self.invalidate_worker_delivery();
         let interval = self.hover_state.restart(point, now);
+        self.arm_dwell(interval);
+    }
+
+    fn restart_dwell_after_preview(&mut self, point: PhysicalScreenPoint, now: Instant) {
+        let interval = self.hover_state.restart_after_preview(point, now);
+        self.arm_dwell(interval);
+    }
+
+    fn arm_dwell(&mut self, interval: Duration) {
+        self.invalidate_worker_delivery();
         let armed = self
             .dwell_timer
             .as_mut()
@@ -853,6 +878,7 @@ impl MessageWindow {
                     self.hide_product_preview();
                     return;
                 };
+                self.hover_state.preview_shown();
                 let active = ActivePreview {
                     generation,
                     anchor,
@@ -926,6 +952,11 @@ impl MessageWindow {
                 .map(WorkerManager::request_session_recycle);
             if matches!(recycle, Some(Err(_))) {
                 self.set_worker_recovering(true);
+            } else if change.prewarms_worker() {
+                let prewarm = self.worker_manager.as_ref().map(WorkerManager::prewarm);
+                if matches!(prewarm, Some(Err(_))) {
+                    self.set_worker_recovering(true);
+                }
             }
         }
         Ok(())
@@ -1245,6 +1276,29 @@ fn pointer_motion_stays_on_active_target(
     current: PhysicalScreenPoint,
 ) -> bool {
     active.is_some_and(|active| active.target_bounds.contains(current))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreviewPointerMotion {
+    Preserve,
+    Reshow,
+    Restart,
+    Cancel,
+}
+
+fn classify_preview_pointer_motion(
+    active: Option<ActivePreview>,
+    current: PhysicalScreenPoint,
+    shares_foreground_explorer: bool,
+) -> PreviewPointerMotion {
+    match active {
+        Some(_) if !shares_foreground_explorer => PreviewPointerMotion::Cancel,
+        Some(_) if pointer_motion_stays_on_active_target(active, current) => {
+            PreviewPointerMotion::Preserve
+        }
+        Some(_) => PreviewPointerMotion::Reshow,
+        None => PreviewPointerMotion::Restart,
+    }
 }
 
 fn preview_context_generation_matches(active: Option<ActivePreview>, generation: usize) -> bool {
@@ -1681,10 +1735,11 @@ fn system_lifecycle_change_for_message(
 mod tests {
     use super::{
         ActivePreview, CLASS_NAME, DWELL_TIMER_ID, IsWindow, LPARAM, MessageWindow,
-        PREVIEW_WINDOW_DIAGNOSTIC_DURATION, PREVIEW_WINDOW_PRACTICE_DURATION,
+        PREVIEW_WINDOW_DIAGNOSTIC_DURATION, PREVIEW_WINDOW_PRACTICE_DURATION, PreviewPointerMotion,
         SYSTEM_LIFECYCLE_CHANGED_MESSAGE, SystemLifecycleChange, TASKBAR_CREATED_MESSAGE,
         TEST_PANIC_MESSAGE, TRAY_CALLBACK_MESSAGE, TRAY_EVENT_MESSAGE, WPARAM,
-        accept_worker_completion, pointer_motion_stays_on_active_target, post_worker_result,
+        accept_worker_completion, classify_preview_pointer_motion,
+        pointer_motion_stays_on_active_target, post_worker_result,
         preview_context_generation_matches, preview_context_is_current,
         preview_input_requires_dismissal, registered_raw_devices, timer_interval_ms, tray_status,
     };
@@ -1751,6 +1806,9 @@ mod tests {
         assert!(SystemLifecycleChange::Resume.recycles_worker());
         assert!(!SystemLifecycleChange::DisplayConfiguration.recycles_worker());
         assert!(!SystemLifecycleChange::WorkArea.recycles_worker());
+        assert!(SystemLifecycleChange::TaskbarCreated.prewarms_worker());
+        assert!(!SystemLifecycleChange::Suspend.prewarms_worker());
+        assert!(SystemLifecycleChange::Resume.prewarms_worker());
     }
 
     #[test]
@@ -2102,6 +2160,33 @@ mod tests {
             None,
             PhysicalScreenPoint::new(150, 250)
         ));
+    }
+
+    #[test]
+    fn pointer_motion_restarts_quickly_only_between_items_in_the_same_foreground_explorer() {
+        let bounds = PhysicalScreenRect::try_new(100, 200, 300, 400).unwrap();
+        let active = Some(ActivePreview {
+            generation: Generation::from_raw(24),
+            anchor: PhysicalScreenPoint::new(150, 250),
+            target_bounds: bounds,
+        });
+
+        assert_eq!(
+            classify_preview_pointer_motion(active, PhysicalScreenPoint::new(299, 399), true),
+            PreviewPointerMotion::Preserve
+        );
+        assert_eq!(
+            classify_preview_pointer_motion(active, PhysicalScreenPoint::new(301, 399), true),
+            PreviewPointerMotion::Reshow
+        );
+        assert_eq!(
+            classify_preview_pointer_motion(active, PhysicalScreenPoint::new(301, 399), false),
+            PreviewPointerMotion::Cancel
+        );
+        assert_eq!(
+            classify_preview_pointer_motion(None, PhysicalScreenPoint::new(301, 399), false),
+            PreviewPointerMotion::Restart
+        );
     }
 
     #[test]

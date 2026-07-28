@@ -32,7 +32,7 @@ use super::{
 };
 
 const WORKER_DEADLINE: Duration = Duration::from_secs(2);
-const DEFAULT_WORKER_IDLE_LIFETIME: Duration = Duration::from_secs(15);
+const DEFAULT_WORKER_IDLE_LIFETIME: Duration = Duration::from_secs(120);
 const DIAGNOSTIC_IDLE_LIFETIME: Duration = Duration::from_millis(250);
 const TIMEOUT_DIAGNOSTIC_DEADLINE: Duration = Duration::from_millis(100);
 
@@ -192,7 +192,7 @@ impl WorkerManager {
 
     fn start_with_config(config: WorkerManagerConfig) -> Result<Self, WorkerManagerError> {
         let manager_config = config.clone();
-        let requests = Arc::new(LatestRequestMailbox::new());
+        let requests = Arc::new(LatestRequestMailbox::new_prewarmed());
         let manager_requests = Arc::clone(&requests);
         let (idle_sender, idle_receiver) = mpsc::channel();
         let thread = thread::Builder::new()
@@ -256,6 +256,10 @@ impl WorkerManager {
         // This only updates the bounded mailbox and wakes the manager thread. Process teardown
         // stays off the caller, including the application's UI thread.
         self.requests.request_session_recycle()
+    }
+
+    pub(crate) fn prewarm(&self) -> Result<(), WorkerManagerError> {
+        self.requests.request_prewarm()
     }
 
     pub(crate) fn restart_if_stopped(&mut self) -> Result<bool, WorkerManagerError> {
@@ -392,6 +396,7 @@ impl CompletionNotifier {
 struct RequestMailboxState {
     pending: Option<PendingRequest>,
     recycle_requested: bool,
+    prewarm_requested: bool,
     closed: bool,
     #[cfg(test)]
     max_pending: usize,
@@ -403,11 +408,38 @@ struct LatestRequestMailbox {
 }
 
 impl LatestRequestMailbox {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_prewarm(false)
+    }
+
+    fn new_prewarmed() -> Self {
+        Self::with_prewarm(true)
+    }
+
+    fn with_prewarm(prewarm_requested: bool) -> Self {
         Self {
-            state: Mutex::new(RequestMailboxState::default()),
+            state: Mutex::new(RequestMailboxState {
+                prewarm_requested,
+                ..RequestMailboxState::default()
+            }),
             changed: Condvar::new(),
         }
+    }
+
+    fn request_prewarm(&self) -> Result<(), WorkerManagerError> {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| WorkerManagerError::RequestMailboxPoisoned)?;
+            if state.closed {
+                return Err(WorkerManagerError::ManagerChannelDisconnected);
+            }
+            state.prewarm_requested = true;
+        }
+        self.changed.notify_one();
+        Ok(())
     }
 
     fn submit(
@@ -495,10 +527,15 @@ impl LatestRequestMailbox {
                 return Ok(MailboxTake::RecycleSession);
             }
             if let Some(request) = state.pending.take() {
+                state.prewarm_requested = false;
                 return Ok(MailboxTake::Request(request));
             }
             if state.closed {
                 return Ok(MailboxTake::Closed);
+            }
+            if state.prewarm_requested {
+                state.prewarm_requested = false;
+                return Ok(MailboxTake::Prewarm);
             }
 
             match deadline {
@@ -518,7 +555,11 @@ impl LatestRequestMailbox {
                         .wait_timeout(state, wait)
                         .map_err(|_| WorkerManagerError::RequestMailboxPoisoned)?;
                     state = next_state;
-                    if timeout_result.timed_out() && state.pending.is_none() {
+                    if timeout_result.timed_out()
+                        && state.pending.is_none()
+                        && !state.recycle_requested
+                        && !state.prewarm_requested
+                    {
                         return Ok(MailboxTake::TimedOut);
                     }
                 }
@@ -531,12 +572,14 @@ impl LatestRequestMailbox {
             Ok(mut state) => {
                 state.closed = true;
                 state.recycle_requested = false;
+                state.prewarm_requested = false;
                 state.pending.take()
             }
             Err(poisoned) => {
                 let mut state = poisoned.into_inner();
                 state.closed = true;
                 state.recycle_requested = false;
+                state.prewarm_requested = false;
                 state.pending.take()
             }
         };
@@ -558,6 +601,7 @@ impl LatestRequestMailbox {
 enum MailboxTake {
     Request(PendingRequest),
     RecycleSession,
+    Prewarm,
     TimedOut,
     Closed,
 }
@@ -583,18 +627,8 @@ fn manager_loop(
                 completion_notifier,
             }) => {
                 if session.is_none() {
-                    let session_id = next_session_id;
-                    let Some(following_session_id) = next_session_id.checked_add(1) else {
-                        send_completion(
-                            response_sender,
-                            completion_notifier,
-                            Err(WorkerManagerError::SessionIdExhausted),
-                        );
-                        continue;
-                    };
-                    match WorkerSession::spawn(session_id, config.legacy_encoding.clone()) {
+                    match spawn_worker_session(&mut next_session_id, &config.legacy_encoding) {
                         Ok(started) => {
-                            next_session_id = following_session_id;
                             session = Some(started);
                         }
                         Err(error) => {
@@ -642,6 +676,17 @@ fn manager_loop(
                     }
                 }
             }
+            MailboxTake::Prewarm => {
+                if session.is_none()
+                    && let Ok(started) =
+                        spawn_worker_session(&mut next_session_id, &config.legacy_encoding)
+                {
+                    session = Some(started);
+                }
+                if session.is_some() {
+                    last_used = Instant::now();
+                }
+            }
             MailboxTake::TimedOut => {
                 let expired = session
                     .take()
@@ -659,6 +704,19 @@ fn manager_loop(
             MailboxTake::Closed => return shutdown_session(session),
         }
     }
+}
+
+fn spawn_worker_session(
+    next_session_id: &mut u64,
+    legacy_encoding: &LegacyEncoding,
+) -> Result<WorkerSession, WorkerManagerError> {
+    let session_id = *next_session_id;
+    let following_session_id = session_id
+        .checked_add(1)
+        .ok_or(WorkerManagerError::SessionIdExhausted)?;
+    let started = WorkerSession::spawn(session_id, legacy_encoding.clone())?;
+    *next_session_id = following_session_id;
+    Ok(started)
 }
 
 fn complete_request(request: PendingRequest, result: Result<WorkerResolution, WorkerManagerError>) {
@@ -1252,12 +1310,53 @@ mod tests {
     }
 
     #[test]
-    fn default_worker_idle_lifetime_is_fifteen_seconds() {
+    fn default_worker_idle_lifetime_covers_an_active_browsing_pause() {
         assert_eq!(
             WorkerManagerConfig::default().idle_lifetime,
             DEFAULT_WORKER_IDLE_LIFETIME
         );
-        assert_eq!(DEFAULT_WORKER_IDLE_LIFETIME, Duration::from_secs(15));
+        assert_eq!(DEFAULT_WORKER_IDLE_LIFETIME, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn prewarm_requests_are_bounded_and_never_displace_real_work() {
+        let mailbox = LatestRequestMailbox::new_prewarmed();
+        let pending = mailbox
+            .submit(Generation::from_raw(1), PhysicalScreenPoint::new(1, 2))
+            .unwrap();
+
+        let request = match mailbox.take(Some(Duration::ZERO)).unwrap() {
+            MailboxTake::Request(request) => request,
+            MailboxTake::RecycleSession
+            | MailboxTake::Prewarm
+            | MailboxTake::TimedOut
+            | MailboxTake::Closed => panic!("real work must outrank an advisory prewarm"),
+        };
+        request
+            .response_sender
+            .send(Ok(WorkerResolution {
+                generation: Generation::from_raw(1),
+                session_id: 1,
+                target_bounds: None,
+                result: PreviewResult::Status(ResolverStatus::Unavailable),
+            }))
+            .unwrap();
+        assert!(pending.recv().unwrap().is_ok());
+        assert!(matches!(
+            mailbox.take(Some(Duration::ZERO)).unwrap(),
+            MailboxTake::TimedOut
+        ));
+
+        mailbox.request_prewarm().unwrap();
+        mailbox.request_prewarm().unwrap();
+        assert!(matches!(
+            mailbox.take(Some(Duration::ZERO)).unwrap(),
+            MailboxTake::Prewarm
+        ));
+        assert!(matches!(
+            mailbox.take(Some(Duration::ZERO)).unwrap(),
+            MailboxTake::TimedOut
+        ));
     }
 
     #[test]
@@ -1334,9 +1433,10 @@ mod tests {
         ));
         let pending = match mailbox.take(Some(Duration::ZERO)).unwrap() {
             MailboxTake::Request(request) => request,
-            MailboxTake::RecycleSession | MailboxTake::TimedOut | MailboxTake::Closed => {
-                panic!("latest request was not pending")
-            }
+            MailboxTake::RecycleSession
+            | MailboxTake::Prewarm
+            | MailboxTake::TimedOut
+            | MailboxTake::Closed => panic!("latest request was not pending"),
         };
         assert_eq!(pending.generation, Generation::from_raw(2));
         assert_eq!(pending.point, PhysicalScreenPoint::new(2, 2));
@@ -1492,9 +1592,10 @@ mod tests {
             .unwrap();
         let active = match mailbox.take(Some(Duration::ZERO)).unwrap() {
             MailboxTake::Request(request) => request,
-            MailboxTake::RecycleSession | MailboxTake::TimedOut | MailboxTake::Closed => {
-                panic!("first request was not active")
-            }
+            MailboxTake::RecycleSession
+            | MailboxTake::Prewarm
+            | MailboxTake::TimedOut
+            | MailboxTake::Closed => panic!("first request was not active"),
         };
         let mut previous = mailbox
             .submit(Generation::from_raw(2), PhysicalScreenPoint::new(2, -2))
@@ -1527,9 +1628,10 @@ mod tests {
         assert!(active_receiver.recv().unwrap().is_ok());
         let latest = match mailbox.take(Some(Duration::ZERO)).unwrap() {
             MailboxTake::Request(request) => request,
-            MailboxTake::RecycleSession | MailboxTake::TimedOut | MailboxTake::Closed => {
-                panic!("latest request was not pending")
-            }
+            MailboxTake::RecycleSession
+            | MailboxTake::Prewarm
+            | MailboxTake::TimedOut
+            | MailboxTake::Closed => panic!("latest request was not pending"),
         };
         assert_eq!(latest.generation, Generation::from_raw(10_000));
         assert_eq!(latest.point, PhysicalScreenPoint::new(10_000, -10_000));

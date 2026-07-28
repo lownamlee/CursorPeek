@@ -12,9 +12,10 @@ Run `CursorPeek.exe`. Its icon appears in the notification area. Windows may pla
 the notification-area overflow button.
 
 Open File Explorer and leave the pointer over a supported file for the configured dwell delay
-(400 ms by default). Pointer motion inside the same Explorer item keeps the preview visible.
-Leaving the item, scrolling, clicking, pressing Escape, changing the active Explorer item/view, or
-switching applications dismisses it.
+(250 ms by default). Pointer motion inside the same Explorer item keeps the preview visible.
+Moving directly to another file uses a brief re-show delay while the complete Explorer and file
+checks run again. Leaving Explorer, scrolling, clicking, pressing Escape, changing the active
+view, or switching applications dismisses the preview.
 
 CursorPeek allows one normal instance in the current interactive session. Starting it again asks
 the existing instance to show its tray menu.
@@ -184,7 +185,7 @@ The canonical file contains:
 
 ```ini
 # CursorPeek settings
-dwell_delay_ms=400
+dwell_delay_ms=250
 preview_width=640
 preview_height=480
 theme=system

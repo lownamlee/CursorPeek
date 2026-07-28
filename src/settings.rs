@@ -94,7 +94,7 @@ pub(crate) struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            dwell_delay_ms: 400,
+            dwell_delay_ms: 250,
             preview_width: 640,
             preview_height: 480,
             theme: Theme::System,
@@ -884,7 +884,7 @@ mod tests {
         assert_eq!(
             text,
             "# CursorPeek settings\n\
-             dwell_delay_ms=400\n\
+             dwell_delay_ms=250\n\
              preview_width=640\n\
              preview_height=480\n\
              theme=system\n\
@@ -897,7 +897,7 @@ mod tests {
         );
         assert_eq!(
             document.settings().dwell_delay(),
-            Duration::from_millis(400)
+            Duration::from_millis(250)
         );
     }
 
