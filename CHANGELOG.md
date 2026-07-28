@@ -4,6 +4,20 @@ This file records user-visible changes to CursorPeek. Release dates are added on
 
 ## Unreleased
 
+## [0.2.1] - 2026-07-29
+
+This patch keeps CursorPeek visible through two common Explorer hover conflicts.
+
+### Fixed
+
+- Keep CursorPeek above a validated Explorer infotip without activating or modifying Explorer.
+- Preserve an active preview while the pointer is over the part of the preview that overlaps its verified source item.
+
+### Security
+
+- Restrict infotip handling to a visible `tooltips_class32` window owned by the validated Explorer process and overlapping the active preview.
+- Accept only CursorPeek's active preview root while the physical point remains inside the stored resolver-validated source rectangle. Clicks, wheel input, keyboard input, and unrelated windows still dismiss the preview.
+
 ## [0.2.0] - 2026-07-28
 
 This release makes previews faster, more compact, and available from visible inactive Explorer windows.
@@ -58,6 +72,7 @@ This patch release restores the notification-area menu when CursorPeek is right-
 
 Version 0.1 is intentionally narrow. See [Known limitations](docs/KNOWN_LIMITATIONS.md) before installing or running this release.
 
+[0.2.1]: https://github.com/lownamlee/CursorPeek/releases/tag/v0.2.1
 [0.2.0]: https://github.com/lownamlee/CursorPeek/releases/tag/v0.2.0
 [0.1.1]: https://github.com/lownamlee/CursorPeek/releases/tag/v0.1.1
 [0.1.0]: https://github.com/lownamlee/CursorPeek/releases/tag/v0.1.0

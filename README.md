@@ -76,8 +76,8 @@ Requires Windows 10 22H2 x64 or supported Windows 11 x64 with Windows File Explo
 
 | Package | Download | Use |
 | --- | --- | --- |
-| **Per-user installer** | **[Download v0.2.0](https://github.com/lownamlee/CursorPeek/releases/latest/download/CursorPeek-0.2.0-windows-x64-setup.exe)** | Recommended; installs without administrator elevation |
-| **Portable ZIP** | **[Download v0.2.0](https://github.com/lownamlee/CursorPeek/releases/latest/download/CursorPeek-0.2.0-windows-x64-portable.zip)** | Extract the archive and run `CursorPeek.exe` |
+| **Per-user installer** | **[Download v0.2.1](https://github.com/lownamlee/CursorPeek/releases/latest/download/CursorPeek-0.2.1-windows-x64-setup.exe)** | Recommended; installs without administrator elevation |
+| **Portable ZIP** | **[Download v0.2.1](https://github.com/lownamlee/CursorPeek/releases/latest/download/CursorPeek-0.2.1-windows-x64-portable.zip)** | Extract the archive and run `CursorPeek.exe` |
 
 > [!NOTE]
 > Packages are not code-signed yet. Windows may show an unknown-publisher warning. Check downloads
