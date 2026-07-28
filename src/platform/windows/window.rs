@@ -31,7 +31,7 @@ use crate::worker::{
     CompletionNotifier, PendingWorkerPoll, PendingWorkerResolution, PreviewResult, ResolverStatus,
     WorkerManager, WorkerManagerError,
 };
-use cursorpeek_core::{ExplorerWindowId, PhysicalScreenRect};
+use cursorpeek_core::{ExplorerWindowId, PhysicalScreenRect, PhysicalScreenSpan};
 
 use super::{PreviewWindow, StartupRegistration, TrayCommand, TrayIcon, TrayMenuState, TrayStatus};
 
@@ -83,6 +83,7 @@ const PREVIEW_DIAGNOSTIC_DEADLINE_TIMER_ID: usize = 4;
 const PREVIEW_GUARD_TIMER_ID: usize = 5;
 const PERFORMANCE_DIAGNOSTIC_DEADLINE_TIMER_ID: usize = 6;
 const PREVIEW_GUARD_INTERVAL: Duration = Duration::from_millis(125);
+const MAX_WORKER_OVERLAP_LEAD: Duration = Duration::from_millis(100);
 static TASKBAR_CREATED_MESSAGE: AtomicU32 = AtomicU32::new(0);
 
 pub(crate) const PREVIEW_WINDOW_DIAGNOSTIC_DURATION: Duration = Duration::from_millis(1_500);
@@ -132,6 +133,125 @@ const fn tray_status(paused: bool, worker_recovering: bool) -> TrayStatus {
     }
 }
 
+fn should_overlap_worker_resolution(dwell: Duration) -> bool {
+    // Long user-selected dwells should not decode content seconds before it can be displayed.
+    // The default and fast re-show paths remain short enough to overlap safely.
+    dwell <= MAX_WORKER_OVERLAP_LEAD
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingWorkerRequest {
+    generation: Generation,
+    explorer_window: ExplorerWindowId,
+    point: PhysicalScreenPoint,
+    phase: WorkerRequestPhase,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CompletedDwell {
+    generation: Generation,
+    anchor: PhysicalScreenPoint,
+    explorer_window: ExplorerWindowId,
+    pointer_span: PhysicalScreenSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PreparedWorkerResult {
+    generation: Generation,
+    explorer_window: ExplorerWindowId,
+    point: PhysicalScreenPoint,
+    phase: WorkerRequestPhase,
+    target_bounds: Option<PhysicalScreenRect>,
+    result: PreviewResult,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerRequestPhase {
+    Overlap,
+    Dwell,
+}
+
+impl WorkerRequestPhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Overlap => "overlap",
+            Self::Dwell => "dwell",
+        }
+    }
+}
+
+impl PreparedWorkerResult {
+    fn requires_settled_point_retry(&self, dwell: CompletedDwell) -> bool {
+        self.phase == WorkerRequestPhase::Overlap
+            && dwell.pointer_span != PhysicalScreenSpan::from_point(self.point)
+    }
+}
+
+#[derive(Default)]
+struct PreviewReadiness {
+    dwell: Option<CompletedDwell>,
+    worker: Option<PreparedWorkerResult>,
+}
+
+impl PreviewReadiness {
+    // Explorer resolution and contained decoding may finish before the user-selected dwell. Keep
+    // both halves private until the same hover generation and Explorer root have completed.
+    fn invalidate(&mut self) {
+        self.dwell = None;
+        self.worker = None;
+    }
+
+    fn complete_dwell(&mut self, dwell: CompletedDwell) {
+        self.dwell = Some(dwell);
+    }
+
+    fn complete_worker(&mut self, worker: PreparedWorkerResult) {
+        self.worker = Some(worker);
+    }
+
+    fn has_worker_for(&self, generation: Generation) -> bool {
+        self.worker
+            .as_ref()
+            .is_some_and(|worker| worker.generation == generation)
+    }
+
+    fn take_ready(
+        &mut self,
+        current_generation: Generation,
+    ) -> Option<(CompletedDwell, PreparedWorkerResult)> {
+        if self
+            .dwell
+            .is_some_and(|dwell| dwell.generation != current_generation)
+        {
+            self.dwell = None;
+        }
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.generation != current_generation)
+        {
+            self.worker = None;
+        }
+
+        let dwell = self.dwell?;
+        let worker_generation = self.worker.as_ref()?.generation;
+        let worker_explorer = self.worker.as_ref()?.explorer_window;
+        if dwell.generation != worker_generation || dwell.explorer_window != worker_explorer {
+            self.invalidate();
+            return None;
+        }
+
+        Some((
+            self.dwell
+                .take()
+                .expect("the readiness check retained a completed dwell"),
+            self.worker
+                .take()
+                .expect("the readiness check retained a worker result"),
+        ))
+    }
+}
+
 pub(crate) struct MessageWindow {
     hwnd: HWND,
     dwell_timer: Option<WindowTimer>,
@@ -152,8 +272,8 @@ pub(crate) struct MessageWindow {
     worker_recovering: bool,
     worker_manager: Option<WorkerManager>,
     pending_worker_resolution: Option<PendingWorkerResolution>,
-    pending_worker_anchor: Option<(Generation, PhysicalScreenPoint, ExplorerWindowId)>,
-    latest_worker_completion: Option<Generation>,
+    pending_worker_request: Option<PendingWorkerRequest>,
+    preview_readiness: PreviewReadiness,
     active_preview: Option<ActivePreview>,
     preview_event_hooks: Option<PreviewEventHooks>,
     raw_input: Option<RawInputRegistration>,
@@ -227,8 +347,8 @@ impl MessageWindow {
             worker_recovering: false,
             worker_manager: None,
             pending_worker_resolution: None,
-            pending_worker_anchor: None,
-            latest_worker_completion: None,
+            pending_worker_request: None,
+            preview_readiness: PreviewReadiness::default(),
             active_preview: None,
             preview_event_hooks: Some(PreviewEventHooks::register()?),
             raw_input: None,
@@ -261,11 +381,13 @@ impl MessageWindow {
     ) -> std::result::Result<(), ApplicationRunError> {
         let startup_registration = StartupRegistration::for_current_executable()?;
         startup_registration.reconcile(settings_document.settings().start_with_windows())?;
+        let theme = settings_document.settings().theme();
         self.worker_manager = Some(worker_manager);
         self.settings_file = Some(settings_file);
         self.settings_document = Some(settings_document);
         self.startup_registration = Some(startup_registration);
         self.tray_icon = Some(TrayIcon::create(self.hwnd, TRAY_CALLBACK_MESSAGE)?);
+        self.prepare_preview_window(theme, "startup", 0);
         self.finish_application_loop()
     }
 
@@ -720,20 +842,30 @@ impl MessageWindow {
         explorer_window: ExplorerWindowId,
         now: Instant,
     ) {
+        self.invalidate_worker_delivery();
         self.tracked_explorer_window = Some(explorer_window);
         let interval = self.hover_state.restart(point, now);
+        let generation = self.hover_state.generation();
         diagnostics::record(
             "hover.dwell.started",
             format_args!(
                 "generation={} x={} y={} explorer={} delay_us={} reshow=false",
-                self.hover_state.generation().get(),
+                generation.get(),
                 point.x,
                 point.y,
                 explorer_window.get(),
                 interval.as_micros()
             ),
         );
-        self.arm_dwell(interval);
+        if self.arm_dwell(interval) && should_overlap_worker_resolution(interval) {
+            let _ = self.submit_worker_resolution(
+                generation,
+                point,
+                explorer_window,
+                PhysicalScreenSpan::from_point(point),
+                WorkerRequestPhase::Overlap,
+            );
+        }
     }
 
     fn track_or_restart_dwell(&mut self, point: PhysicalScreenPoint, now: Instant) {
@@ -771,24 +903,33 @@ impl MessageWindow {
         explorer_window: ExplorerWindowId,
         now: Instant,
     ) {
+        self.invalidate_worker_delivery();
         self.tracked_explorer_window = Some(explorer_window);
         let interval = self.hover_state.restart_after_preview(point, now);
+        let generation = self.hover_state.generation();
         diagnostics::record(
             "hover.dwell.started",
             format_args!(
                 "generation={} x={} y={} explorer={} delay_us={} reshow=true",
-                self.hover_state.generation().get(),
+                generation.get(),
                 point.x,
                 point.y,
                 explorer_window.get(),
                 interval.as_micros()
             ),
         );
-        self.arm_dwell(interval);
+        if self.arm_dwell(interval) && should_overlap_worker_resolution(interval) {
+            let _ = self.submit_worker_resolution(
+                generation,
+                point,
+                explorer_window,
+                PhysicalScreenSpan::from_point(point),
+                WorkerRequestPhase::Overlap,
+            );
+        }
     }
 
-    fn arm_dwell(&mut self, interval: Duration) {
-        self.invalidate_worker_delivery();
+    fn arm_dwell(&mut self, interval: Duration) -> bool {
         let armed = self
             .dwell_timer
             .as_mut()
@@ -805,6 +946,7 @@ impl MessageWindow {
         if !armed {
             self.cancel_dwell();
         }
+        armed
     }
 
     fn cancel_dwell(&mut self) {
@@ -827,8 +969,8 @@ impl MessageWindow {
 
     fn invalidate_worker_delivery(&mut self) {
         drop(self.pending_worker_resolution.take());
-        self.pending_worker_anchor = None;
-        self.latest_worker_completion = None;
+        self.pending_worker_request = None;
+        self.preview_readiness.invalidate();
         self.hide_product_preview();
     }
 
@@ -889,46 +1031,96 @@ impl MessageWindow {
                     return;
                 }
 
-                if !self.ensure_worker_manager_running() {
+                self.preview_readiness.complete_dwell(CompletedDwell {
+                    generation,
+                    explorer_window,
+                    anchor: point,
+                    pointer_span,
+                });
+
+                let worker_is_pending = self
+                    .pending_worker_request
+                    .is_some_and(|request| request.generation == generation);
+                if !worker_is_pending
+                    && !self.preview_readiness.has_worker_for(generation)
+                    && !self.submit_worker_resolution(
+                        generation,
+                        point,
+                        explorer_window,
+                        pointer_span,
+                        WorkerRequestPhase::Dwell,
+                    )
+                {
+                    self.preview_readiness.invalidate();
                     self.hover_state.finish_resolution(generation);
                     return;
                 }
-                let manager = self
-                    .worker_manager
-                    .as_ref()
-                    .expect("a successful recovery check retains the worker manager");
-                let notifier = worker_result_notifier(self.hwnd);
-                let pending = match manager.submit_with_notifier(
-                    generation,
-                    point,
-                    explorer_window,
-                    pointer_span,
-                    notifier,
-                ) {
-                    Ok(pending) => pending,
-                    Err(error) => {
-                        diagnostics::record(
-                            "worker.request.submit",
-                            format_args!(
-                                "generation={} outcome=error category={}",
-                                generation.get(),
-                                error.category()
-                            ),
-                        );
-                        self.hover_state.finish_resolution(generation);
-                        self.set_worker_recovering(true);
-                        return;
-                    }
-                };
-                diagnostics::record(
-                    "worker.request.submit",
-                    format_args!("generation={} outcome=queued", generation.get()),
-                );
-
-                self.pending_worker_resolution = Some(pending);
-                self.pending_worker_anchor = Some((generation, point, explorer_window));
+                self.show_ready_preview();
             }
         }
+    }
+
+    fn submit_worker_resolution(
+        &mut self,
+        generation: Generation,
+        point: PhysicalScreenPoint,
+        explorer_window: ExplorerWindowId,
+        pointer_span: PhysicalScreenSpan,
+        phase: WorkerRequestPhase,
+    ) -> bool {
+        let phase_name = phase.as_str();
+        if !self.ensure_worker_manager_running() {
+            diagnostics::record(
+                "worker.request.submit",
+                format_args!(
+                    "generation={} phase={phase_name} outcome=manager_unavailable",
+                    generation.get()
+                ),
+            );
+            return false;
+        }
+        let manager = self
+            .worker_manager
+            .as_ref()
+            .expect("a successful recovery check retains the worker manager");
+        let notifier = worker_result_notifier(self.hwnd);
+        let pending = match manager.submit_with_notifier(
+            generation,
+            point,
+            explorer_window,
+            pointer_span,
+            notifier,
+        ) {
+            Ok(pending) => pending,
+            Err(error) => {
+                diagnostics::record(
+                    "worker.request.submit",
+                    format_args!(
+                        "generation={} phase={phase_name} outcome=error category={}",
+                        generation.get(),
+                        error.category()
+                    ),
+                );
+                self.set_worker_recovering(true);
+                return false;
+            }
+        };
+        diagnostics::record(
+            "worker.request.submit",
+            format_args!(
+                "generation={} phase={phase_name} outcome=queued",
+                generation.get()
+            ),
+        );
+
+        self.pending_worker_resolution = Some(pending);
+        self.pending_worker_request = Some(PendingWorkerRequest {
+            generation,
+            explorer_window,
+            point,
+            phase,
+        });
+        true
     }
 
     fn handle_worker_result(&mut self) {
@@ -940,7 +1132,7 @@ impl MessageWindow {
             PendingWorkerPoll::Pending => {}
             PendingWorkerPoll::Ready(result) => {
                 self.pending_worker_resolution = None;
-                let anchor = self.pending_worker_anchor.take();
+                let request = self.pending_worker_request.take();
                 match result {
                     Ok(resolution) => {
                         diagnostics::record(
@@ -956,15 +1148,12 @@ impl MessageWindow {
                             self.hover_state.generation(),
                             Some(resolution.generation()),
                         );
-                        self.latest_worker_completion = generation;
-
-                        if let (Some(generation), Some((anchor_generation, point, explorer_window))) =
-                            (generation, anchor)
-                            && generation == anchor_generation
+                        if let (Some(generation), Some(request)) = (generation, request)
+                            && generation == request.generation
                         {
                             let (target_bounds, result) = resolution.into_parts();
                             diagnostics::record(
-                                "worker.result.validated",
+                                "worker.result.prepared",
                                 format_args!(
                                     "generation={} kind={} target_bounds={}",
                                     generation.get(),
@@ -972,50 +1161,84 @@ impl MessageWindow {
                                     target_bounds.is_some()
                                 ),
                             );
-                            let current = self.refresh_tracked_pointer();
-                            if result.status() == Some(ResolverStatus::PointerMoved) {
-                                self.restart_after_pointer_span_rejection(current);
-                            } else if current.is_some()
-                                && let Some(target_bounds) = target_bounds
-                                && self
-                                    .hover_state
-                                    .tracked_span_fits(generation, target_bounds)
-                            {
-                                self.show_worker_result(
-                                    point,
-                                    explorer_window,
+                            self.preview_readiness
+                                .complete_worker(PreparedWorkerResult {
+                                    generation,
+                                    explorer_window: request.explorer_window,
+                                    point: request.point,
+                                    phase: request.phase,
                                     target_bounds,
                                     result,
-                                );
-                            } else if target_bounds.is_some() {
-                                self.restart_after_pointer_span_rejection(current);
-                            } else {
-                                self.hover_state.finish_resolution(generation);
-                                self.hide_product_preview();
-                            }
+                                });
+                            self.show_ready_preview();
                         } else {
+                            self.preview_readiness.invalidate();
                             self.hide_product_preview();
                         }
                     }
                     Err(error) => {
+                        let generation = request.map_or_else(
+                            || self.hover_state.generation(),
+                            |request| request.generation,
+                        );
                         diagnostics::record(
                             "worker.request.completed",
                             format_args!(
                                 "generation={} outcome=error category={}",
-                                self.hover_state.generation().get(),
+                                generation.get(),
                                 error.category()
                             ),
                         );
                         if !error.is_request_cancellation() {
                             self.set_worker_recovering(true);
                         }
-                        self.hover_state
-                            .finish_resolution(self.hover_state.generation());
-                        self.latest_worker_completion = None;
+                        self.hover_state.finish_resolution(generation);
+                        self.preview_readiness.invalidate();
                         self.hide_product_preview();
                     }
                 }
             }
+        }
+    }
+
+    fn show_ready_preview(&mut self) {
+        let current_generation = self.hover_state.generation();
+        let Some((dwell, prepared)) = self.preview_readiness.take_ready(current_generation) else {
+            return;
+        };
+        debug_assert_eq!(dwell.generation, prepared.generation);
+
+        diagnostics::record(
+            "worker.result.validated",
+            format_args!(
+                "generation={} kind={} target_bounds={}",
+                current_generation.get(),
+                preview_result_kind(&prepared.result),
+                prepared.target_bounds.is_some()
+            ),
+        );
+        let overlapped_target_changed = prepared.requires_settled_point_retry(dwell);
+        let current = self.refresh_tracked_pointer();
+        if prepared.result.status() == Some(ResolverStatus::PointerMoved) {
+            self.restart_after_pointer_span_rejection(current);
+        } else if current.is_some()
+            && let Some(target_bounds) = prepared.target_bounds
+            && self
+                .hover_state
+                .tracked_span_fits(current_generation, target_bounds)
+        {
+            self.show_worker_result(
+                current_generation,
+                dwell.anchor,
+                dwell.explorer_window,
+                target_bounds,
+                prepared.result,
+            );
+        } else if prepared.target_bounds.is_some() || overlapped_target_changed {
+            self.restart_after_pointer_span_rejection(current);
+        } else {
+            self.hover_state.finish_resolution(current_generation);
+            self.hide_product_preview();
         }
     }
 
@@ -1070,18 +1293,19 @@ impl MessageWindow {
 
     fn show_worker_result(
         &mut self,
+        generation: Generation,
         anchor: PhysicalScreenPoint,
         explorer_window: ExplorerWindowId,
         target_bounds: PhysicalScreenRect,
         result: PreviewResult,
     ) {
         let show_started = diagnostics::counter();
-        let generation = self.latest_worker_completion.map_or(0, Generation::get);
+        let generation_value = generation.get();
         let result_kind = preview_result_kind(&result);
         diagnostics::record(
             "preview.show.requested",
             format_args!(
-                "generation={generation} kind={} target_left={} target_top={} \
+                "generation={generation_value} kind={} target_left={} target_top={} \
                  target_right={} target_bottom={}",
                 result_kind,
                 target_bounds.left(),
@@ -1093,7 +1317,7 @@ impl MessageWindow {
         if matches!(result, PreviewResult::Status(_)) {
             diagnostics::record(
                 "preview.show.rejected",
-                format_args!("generation={generation} reason=status"),
+                format_args!("generation={generation_value} reason=status"),
             );
             self.hide_product_preview();
             return;
@@ -1104,7 +1328,7 @@ impl MessageWindow {
         {
             diagnostics::record(
                 "preview.show.rejected",
-                format_args!("generation={generation} reason=context_changed"),
+                format_args!("generation={generation_value} reason=context_changed"),
             );
             self.hide_product_preview();
             return;
@@ -1121,18 +1345,9 @@ impl MessageWindow {
                 .expect("normal preview creation requires loaded settings")
                 .settings()
                 .theme();
-            let Ok(preview) = PreviewWindow::create_with_theme(theme) else {
-                diagnostics::record(
-                    "preview.window.create",
-                    format_args!("generation={generation} outcome=error"),
-                );
+            if !self.prepare_preview_window(theme, "on_demand", generation_value) {
                 return;
-            };
-            diagnostics::record(
-                "preview.window.create",
-                format_args!("generation={generation} outcome=success"),
-            );
-            self.preview_window = Some(preview);
+            }
         }
 
         let preview = self
@@ -1149,15 +1364,11 @@ impl MessageWindow {
                 diagnostics::record(
                     "preview.visible",
                     format_args!(
-                        "generation={generation} kind={} show_us={}",
+                        "generation={generation_value} kind={} show_us={}",
                         result_kind,
                         diagnostics::elapsed_us(show_started).unwrap_or(0)
                     ),
                 );
-                let Some(generation) = self.latest_worker_completion else {
-                    self.hide_product_preview();
-                    return;
-                };
                 self.hover_state.preview_shown();
                 let active = ActivePreview {
                     generation,
@@ -1181,12 +1392,48 @@ impl MessageWindow {
                 diagnostics::record(
                     "preview.show.failed",
                     format_args!(
-                        "generation={generation} show_us={}",
+                        "generation={generation_value} show_us={}",
                         diagnostics::elapsed_us(show_started).unwrap_or(0)
                     ),
                 );
                 self.clear_product_preview_state();
                 drop(self.preview_window.take());
+            }
+        }
+    }
+
+    fn prepare_preview_window(
+        &mut self,
+        theme: Theme,
+        phase: &'static str,
+        generation: u64,
+    ) -> bool {
+        if self.preview_window.is_some() {
+            return true;
+        }
+
+        let started = diagnostics::counter();
+        match PreviewWindow::create_with_theme(theme) {
+            Ok(preview) => {
+                diagnostics::record(
+                    "preview.window.create",
+                    format_args!(
+                        "generation={generation} phase={phase} outcome=success elapsed_us={}",
+                        diagnostics::elapsed_us(started).unwrap_or(0)
+                    ),
+                );
+                self.preview_window = Some(preview);
+                true
+            }
+            Err(_) => {
+                diagnostics::record(
+                    "preview.window.create",
+                    format_args!(
+                        "generation={generation} phase={phase} outcome=error elapsed_us={}",
+                        diagnostics::elapsed_us(started).unwrap_or(0)
+                    ),
+                );
+                false
             }
         }
     }
@@ -1267,7 +1514,8 @@ impl MessageWindow {
                 "preview.hidden",
                 format_args!(
                     "generation={}",
-                    self.latest_worker_completion.map_or(0, Generation::get)
+                    self.active_preview
+                        .map_or(0, |active| active.generation.get())
                 ),
             );
         }
@@ -2128,25 +2376,27 @@ fn system_lifecycle_change_for_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivePreview, CLASS_NAME, DWELL_TIMER_ID, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW,
-        EVENT_SYSTEM_FOREGROUND, IsWindow, LPARAM, MessageWindow,
+        ActivePreview, CLASS_NAME, CompletedDwell, DWELL_TIMER_ID, EVENT_OBJECT_LOCATIONCHANGE,
+        EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND, IsWindow, LPARAM, MessageWindow,
         PREVIEW_CONTEXT_INVALIDATED_MESSAGE, PREVIEW_CONTEXT_REVALIDATE_MESSAGE,
         PREVIEW_WINDOW_DIAGNOSTIC_DURATION, PREVIEW_WINDOW_PRACTICE_DURATION,
-        PREVIEW_ZORDER_REPAIR_MESSAGE, PreviewPointOwner, PreviewPointerMotion, PreviewWindow,
-        SYSTEM_LIFECYCLE_CHANGED_MESSAGE, SystemLifecycleChange, TASKBAR_CREATED_MESSAGE,
-        TEST_PANIC_MESSAGE, TRAY_CALLBACK_MESSAGE, TRAY_EVENT_MESSAGE, WPARAM,
-        accept_worker_completion, classify_preview_pointer_motion, classify_preview_window_owner,
+        PREVIEW_ZORDER_REPAIR_MESSAGE, PreparedWorkerResult, PreviewPointOwner,
+        PreviewPointerMotion, PreviewReadiness, PreviewWindow, SYSTEM_LIFECYCLE_CHANGED_MESSAGE,
+        SystemLifecycleChange, TASKBAR_CREATED_MESSAGE, TEST_PANIC_MESSAGE, TRAY_CALLBACK_MESSAGE,
+        TRAY_EVENT_MESSAGE, WPARAM, WorkerRequestPhase, accept_worker_completion,
+        classify_preview_pointer_motion, classify_preview_window_owner,
         pointer_motion_stays_on_active_target, post_worker_result,
         preview_context_generation_matches, preview_context_is_current, preview_event_message,
         preview_input_requires_dismissal, preview_point_owner_shares_context,
-        registered_raw_devices, timer_interval_ms, tray_status,
+        registered_raw_devices, should_overlap_worker_resolution, timer_interval_ms, tray_status,
     };
     use crate::hover::{Generation, PhysicalScreenPoint};
     use crate::platform::windows::TrayStatus;
     use crate::platform::windows::explorer::is_explorer_window;
     use crate::platform::windows::input::{RawInputActivity, RawMouseActivity};
-    use crate::worker::WorkerManager;
-    use cursorpeek_core::{ExplorerWindowId, PhysicalScreenRect};
+    use crate::settings::Theme;
+    use crate::worker::{PreviewResult, ResolverStatus, WorkerManager};
+    use cursorpeek_core::{ExplorerWindowId, PhysicalScreenRect, PhysicalScreenSpan};
     use std::{
         sync::atomic::Ordering,
         thread,
@@ -2156,9 +2406,9 @@ mod tests {
         Win32::UI::{
             Input::RIDEV_INPUTSINK,
             WindowsAndMessaging::{
-                FindWindowExW, HWND_MESSAGE, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND,
-                PM_REMOVE, PeekMessageW, PostMessageW, SPI_SETWORKAREA, SendMessageW,
-                WM_DISPLAYCHANGE, WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_TIMER,
+                FindWindowExW, HWND_MESSAGE, IsWindowVisible, MSG, PBT_APMRESUMEAUTOMATIC,
+                PBT_APMSUSPEND, PM_REMOVE, PeekMessageW, PostMessageW, SPI_SETWORKAREA,
+                SendMessageW, WM_DISPLAYCHANGE, WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_TIMER,
             },
         },
         core::{Error, PCWSTR},
@@ -2190,11 +2440,138 @@ mod tests {
     }
 
     #[test]
+    fn overlapped_worker_result_waits_for_the_matching_dwell() {
+        let generation = Generation::from_raw(12);
+        let explorer_window = ExplorerWindowId::try_from_raw(0x1234).unwrap();
+        let dwell = CompletedDwell {
+            generation,
+            anchor: PhysicalScreenPoint::new(320, 240),
+            explorer_window,
+            pointer_span: PhysicalScreenSpan::from_point(PhysicalScreenPoint::new(320, 240)),
+        };
+        let worker = PreparedWorkerResult {
+            generation,
+            explorer_window,
+            point: PhysicalScreenPoint::new(320, 240),
+            phase: WorkerRequestPhase::Overlap,
+            target_bounds: PhysicalScreenRect::try_new(300, 220, 420, 300),
+            result: PreviewResult::Status(ResolverStatus::Unsupported),
+        };
+        let mut readiness = PreviewReadiness::default();
+
+        readiness.complete_worker(worker.clone());
+        assert!(
+            readiness.take_ready(generation).is_none(),
+            "worker completion must not bypass the dwell deadline"
+        );
+        readiness.complete_dwell(dwell);
+        assert_eq!(
+            readiness.take_ready(generation),
+            Some((dwell, worker.clone()))
+        );
+
+        readiness.complete_dwell(dwell);
+        assert!(
+            readiness.take_ready(generation).is_none(),
+            "the dwell deadline must also wait for worker completion"
+        );
+        readiness.complete_worker(worker.clone());
+        assert_eq!(readiness.take_ready(generation), Some((dwell, worker)));
+    }
+
+    #[test]
+    fn overlapped_unbounded_result_retries_when_the_pointer_settles_elsewhere() {
+        let generation = Generation::from_raw(13);
+        let explorer_window = ExplorerWindowId::try_from_raw(0x1234).unwrap();
+        let request_point = PhysicalScreenPoint::new(300, 220);
+        let dwell = CompletedDwell {
+            generation,
+            anchor: PhysicalScreenPoint::new(360, 260),
+            explorer_window,
+            pointer_span: PhysicalScreenSpan::try_new(300, 220, 360, 260).unwrap(),
+        };
+        let mut worker = PreparedWorkerResult {
+            generation,
+            explorer_window,
+            point: request_point,
+            phase: WorkerRequestPhase::Overlap,
+            target_bounds: None,
+            result: PreviewResult::Status(ResolverStatus::Unavailable),
+        };
+
+        assert!(
+            worker.requires_settled_point_retry(dwell),
+            "an early background result must not suppress a file reached before dwell completes"
+        );
+        worker.phase = WorkerRequestPhase::Dwell;
+        assert!(
+            !worker.requires_settled_point_retry(dwell),
+            "a fallback request already used the settled dwell point and complete pointer span"
+        );
+    }
+
+    #[test]
+    fn preview_readiness_rejects_stale_generations_and_explorer_roots() {
+        let current = Generation::from_raw(20);
+        let stale = Generation::from_raw(19);
+        let first_explorer = ExplorerWindowId::try_from_raw(0x1234).unwrap();
+        let second_explorer = ExplorerWindowId::try_from_raw(0x5678).unwrap();
+        let mut readiness = PreviewReadiness::default();
+
+        readiness.complete_dwell(CompletedDwell {
+            generation: stale,
+            anchor: PhysicalScreenPoint::new(10, 10),
+            explorer_window: first_explorer,
+            pointer_span: PhysicalScreenSpan::from_point(PhysicalScreenPoint::new(10, 10)),
+        });
+        readiness.complete_worker(PreparedWorkerResult {
+            generation: stale,
+            explorer_window: first_explorer,
+            point: PhysicalScreenPoint::new(10, 10),
+            phase: WorkerRequestPhase::Overlap,
+            target_bounds: None,
+            result: PreviewResult::Status(ResolverStatus::Unavailable),
+        });
+        assert!(readiness.take_ready(current).is_none());
+        assert!(readiness.dwell.is_none());
+        assert!(readiness.worker.is_none());
+
+        readiness.complete_dwell(CompletedDwell {
+            generation: current,
+            anchor: PhysicalScreenPoint::new(10, 10),
+            explorer_window: first_explorer,
+            pointer_span: PhysicalScreenSpan::from_point(PhysicalScreenPoint::new(10, 10)),
+        });
+        readiness.complete_worker(PreparedWorkerResult {
+            generation: current,
+            explorer_window: second_explorer,
+            point: PhysicalScreenPoint::new(10, 10),
+            phase: WorkerRequestPhase::Overlap,
+            target_bounds: None,
+            result: PreviewResult::Status(ResolverStatus::Unavailable),
+        });
+        assert!(readiness.take_ready(current).is_none());
+        assert!(readiness.dwell.is_none());
+        assert!(readiness.worker.is_none());
+    }
+
+    #[test]
     fn tray_status_prioritizes_pause_and_exposes_worker_recovery() {
         assert_eq!(tray_status(false, false), TrayStatus::Active);
         assert_eq!(tray_status(false, true), TrayStatus::WorkerRecovering);
         assert_eq!(tray_status(true, false), TrayStatus::Paused);
         assert_eq!(tray_status(true, true), TrayStatus::Paused);
+    }
+
+    #[test]
+    fn worker_overlap_is_bounded_to_short_interactive_dwells() {
+        assert!(should_overlap_worker_resolution(Duration::from_millis(25)));
+        assert!(should_overlap_worker_resolution(Duration::from_millis(50)));
+        assert!(should_overlap_worker_resolution(Duration::from_millis(100)));
+        assert!(!should_overlap_worker_resolution(Duration::from_millis(
+            101
+        )));
+        assert!(!should_overlap_worker_resolution(Duration::from_secs(2)));
     }
 
     #[test]
@@ -2434,9 +2811,22 @@ mod tests {
                 "raw input should be unregistered before window teardown"
             );
 
-            let application = MessageWindow::create_with_dwell_delay(Duration::from_millis(650))
-                .expect("the application message window should be created");
+            let mut application =
+                MessageWindow::create_with_dwell_delay(Duration::from_millis(650))
+                    .expect("the application message window should be created");
             assert_eq!(application.dwell_delay(), Duration::from_millis(650));
+            assert!(
+                application.prepare_preview_window(Theme::System, "test", 0),
+                "the application should prepare its preview window before the first hover"
+            );
+            let prepared_preview = application
+                .preview_window
+                .as_ref()
+                .expect("successful preparation retains the preview window")
+                .handle();
+            // SAFETY: The prepared preview handle is live and queried synchronously on its owner
+            // thread. Startup preparation must not make the window visible.
+            assert!(!unsafe { IsWindowVisible(prepared_preview).as_bool() });
             let application_handle = application.handle();
             let worker_manager = WorkerManager::start(
                 crate::settings::LegacyEncoding::Auto,
