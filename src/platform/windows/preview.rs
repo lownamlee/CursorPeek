@@ -14,7 +14,7 @@ use crate::{
     settings::Theme,
     worker::{ImagePreview, TextPreview},
 };
-use cursorpeek_core::{ExplorerWindowId, layout::fit_dimensions};
+use cursorpeek_core::{ExplorerWindowId, layout::fit_dimensions, payload::VideoPreview};
 
 use super::explorer::is_explorer_infotip_window;
 
@@ -54,6 +54,11 @@ use windows::{
                 RedrawWindow,
             },
         },
+        Media::MediaFoundation::{
+            IMFPMediaPlayer, IMFPMediaPlayerCallback, IMFPMediaPlayerCallback_Impl,
+            MF_MT_FRAME_SIZE, MF_VERSION, MFP_EVENT_HEADER, MFP_EVENT_TYPE_PLAYBACK_ENDED,
+            MFP_OPTION_NONE, MFPCreateMediaPlayer, MFSTARTUP_FULL, MFShutdown, MFStartup,
+        },
         System::{
             LibraryLoader::GetModuleHandleW,
             Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTimeEx},
@@ -72,11 +77,12 @@ use windows::{
                 UnregisterClassW, WINDOW_EX_STYLE, WM_APP, WM_DISPLAYCHANGE, WM_DPICHANGED,
                 WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
                 WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOLORCHANGE, WM_THEMECHANGED, WNDCLASSW,
-                WS_BORDER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+                WS_BORDER, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+                WS_VISIBLE,
             },
         },
     },
-    core::{Error, HRESULT, PCWSTR, Result, w},
+    core::{Error, HRESULT, PCWSTR, Result, implement, w},
 };
 use windows_numerics::Vector2;
 
@@ -98,6 +104,7 @@ pub(crate) struct PreviewWindow {
     hwnd: HWND,
     state: Box<RefCell<PreviewWindowState>>,
     theme_observer: Option<ThemeObserver>,
+    video_player: RefCell<Option<VideoPlayer>>,
     _class: RegisteredPreviewClass,
     _thread_affinity: PhantomData<Rc<()>>,
 }
@@ -139,6 +146,7 @@ impl PreviewWindow {
             hwnd,
             state,
             theme_observer,
+            video_player: RefCell::new(None),
             _class: class,
             _thread_affinity: PhantomData,
         })
@@ -160,6 +168,7 @@ impl PreviewWindow {
         size: PreviewSize,
         preview: &TextPreview,
     ) -> Result<PreviewPlacement> {
+        self.stop_video();
         self.show(
             anchor,
             size,
@@ -173,11 +182,44 @@ impl PreviewWindow {
         size: PreviewSize,
         preview: ImagePreview,
     ) -> Result<PreviewPlacement> {
+        self.stop_video();
         self.show(
             anchor,
             size,
             Some(RetainedContent::Image(ImageContent::from_preview(preview))),
         )
+    }
+
+    pub(crate) fn show_video_at(
+        &self,
+        anchor: PhysicalScreenPoint,
+        size: PreviewSize,
+        preview: VideoPreview,
+        play_audio: bool,
+    ) -> Result<PreviewPlacement> {
+        self.stop_video();
+        let file_lock = crate::worker::video::lock_for_playback(&preview.path)
+            .map_err(|_| Error::from_hresult(E_INVALIDARG))?;
+        match VideoPlayer::create(self.hwnd, &preview.path, play_audio, file_lock) {
+            Ok(player) => {
+                let (native_width, native_height) = player.native_size();
+                let (width, height) =
+                    fit_dimensions(native_width, native_height, size.width(), size.height())
+                        .ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
+                let placement = self.show(anchor, PreviewSize::new(width, height), None)?;
+                player.fill_parent()?;
+                self.video_player.replace(Some(player));
+                Ok(placement)
+            }
+            Err(error) => {
+                let _ = self.hide();
+                Err(error)
+            }
+        }
+    }
+
+    fn stop_video(&self) {
+        self.video_player.borrow_mut().take();
     }
 
     fn show(
@@ -304,6 +346,7 @@ impl PreviewWindow {
     }
 
     pub(crate) fn hide(&self) -> Result<()> {
+        self.stop_video();
         // SAFETY: The live HWND belongs to this UI thread. The flags hide it without changing
         // position, size, Z order, or activation.
         unsafe {
@@ -433,6 +476,234 @@ impl PreviewWindow {
             windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(self.hwnd, &mut units)
         };
         String::from_utf16_lossy(&units[..usize::try_from(copied).unwrap_or(0)])
+    }
+}
+
+#[implement(IMFPMediaPlayerCallback)]
+struct VideoPlayerCallback;
+
+impl IMFPMediaPlayerCallback_Impl for VideoPlayerCallback_Impl {
+    fn OnMediaPlayerEvent(&self, event: *const MFP_EVENT_HEADER) {
+        if event.is_null() {
+            return;
+        }
+        // SAFETY: MFPlay invokes the callback with one synchronous event header that remains live
+        // for this method. The embedded player is borrowed and cloned before the callback returns.
+        let header = unsafe { &*event };
+        if header.hrEvent.is_err() || header.eEventType != MFP_EVENT_TYPE_PLAYBACK_ENDED {
+            return;
+        }
+        if let Some(player) = header.pMediaPlayer.as_ref() {
+            // Stop resets the current media item to its beginning. Replaying here creates the
+            // short hover loop without queuing work onto the no-activate UI window.
+            // SAFETY: The callback header holds a live MFPlay interface for this callback.
+            let _ = unsafe { player.Stop() };
+            // SAFETY: The same live interface remains valid after the synchronous stop call.
+            let _ = unsafe { player.Play() };
+        }
+    }
+}
+
+struct VideoPlayer {
+    player: IMFPMediaPlayer,
+    video_window: VideoChildWindow,
+    native_width: u32,
+    native_height: u32,
+    _file_lock: crate::worker::video::PlaybackFileLock,
+    _media_foundation: MediaFoundationSession,
+}
+
+impl VideoPlayer {
+    fn create(
+        hwnd: HWND,
+        path: &[u16],
+        play_audio: bool,
+        file_lock: crate::worker::video::PlaybackFileLock,
+    ) -> Result<Self> {
+        let terminated = media_foundation_path(path)?;
+        let media_foundation = MediaFoundationSession::start()?;
+        let video_window = VideoChildWindow::create(hwnd)?;
+        let callback: IMFPMediaPlayerCallback = VideoPlayerCallback.into();
+        let mut player = None;
+        // SAFETY: The callback, dedicated live child HWND, and output storage remain valid for the
+        // synchronous call. MFPlay retains its own callback reference.
+        unsafe {
+            MFPCreateMediaPlayer(
+                PCWSTR::null(),
+                false,
+                MFP_OPTION_NONE,
+                &callback,
+                Some(video_window.hwnd),
+                Some(&mut player),
+            )?;
+        }
+        let player = player.ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
+        let mut owner = Self {
+            player,
+            video_window,
+            native_width: 0,
+            native_height: 0,
+            _file_lock: file_lock,
+            _media_foundation: media_foundation,
+        };
+        let mut item = None;
+        // SAFETY: The ordinary absolute path is terminated and stays live for synchronous item
+        // creation. The output receives one owned MFPlay media-item interface.
+        unsafe {
+            owner.player.CreateMediaItemFromURL(
+                PCWSTR(terminated.as_ptr()),
+                true,
+                0,
+                Some(&mut item),
+            )?;
+        }
+        let item = item.ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
+        // SAFETY: Synchronous media-item creation completed and the returned interface is live.
+        let stream_count = unsafe { item.GetNumberOfStreams()? };
+        let mut frame_size = None;
+        for stream in 0..stream_count {
+            // SAFETY: The synchronous media item owns `stream_count` streams and returns an owned
+            // PROPVARIANT. Non-video streams simply do not expose MF_MT_FRAME_SIZE.
+            let Ok(value) = (unsafe { item.GetStreamAttribute(stream, &MF_MT_FRAME_SIZE) }) else {
+                continue;
+            };
+            if let Ok(packed) = u64::try_from(&value) {
+                frame_size = Some(packed);
+                break;
+            }
+        }
+        let packed = frame_size.ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
+        owner.native_width =
+            u32::try_from(packed >> 32).map_err(|_| Error::from_hresult(E_INVALIDARG))?;
+        owner.native_height =
+            u32::try_from(packed & u64::from(u32::MAX)).expect("the low half fits u32");
+        if owner.native_width == 0 || owner.native_height == 0 {
+            return Err(Error::from_hresult(E_INVALIDARG));
+        }
+        // SAFETY: Both interfaces are live and owned through this synchronous setup sequence.
+        unsafe { owner.player.SetMediaItem(&item)? };
+        // Audio is opt-in. Muting happens before returning control to the message loop.
+        // SAFETY: MFPlay returned this live player interface on the current COM-initialized thread.
+        unsafe { owner.player.SetMute(!play_audio)? };
+        // SAFETY: The media item, video child, and player remain live in `owner`.
+        unsafe { owner.player.Play()? };
+        Ok(owner)
+    }
+
+    const fn native_size(&self) -> (u32, u32) {
+        (self.native_width, self.native_height)
+    }
+
+    fn fill_parent(&self) -> Result<()> {
+        let mut bounds = RECT::default();
+        // SAFETY: The parent preview HWND and writable rectangle are live.
+        unsafe { GetClientRect(self.video_window.parent, &mut bounds)? };
+        let width = bounds
+            .right
+            .checked_sub(bounds.left)
+            .filter(|value| *value > 0)
+            .ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
+        let height = bounds
+            .bottom
+            .checked_sub(bounds.top)
+            .filter(|value| *value > 0)
+            .ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
+        // SAFETY: The child belongs to this parent and fills its checked client rectangle without
+        // activation or Z-order changes.
+        unsafe {
+            SetWindowPos(
+                self.video_window.hwnd,
+                None,
+                0,
+                0,
+                width,
+                height,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            )
+        }
+    }
+}
+
+struct VideoChildWindow {
+    hwnd: HWND,
+    parent: HWND,
+}
+
+impl VideoChildWindow {
+    fn create(parent: HWND) -> Result<Self> {
+        // SAFETY: STATIC is a system class. The dedicated child has no borrowed creation data and
+        // remains owned by this RAII wrapper inside the live preview parent.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_NOACTIVATE,
+                w!("STATIC"),
+                w!("CursorPeek.VideoSurface"),
+                WS_CHILD | WS_VISIBLE,
+                0,
+                0,
+                1,
+                1,
+                Some(parent),
+                None,
+                None,
+                None,
+            )?
+        };
+        Ok(Self { hwnd, parent })
+    }
+}
+
+impl Drop for VideoChildWindow {
+    fn drop(&mut self) {
+        // SAFETY: This wrapper owns the dedicated child and destroys it once while its parent lives.
+        let _ = unsafe { DestroyWindow(self.hwnd) };
+    }
+}
+
+fn media_foundation_path(path: &[u16]) -> Result<Vec<u16>> {
+    if path.is_empty() || path.contains(&0) {
+        return Err(Error::from_hresult(E_INVALIDARG));
+    }
+    // GetFinalPathNameByHandleW deliberately gives the worker a canonical `\\?\C:\...` path.
+    // MFPlay accepts ordinary absolute DOS paths but rejects that extended-length spelling for
+    // some media sources, so remove only the verified drive-path prefix at this API boundary.
+    let extended_prefix = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    let path = path.strip_prefix(&extended_prefix).unwrap_or(path);
+    if path.len() < 3
+        || !u8::try_from(path[0]).is_ok_and(|unit| unit.is_ascii_alphabetic())
+        || path[1] != b':' as u16
+        || path[2] != b'\\' as u16
+    {
+        return Err(Error::from_hresult(E_INVALIDARG));
+    }
+    let mut terminated = Vec::with_capacity(path.len() + 1);
+    terminated.extend_from_slice(path);
+    terminated.push(0);
+    Ok(terminated)
+}
+
+struct MediaFoundationSession;
+
+impl MediaFoundationSession {
+    fn start() -> Result<Self> {
+        // SAFETY: Startup and shutdown are balanced by this thread-affine playback owner.
+        unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL)? };
+        Ok(Self)
+    }
+}
+
+impl Drop for MediaFoundationSession {
+    fn drop(&mut self) {
+        // SAFETY: This balances this owner's successful MFStartup after the player was shut down.
+        let _ = unsafe { MFShutdown() };
+    }
+}
+
+impl Drop for VideoPlayer {
+    fn drop(&mut self) {
+        // Shutdown synchronously stops rendering and audio before the hover window is hidden.
+        // SAFETY: This owner shuts down its live player once before Media Foundation shutdown.
+        let _ = unsafe { self.player.Shutdown() };
     }
 }
 
@@ -1681,7 +1952,8 @@ mod tests {
         PreviewWindowState, RetainedContent, TextContent, adjusted_window_pixel_size,
         checked_image_layout, checked_window_rect, client_pixel_size, color_from_colorref,
         format_file_size, image_client_pixel_size, image_destination_rect, image_preview_metadata,
-        rectangles_overlap, system_dark_mode, system_message_font, text_preview_metadata,
+        media_foundation_path, rectangles_overlap, system_dark_mode, system_message_font,
+        text_preview_metadata,
     };
     use crate::{
         hover::PhysicalScreenPoint,
@@ -1690,7 +1962,8 @@ mod tests {
         settings::Theme,
         worker::{ImageFormat, ImagePreview, TextPreview, image_corpus_previews},
     };
-    use std::thread;
+    use cursorpeek_core::payload::VideoPreview;
+    use std::{env, os::windows::ffi::OsStrExt, path::PathBuf, thread};
     use windows::Win32::{
         Foundation::{HWND, LPARAM, RECT, WPARAM},
         Graphics::DirectWrite::DWRITE_TEXT_METRICS,
@@ -2378,5 +2651,71 @@ mod tests {
         assert!((color.g - 0x22 as f32 / 255.0).abs() < f32::EPSILON);
         assert!((color.b - 0x33 as f32 / 255.0).abs() < f32::EPSILON);
         assert_eq!(color.a, 1.0);
+    }
+
+    #[test]
+    #[ignore = "requires CURSORPEEK_TEST_MP4 pointing to a local playable MP4"]
+    fn native_mp4_player_starts_muted_and_stops_with_the_preview() {
+        let path = PathBuf::from(
+            env::var_os("CURSORPEEK_TEST_MP4")
+                .expect("CURSORPEEK_TEST_MP4 must point to a local playable MP4"),
+        );
+        let metadata = path.metadata().expect("the MP4 fixture should be readable");
+        let _apartment = ComApartment::initialize(ApartmentKind::SingleThreaded)
+            .expect("the test thread should initialize COM");
+        let window = PreviewWindow::create().expect("the preview window should be created");
+        let mut worker_path: Vec<u16> = r"\\?\".encode_utf16().collect();
+        worker_path.extend(path.as_os_str().encode_wide());
+        let preview = VideoPreview {
+            file_size: metadata.len(),
+            last_write_time: 0,
+            linked_content: false,
+            display_name: "native-player-test.mp4".to_owned(),
+            path: worker_path,
+        };
+        window
+            .show_video_at(
+                PhysicalScreenPoint::new(100, 100),
+                PreviewSize::new(480, 360),
+                preview,
+                false,
+            )
+            .expect("MFPlay should accept and start the local MP4");
+        let video_surface = window
+            .video_player
+            .borrow()
+            .as_ref()
+            .expect("the player should be retained while visible")
+            .video_window
+            .hwnd;
+        window.hide().expect("hiding should stop native playback");
+        // SAFETY: The captured HWND belonged to the video child and should now be stale.
+        assert!(!unsafe { IsWindow(Some(video_surface)).as_bool() });
+        window
+            .show_image_at(
+                PhysicalScreenPoint::new(100, 100),
+                PreviewSize::new(480, 360),
+                image_preview(),
+            )
+            .expect("an image should render after the video surface is destroyed");
+        window.hide().expect("the image preview should hide");
+    }
+
+    #[test]
+    fn media_foundation_receives_an_ordinary_absolute_dos_path() {
+        let converted = media_foundation_path(
+            &r"\\?\C:\Video\sample.mp4"
+                .encode_utf16()
+                .collect::<Vec<_>>(),
+        )
+        .expect("the worker's canonical drive path should convert");
+        assert_eq!(
+            String::from_utf16(&converted).unwrap(),
+            "C:\\Video\\sample.mp4\0"
+        );
+        assert!(
+            media_foundation_path(&r"\\server\share\a.mp4".encode_utf16().collect::<Vec<_>>())
+                .is_err()
+        );
     }
 }

@@ -38,6 +38,8 @@ const TOGGLE_STARTUP_COMMAND: usize = 30;
 const THEME_SYSTEM_COMMAND: usize = 40;
 const THEME_LIGHT_COMMAND: usize = 41;
 const THEME_DARK_COMMAND: usize = 42;
+const TOGGLE_VIDEO_PREVIEWS_COMMAND: usize = 50;
+const TOGGLE_VIDEO_AUDIO_COMMAND: usize = 51;
 const NIN_KEYSELECT: u32 = NIN_SELECT + 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,6 +67,8 @@ pub(crate) struct TrayMenuState {
     pub(crate) preview_height: u16,
     pub(crate) theme: Theme,
     pub(crate) start_with_windows: bool,
+    pub(crate) video_previews: bool,
+    pub(crate) video_audio: bool,
 }
 
 pub(crate) struct TrayIcon {
@@ -244,6 +248,8 @@ pub(crate) enum TrayCommand {
     SetPreviewSize(u16, u16),
     SetTheme(Theme),
     ToggleStartWithWindows,
+    ToggleVideoPreviews,
+    ToggleVideoAudio,
     About,
     Exit,
 }
@@ -391,6 +397,18 @@ impl PopupMenu {
         )?;
         theme.append_command(THEME_DARK_COMMAND, w!("Dark"), state.theme == Theme::Dark)?;
         settings.append_submenu(theme, w!("Theme"))?;
+        let video = Self::new()?;
+        video.append_command(
+            TOGGLE_VIDEO_PREVIEWS_COMMAND,
+            w!("Play video previews"),
+            state.video_previews,
+        )?;
+        video.append_command(
+            TOGGLE_VIDEO_AUDIO_COMMAND,
+            w!("Play sound"),
+            state.video_audio,
+        )?;
+        settings.append_submenu(video, w!("Video"))?;
         settings.append_separator()?;
         settings.append_command(
             TOGGLE_STARTUP_COMMAND,
@@ -503,6 +521,8 @@ fn command_from_id(id: usize) -> Option<TrayCommand> {
         THEME_LIGHT_COMMAND => Some(TrayCommand::SetTheme(Theme::Light)),
         THEME_DARK_COMMAND => Some(TrayCommand::SetTheme(Theme::Dark)),
         TOGGLE_STARTUP_COMMAND => Some(TrayCommand::ToggleStartWithWindows),
+        TOGGLE_VIDEO_PREVIEWS_COMMAND => Some(TrayCommand::ToggleVideoPreviews),
+        TOGGLE_VIDEO_AUDIO_COMMAND => Some(TrayCommand::ToggleVideoAudio),
         ABOUT_COMMAND => Some(TrayCommand::About),
         EXIT_COMMAND => Some(TrayCommand::Exit),
         _ => None,
@@ -538,8 +558,9 @@ mod tests {
         DWELL_STANDARD_COMMAND, EXIT_COMMAND, ICON_ID, NIN_KEYSELECT, NIN_SELECT,
         PREVIEW_COMPACT_COMMAND, PREVIEW_LARGE_COMMAND, PREVIEW_STANDARD_COMMAND, PopupMenu,
         THEME_DARK_COMMAND, THEME_LIGHT_COMMAND, THEME_SYSTEM_COMMAND, TOGGLE_PAUSE_COMMAND,
-        TOGGLE_STARTUP_COMMAND, TrayCommand, TrayMenuState, TrayStatus, callback_anchor,
-        command_from_id, establish_notification_area_registration, write_wide_z,
+        TOGGLE_STARTUP_COMMAND, TOGGLE_VIDEO_AUDIO_COMMAND, TOGGLE_VIDEO_PREVIEWS_COMMAND,
+        TrayCommand, TrayMenuState, TrayStatus, callback_anchor, command_from_id,
+        establish_notification_area_registration, write_wide_z,
     };
     use crate::settings::Theme;
     use windows::Win32::{
@@ -633,6 +654,14 @@ mod tests {
             command_from_id(TOGGLE_STARTUP_COMMAND),
             Some(TrayCommand::ToggleStartWithWindows)
         );
+        assert_eq!(
+            command_from_id(TOGGLE_VIDEO_PREVIEWS_COMMAND),
+            Some(TrayCommand::ToggleVideoPreviews)
+        );
+        assert_eq!(
+            command_from_id(TOGGLE_VIDEO_AUDIO_COMMAND),
+            Some(TrayCommand::ToggleVideoAudio)
+        );
         assert_eq!(command_from_id(0), None);
         assert_eq!(command_from_id(usize::MAX), None);
     }
@@ -646,6 +675,8 @@ mod tests {
             preview_height: 360,
             theme: Theme::Dark,
             start_with_windows: true,
+            video_previews: true,
+            video_audio: false,
         })
         .expect("the native popup hierarchy should be created");
 
@@ -672,6 +703,11 @@ mod tests {
         assert!(!is_checked(theme, THEME_SYSTEM_COMMAND));
         assert!(!is_checked(theme, THEME_LIGHT_COMMAND));
         assert!(is_checked(theme, THEME_DARK_COMMAND));
+        // SAFETY: Video is the fourth live submenu in the settings hierarchy.
+        let video = unsafe { GetSubMenu(settings, 3) };
+        assert!(!video.0.is_null());
+        assert!(is_checked(video, TOGGLE_VIDEO_PREVIEWS_COMMAND));
+        assert!(!is_checked(video, TOGGLE_VIDEO_AUDIO_COMMAND));
         assert!(is_checked(settings, TOGGLE_STARTUP_COMMAND));
     }
 

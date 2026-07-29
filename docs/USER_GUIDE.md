@@ -41,6 +41,10 @@ Right-click the CursorPeek icon:
   - Use system colors
   - Light
   - Dark
+- **Settings > Video**
+  - **Play video previews** enables or disables MP4 playback on hover. Enabled by default.
+  - **Play sound** enables MP4 audio. Disabled by default. Hiding the preview stops audio
+    immediately.
 - **Settings > Start with Windows** — adds or removes the current executable from the current
   user’s startup list.
 - **About CursorPeek** — shows the product version.
@@ -79,6 +83,17 @@ Current image limits:
 Images are never enlarged beyond their decoded size and are fitted without changing aspect ratio.
 The popup follows the displayed image size, up to the selected maximum, with file details beneath
 the image.
+
+## Supported video
+
+CursorPeek plays local `.mp4` files with Windows Media Foundation. Playback loops while the pointer
+remains on the same Explorer item and stops as soon as the preview is dismissed. Audio is muted
+unless **Settings > Video > Play sound** is selected.
+
+An `.mp4` extension is not sufficient by itself: the worker checks for an ISO Base Media `ftyp`
+header before the main application starts native playback. Video files are limited to 4 GiB.
+Available codecs depend on the media components installed in Windows; unsupported or malformed
+MP4 files fail without opening another application.
 
 ## Supported text
 
@@ -193,6 +208,8 @@ cache_entries=128
 theme=system
 legacy_encoding=auto
 start_with_windows=false
+video_previews=true
+video_audio=false
 ```
 
 | Key | Accepted value |
@@ -204,6 +221,8 @@ start_with_windows=false
 | `theme` | `system`, `light`, or `dark` |
 | `legacy_encoding` | `auto`, `system`, `off`, or a supported legacy label such as `windows-1252` or `shift_jis` |
 | `start_with_windows` | `true` or `false` |
+| `video_previews` | `true` or `false`; controls MP4 playback |
+| `video_audio` | `true` or `false`; controls MP4 sound and defaults to `false` |
 
 The tray exposes safe presets rather than every numeric value. To use another accepted value,
 including a different cache capacity, exit CursorPeek, edit `config.ini` as UTF-8, and restart it.
@@ -216,9 +235,11 @@ preserved for forward compatibility.
 ## Privacy and containment
 
 CursorPeek has no account, telemetry, content upload, update check, or application network
-protocol. It reads the selected local file only after Explorer identity checks succeed. Parsing
-and decoding occur in a separate worker process with strict resource limits, authenticated bounded
-IPC, process mitigations, and kill-on-close Job containment.
+protocol. It reads the selected local file only after Explorer identity checks succeed. Image and
+text parsing and decoding occur in a separate worker process with strict resource limits,
+authenticated bounded IPC, process mitigations, and kill-on-close Job containment. MP4 eligibility
+is checked there, then Windows Media Foundation performs native playback while a no-delete lock
+keeps the validated local path stable.
 
 The worker runs as the same Windows user. It is not an AppContainer, a different integrity level,
 or a security sandbox. Containment is designed to recover from decoder crashes, hangs, malformed

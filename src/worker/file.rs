@@ -491,7 +491,7 @@ fn structure_size<T>() -> u32 {
 }
 
 #[derive(Debug)]
-pub(super) enum PreviewFileError {
+pub(crate) enum PreviewFileError {
     Windows {
         operation: &'static str,
         source: WindowsError,

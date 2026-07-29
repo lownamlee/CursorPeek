@@ -145,6 +145,7 @@ settings, and uninstall details.
 | Type | Supported extensions or filenames |
 | --- | --- |
 | **Images** | `.jpg`, `.jpeg`, `.jpe`, `.jfif`, `.png`, `.gif`, `.webp`, `.bmp`, `.dib`, `.ico`, `.tif`, `.tiff` |
+| **Video** | `.mp4` (native Windows playback) |
 | **Text, logs, and markup** | `.txt`, `.text`, `.log`, `.md` |
 | **Data and configuration** | `.csv`, `.tsv`, `.json`, `.jsonc`, `.xml`, `.yaml`, `.yml`, `.toml`, `.ini`, `.cfg`, `.conf`, `.properties` |
 | **C and C++** | `.c`, `.h`, `.cc`, `.cpp`, `.cxx`, `.hh`, `.hpp`, `.hxx`, `.ipp`, `.inl` |
@@ -153,14 +154,15 @@ settings, and uninstall details.
 | **Scripts and queries** | `.sql`, `.sh`, `.bash`, `.zsh`, `.ps1`, `.bat`, `.cmd` |
 | **Exact filenames** | `README`, `LICENSE`, `COPYING`, `NOTICE`, `Makefile`, `Dockerfile`, `Gemfile`, `.env`, `.editorconfig`, `.gitattributes`, `.gitignore`, `.dockerignore`, `.npmrc`, `.prettierrc`, `.prettierignore`, `.eslintrc`, `.eslintignore` |
 
-Matching is case-insensitive. Images and text are validated before previewing. See the
+Matching is case-insensitive. Images, video, and text are validated before previewing. See the
 [format reference](docs/USER_GUIDE.md#supported-images) and
 [known limitations](docs/KNOWN_LIMITATIONS.md) for behavior and limits.
 
 ## ⚙️ Settings
 
 Right-click the tray icon to pause previews or change the dwell delay, maximum preview size, theme,
-and startup behavior. See [settings and configuration](docs/USER_GUIDE.md#tray-menu).
+video playback, sound, and startup behavior. Video previews are enabled by default; sound is
+opt-in. See [settings and configuration](docs/USER_GUIDE.md#tray-menu).
 
 <p align="center">
   <img

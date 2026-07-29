@@ -9,6 +9,7 @@ const NULL_PATTERN_SAMPLE_LIMIT: usize = 4 * 1024;
 pub const IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "jpe", "jfif", "png", "gif", "webp", "bmp", "dib", "ico", "tif", "tiff",
 ];
+pub const VIDEO_EXTENSIONS: &[&str] = &["mp4"];
 
 pub const TEXT_EXTENSIONS: &[&str] = &[
     "txt",
@@ -136,6 +137,22 @@ pub fn is_image_eligible_path(path: &Path) -> bool {
                 .iter()
                 .any(|candidate| extension.eq_ignore_ascii_case(candidate))
         })
+}
+
+pub fn is_video_eligible_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            VIDEO_EXTENSIONS
+                .iter()
+                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+        })
+}
+
+pub fn is_mp4_prefix(prefix: &[u8]) -> bool {
+    prefix.len() >= 12
+        && &prefix[4..8] == b"ftyp"
+        && u32::from_be_bytes(prefix[..4].try_into().expect("the length was checked")) >= 8
 }
 
 pub fn sniff_image_format(prefix: &[u8]) -> Option<SniffedImageFormat> {
@@ -278,7 +295,8 @@ mod tests {
 
     use super::{
         IMAGE_EXTENSIONS, TEXT_EXTENSIONS, TEXT_NAMES, TextByteKind, classify_text_prefix,
-        is_image_eligible_path, is_text_eligible_path, sniff_image_format,
+        is_image_eligible_path, is_mp4_prefix, is_text_eligible_path, is_video_eligible_path,
+        sniff_image_format,
     };
     use crate::payload::ImageFormat;
 
@@ -299,6 +317,16 @@ mod tests {
                 extension.to_ascii_uppercase()
             ))));
         }
+        assert!(is_video_eligible_path(Path::new(r"C:\preview.MP4")));
+        assert!(!is_video_eligible_path(Path::new(r"C:\preview.mov")));
+    }
+
+    #[test]
+    fn mp4_sniff_requires_a_bounded_iso_base_media_header() {
+        assert!(is_mp4_prefix(b"\0\0\0\x18ftypisom\0\0\0\0isommp42"));
+        assert!(!is_mp4_prefix(b"\0\0\0\x18moovisom"));
+        assert!(!is_mp4_prefix(b"\0\0\0\x04ftypisom"));
+        assert!(!is_mp4_prefix(b"short"));
     }
 
     #[test]

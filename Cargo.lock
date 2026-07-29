@@ -342,6 +342,7 @@ dependencies = [
  "encoding_rs",
  "image",
  "windows",
+ "windows-core",
  "windows-numerics",
  "winresource",
 ]

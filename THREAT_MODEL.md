@@ -62,14 +62,17 @@ preview.
 
 ### Malformed content and resource exhaustion
 
-Only an explicit image/text extension or special filename is eligible. Image magic remains
-authoritative. Product caps bound file size, read prefixes, dimensions, pixel count, decoded
-bytes, text bytes, scalar count, lines, protocol frames, cache entries, and cache bytes. Checked
-arithmetic precedes allocation and layout.
+Only an explicit image, MP4 video, or text extension or special filename is eligible. Image magic
+remains authoritative, and MP4 requires an ISO Base Media `ftyp` header. Product caps bound file
+size, read prefixes, dimensions, pixel count, decoded bytes, text bytes, scalar count, lines,
+protocol frames, cache entries, and cache bytes. Checked arithmetic precedes allocation and layout.
 
-Parsing and decoding occur in the worker. One request runs at a time and only the newest pending
-request is retained. A private Job limits the worker to one process and 384 MiB, kills it when the
-Job closes, and supports forced timeout recovery. The worker retires after idle expiry.
+Image/text parsing and decoding occur in the worker. MP4 structure, locality, identity, and resource
+eligibility are checked there; immediately before native Windows Media Foundation playback, the UI
+process repeats those checks while holding a no-delete file lock so the validated path cannot be
+replaced. One request runs at a time and only the newest pending request is retained. A private Job
+limits the worker to one process and 384 MiB, kills it when the Job closes, and supports forced
+timeout recovery. The worker retires after idle expiry.
 
 ### Worker spoofing, stale data, and handle inheritance
 

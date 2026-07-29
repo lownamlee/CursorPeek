@@ -44,10 +44,12 @@ windows = { version = "=0.62.2", features = [
     "Win32_Graphics_Dxgi_Common",
     "Win32_Globalization",
     "Win32_Graphics_Gdi",
+    "Win32_Media_MediaFoundation",
     "Win32_Security",
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
     "Win32_System_Ole",
@@ -63,9 +65,11 @@ windows = { version = "=0.62.2", features = [
     "Win32_UI_HiDpi",
     "Win32_UI_Input",
     "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_WindowsAndMessaging",
 ] }
 windows-numerics = { version = "=0.3.1", default-features = false }
+windows-core = { version = "=0.62.2", default-features = false }
 
 [build-dependencies]
 winresource = { version = "=0.1.31", default-features = false }

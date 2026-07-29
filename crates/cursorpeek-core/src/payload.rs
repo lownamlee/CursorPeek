@@ -13,10 +13,12 @@ pub const MAX_TEXT_SCALARS: usize = 32_000;
 pub const MAX_TEXT_LINES: usize = 200;
 pub const MAX_ENCODING_LABEL_LEN: usize = 40;
 pub const MAX_DISPLAY_NAME_UTF8_LEN: usize = 1_024;
+pub const MAX_VIDEO_PATH_UNITS: usize = 32_768;
 
 const RESULT_STATUS: u32 = 0;
 const RESULT_TEXT: u32 = 1;
 const RESULT_IMAGE: u32 = 2;
+const RESULT_VIDEO: u32 = 3;
 const STATUS_PAYLOAD_LEN: usize = 8;
 const TEXT_FIXED_LEN: usize = 36;
 const FLAG_LINKED_CONTENT: u32 = 1 << 0;
@@ -25,6 +27,8 @@ const FLAG_TEXT_TRUNCATED: u32 = 1 << 2;
 const TEXT_FLAGS: u32 = FLAG_LINKED_CONTENT | FLAG_TEXT_ENCODING_GUESSED | FLAG_TEXT_TRUNCATED;
 const FLAG_IMAGE_FIRST_FRAME_ONLY: u32 = 1 << 1;
 const IMAGE_FLAGS: u32 = FLAG_LINKED_CONTENT | FLAG_IMAGE_FIRST_FRAME_ONLY;
+const VIDEO_FIXED_LEN: usize = 32;
+const VIDEO_FLAGS: u32 = FLAG_LINKED_CONTENT;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResolverStatus {
@@ -104,17 +108,28 @@ pub struct ImagePreview {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VideoPreview {
+    pub file_size: u64,
+    pub last_write_time: i64,
+    pub linked_content: bool,
+    pub display_name: String,
+    /// Absolute, local, non-NUL-terminated UTF-16 path validated by the worker.
+    pub path: Vec<u16>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PreviewResult {
     Status(ResolverStatus),
     Text(TextPreview),
     Image(ImagePreview),
+    Video(VideoPreview),
 }
 
 impl PreviewResult {
     pub const fn status(&self) -> Option<ResolverStatus> {
         match self {
             Self::Status(status) => Some(*status),
-            Self::Text(_) | Self::Image(_) => None,
+            Self::Text(_) | Self::Image(_) | Self::Video(_) => None,
         }
     }
 }
@@ -201,6 +216,40 @@ pub fn encode_result(result: &PreviewResult) -> Result<Vec<u8>, PayloadError> {
             output.extend_from_slice(preview.display_name.as_bytes());
             output.extend_from_slice(&preview.premultiplied_bgra);
         }
+        PreviewResult::Video(preview) => {
+            validate_video(preview)?;
+            let path_bytes = preview
+                .path
+                .len()
+                .checked_mul(2)
+                .ok_or(PayloadError::LengthOverflow)?;
+            let payload_len = VIDEO_FIXED_LEN
+                .checked_add(preview.display_name.len())
+                .and_then(|length| length.checked_add(path_bytes))
+                .ok_or(PayloadError::LengthOverflow)?;
+            ensure_payload_cap(payload_len)?;
+            output.reserve(payload_len);
+            push_u32(&mut output, RESULT_VIDEO);
+            push_u32(
+                &mut output,
+                flags(&[(preview.linked_content, FLAG_LINKED_CONTENT)]),
+            );
+            push_u64(&mut output, preview.file_size);
+            push_i64(&mut output, preview.last_write_time);
+            push_u32(
+                &mut output,
+                u32::try_from(preview.display_name.len())
+                    .expect("the display-name cap fits the wire length"),
+            );
+            push_u32(
+                &mut output,
+                u32::try_from(preview.path.len()).expect("the path cap fits the wire length"),
+            );
+            output.extend_from_slice(preview.display_name.as_bytes());
+            for unit in &preview.path {
+                output.extend_from_slice(&unit.to_le_bytes());
+            }
+        }
     }
     Ok(output)
 }
@@ -216,8 +265,47 @@ pub fn decode_result(bytes: &[u8]) -> Result<PreviewResult, PayloadError> {
         RESULT_STATUS => decode_status(bytes),
         RESULT_TEXT => decode_text(bytes),
         RESULT_IMAGE => decode_image(bytes),
+        RESULT_VIDEO => decode_video(bytes),
         kind => Err(PayloadError::UnknownResultKind(kind)),
     }
+}
+
+fn decode_video(bytes: &[u8]) -> Result<PreviewResult, PayloadError> {
+    if bytes.len() < VIDEO_FIXED_LEN {
+        return Err(PayloadError::PayloadLengthMismatch {
+            kind: "video",
+            expected: VIDEO_FIXED_LEN,
+            actual: bytes.len(),
+        });
+    }
+    let raw_flags = read_u32(bytes, 4);
+    reject_unknown_flags("video", raw_flags, VIDEO_FLAGS)?;
+    let display_name_len = read_u32(bytes, 24) as usize;
+    let path_units = read_u32(bytes, 28) as usize;
+    let path_bytes = path_units
+        .checked_mul(2)
+        .ok_or(PayloadError::LengthOverflow)?;
+    let expected = VIDEO_FIXED_LEN
+        .checked_add(display_name_len)
+        .and_then(|length| length.checked_add(path_bytes))
+        .ok_or(PayloadError::LengthOverflow)?;
+    require_exact_length("video", bytes.len(), expected)?;
+    let display_name_end = VIDEO_FIXED_LEN + display_name_len;
+    let display_name = std::str::from_utf8(&bytes[VIDEO_FIXED_LEN..display_name_end])
+        .map_err(|_| PayloadError::InvalidDisplayName)?;
+    let path = bytes[display_name_end..]
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    let preview = VideoPreview {
+        file_size: read_u64(bytes, 8),
+        last_write_time: read_i64(bytes, 16),
+        linked_content: raw_flags & FLAG_LINKED_CONTENT != 0,
+        display_name: display_name.to_owned(),
+        path,
+    };
+    validate_video(&preview)?;
+    Ok(PreviewResult::Video(preview))
 }
 
 fn decode_status(bytes: &[u8]) -> Result<PreviewResult, PayloadError> {
@@ -460,6 +548,28 @@ fn validate_image(preview: &ImagePreview) -> Result<(), PayloadError> {
     )
 }
 
+fn validate_video(preview: &VideoPreview) -> Result<(), PayloadError> {
+    validate_display_name(&preview.display_name)?;
+    if preview.path.is_empty()
+        || preview.path.len() > MAX_VIDEO_PATH_UNITS
+        || preview.path.contains(&0)
+        || String::from_utf16(&preview.path).is_err()
+    {
+        return Err(PayloadError::InvalidVideoPath);
+    }
+    let path_bytes = preview
+        .path
+        .len()
+        .checked_mul(2)
+        .ok_or(PayloadError::LengthOverflow)?;
+    ensure_payload_cap(
+        VIDEO_FIXED_LEN
+            .checked_add(preview.display_name.len())
+            .and_then(|length| length.checked_add(path_bytes))
+            .ok_or(PayloadError::LengthOverflow)?,
+    )
+}
+
 fn validate_display_name(value: &str) -> Result<(), PayloadError> {
     if value.len() > MAX_DISPLAY_NAME_UTF8_LEN {
         return Err(PayloadError::DisplayNameTooLong {
@@ -597,6 +707,7 @@ pub enum PayloadError {
         actual: usize,
     },
     InvalidDisplayName,
+    InvalidVideoPath,
     InvalidSourceDimensions {
         width: u32,
         height: u32,
@@ -686,6 +797,7 @@ impl fmt::Display for PayloadError {
                 "display name length {actual} exceeds {MAX_DISPLAY_NAME_UTF8_LEN} UTF-8 bytes"
             ),
             Self::InvalidDisplayName => write!(formatter, "invalid preview display name"),
+            Self::InvalidVideoPath => write!(formatter, "invalid preview video path"),
             Self::InvalidSourceDimensions { width, height } => write!(
                 formatter,
                 "invalid source image dimensions {width}x{height}"
@@ -738,7 +850,7 @@ mod tests {
         ImagePreview, MAX_DISPLAY_NAME_UTF8_LEN, MAX_ENCODING_LABEL_LEN, MAX_PREVIEW_IMAGE_WIDTH,
         MAX_SOURCE_IMAGE_AXIS, MAX_SOURCE_IMAGE_PIXELS, MAX_TEXT_LINES, MAX_TEXT_SCALARS,
         MAX_TEXT_UTF8_LEN, PayloadError, PreviewResult, ResolverStatus, TEXT_FIXED_LEN,
-        TextPreview, decode_result, encode_result,
+        TextPreview, VideoPreview, decode_result, encode_result,
     };
 
     fn text_preview() -> TextPreview {
@@ -767,6 +879,16 @@ mod tests {
             width: 3,
             height: 2,
             premultiplied_bgra: vec![0x7f; 24],
+        }
+    }
+
+    fn video_preview() -> VideoPreview {
+        VideoPreview {
+            file_size: 1_234_567,
+            last_write_time: 133_000_000_000_000_000,
+            linked_content: false,
+            display_name: "sample.mp4".to_owned(),
+            path: r"C:\Videos\sample.mp4".encode_utf16().collect(),
         }
     }
 
@@ -801,6 +923,9 @@ mod tests {
             let result = PreviewResult::Image(image);
             assert_eq!(decode_result(&encode_result(&result).unwrap()), Ok(result));
         }
+
+        let video = PreviewResult::Video(video_preview());
+        assert_eq!(decode_result(&encode_result(&video).unwrap()), Ok(video));
     }
 
     #[test]
@@ -1013,6 +1138,18 @@ mod tests {
         let mut image = encode_result(&PreviewResult::Image(image_preview())).unwrap();
         image[IMAGE_FIXED_LEN] = 0xff;
         assert_eq!(decode_result(&image), Err(PayloadError::InvalidDisplayName));
+    }
+
+    #[test]
+    fn video_paths_are_bounded_well_formed_utf16_without_embedded_nuls() {
+        for path in [Vec::new(), vec![0], vec![0xd800]] {
+            let mut preview = video_preview();
+            preview.path = path;
+            assert_eq!(
+                encode_result(&PreviewResult::Video(preview)),
+                Err(PayloadError::InvalidVideoPath)
+            );
+        }
     }
 
     #[test]

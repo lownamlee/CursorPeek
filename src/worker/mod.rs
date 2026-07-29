@@ -3,6 +3,7 @@ mod file;
 mod image;
 mod manager;
 mod text;
+pub(crate) mod video;
 
 mod payload {
     pub(crate) use cursorpeek_core::payload::*;
@@ -190,8 +191,11 @@ fn resolver_result_with_cache(
                 }
             };
             (
-                matches!(result, PreviewResult::Text(_) | PreviewResult::Image(_))
-                    .then_some(target_bounds),
+                matches!(
+                    result,
+                    PreviewResult::Text(_) | PreviewResult::Image(_) | PreviewResult::Video(_)
+                )
+                .then_some(target_bounds),
                 result,
             )
         }
@@ -242,6 +246,10 @@ fn preview_file_result(
                 preview.display_name = file.display_name();
                 preview.last_write_time = file.last_write_time();
             }
+            PreviewResult::Video(preview) => {
+                preview.display_name = file.display_name();
+                preview.last_write_time = file.last_write_time();
+            }
             PreviewResult::Status(_) => {}
         }
         return match file.is_unchanged() {
@@ -278,6 +286,10 @@ fn preview_file_result(
             Err(error) if error.is_unsupported() => {
                 PreviewResult::Status(ResolverStatus::Unsupported)
             }
+            Err(_) => PreviewResult::Status(ResolverStatus::Unavailable),
+        },
+        PreviewProvider::Video => match video::preview(file) {
+            Ok(preview) => PreviewResult::Video(preview),
             Err(_) => PreviewResult::Status(ResolverStatus::Unavailable),
         },
     };
@@ -321,6 +333,7 @@ fn preview_result_kind(result: &PreviewResult) -> &'static str {
         },
         PreviewResult::Text(_) => "text",
         PreviewResult::Image(_) => "image",
+        PreviewResult::Video(_) => "video",
     }
 }
 
@@ -374,6 +387,16 @@ fn record_preview_result(
                 preview.first_frame_only,
                 preview.linked_content,
                 target_bounds.is_some()
+            ),
+        ),
+        PreviewResult::Video(preview) => diagnostics::record(
+            event,
+            format_args!(
+                "generation={} outcome=video target={} file_size={} elapsed_us={}",
+                generation.get(),
+                target_bounds.is_some(),
+                preview.file_size,
+                diagnostics::elapsed_us(started).unwrap_or(0)
             ),
         ),
     }
