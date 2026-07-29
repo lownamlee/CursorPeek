@@ -7,5 +7,6 @@ sequences. No third-party fixture content is copied into the repository.
 `cases.tsv` is the review manifest. Its order and identifiers are checked against the executable
 table so every documented case remains active. The corpus covers multilingual scripts, combining
 marks and emoji, UTF-8/16/32 byte order, explicit Windows-1252 and Shift_JIS decoding, mixed line
-endings, unsafe controls and bidi formatting, SVG markup retained as inert source text, exact
-line/scalar limits, malformed declared Unicode, binary signatures, and control-heavy negatives.
+endings, unsafe controls and bidi formatting, an SVG document the vector provider refuses falling
+back to inert source text, exact line/scalar limits, malformed declared Unicode, binary signatures,
+and control-heavy negatives.

@@ -1357,6 +1357,9 @@ impl MessageWindow {
         let shown = match result {
             PreviewResult::Text(text) => preview.show_text_at(anchor, self.preview_size, &text),
             PreviewResult::Image(image) => preview.show_image_at(anchor, self.preview_size, image),
+            PreviewResult::Vector(vector) => {
+                preview.show_vector_at(anchor, self.preview_size, vector)
+            }
             PreviewResult::Status(_) => unreachable!("statuses returned before window creation"),
         };
         match shown {
@@ -1862,6 +1865,7 @@ fn preview_result_kind(result: &PreviewResult) -> &'static str {
         PreviewResult::Status(_) => "status",
         PreviewResult::Text(_) => "text",
         PreviewResult::Image(_) => "image",
+        PreviewResult::Vector(_) => "vector",
     }
 }
 

@@ -764,7 +764,7 @@ mod tests {
                 extension.to_ascii_uppercase()
             ))));
         }
-        // `.svg` is eligible for the text provider only; the raster decoder must never claim it.
+        // `.svg` belongs to the vector provider; the raster decoder must never claim it.
         for path in [
             "sample",
             "sample.apng",

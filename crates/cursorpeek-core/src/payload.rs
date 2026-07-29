@@ -1,11 +1,14 @@
 use std::{error::Error, fmt};
 
 pub use crate::layout::{
-    BGRA_BYTES_PER_PIXEL, IMAGE_FIXED_LEN, MAX_PREVIEW_IMAGE_HEIGHT, MAX_PREVIEW_IMAGE_WIDTH,
-    MAX_PREVIEW_PAYLOAD_LEN, MAX_SOURCE_IMAGE_AXIS, MAX_SOURCE_IMAGE_PIXELS,
-    fitted_preview_dimensions,
+    BGRA_BYTES_PER_PIXEL, IMAGE_FIXED_LEN, MAX_ANIMATED_VECTOR_HEIGHT, MAX_ANIMATED_VECTOR_WIDTH,
+    MAX_PREVIEW_IMAGE_HEIGHT, MAX_PREVIEW_IMAGE_WIDTH, MAX_PREVIEW_PAYLOAD_LEN,
+    MAX_RESULT_PAYLOAD_LEN, MAX_SOURCE_IMAGE_AXIS, MAX_SOURCE_IMAGE_PIXELS,
+    MAX_VECTOR_FRAME_DELAY_MS, MAX_VECTOR_FRAMES, MAX_VECTOR_PAYLOAD_LEN,
+    MIN_VECTOR_FRAME_DELAY_MS, VECTOR_FIXED_LEN, fitted_preview_dimensions,
+    fitted_vector_dimensions,
 };
-use crate::layout::{LayoutError, checked_bgra_layout};
+use crate::layout::{LayoutError, checked_bgra_layout, checked_vector_layout};
 
 pub const MIN_PREVIEW_RESULT_LEN: usize = 8;
 pub const MAX_TEXT_UTF8_LEN: usize = 128 * 1024;
@@ -17,6 +20,7 @@ pub const MAX_DISPLAY_NAME_UTF8_LEN: usize = 1_024;
 const RESULT_STATUS: u32 = 0;
 const RESULT_TEXT: u32 = 1;
 const RESULT_IMAGE: u32 = 2;
+const RESULT_VECTOR: u32 = 3;
 const STATUS_PAYLOAD_LEN: usize = 8;
 const TEXT_FIXED_LEN: usize = 36;
 const FLAG_LINKED_CONTENT: u32 = 1 << 0;
@@ -25,6 +29,8 @@ const FLAG_TEXT_TRUNCATED: u32 = 1 << 2;
 const TEXT_FLAGS: u32 = FLAG_LINKED_CONTENT | FLAG_TEXT_ENCODING_GUESSED | FLAG_TEXT_TRUNCATED;
 const FLAG_IMAGE_FIRST_FRAME_ONLY: u32 = 1 << 1;
 const IMAGE_FLAGS: u32 = FLAG_LINKED_CONTENT | FLAG_IMAGE_FIRST_FRAME_ONLY;
+const FLAG_VECTOR_ANIMATED: u32 = 1 << 1;
+const VECTOR_FLAGS: u32 = FLAG_LINKED_CONTENT | FLAG_VECTOR_ANIMATED;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResolverStatus {
@@ -103,18 +109,42 @@ pub struct ImagePreview {
     pub premultiplied_bgra: Vec<u8>,
 }
 
+/// A rasterized vector preview. A static document carries one frame; an animated one carries
+/// several equal-length frames that the UI loops.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VectorPreview {
+    pub file_size: u64,
+    pub last_write_time: i64,
+    pub linked_content: bool,
+    pub animated: bool,
+    pub display_name: String,
+    pub source_width: u32,
+    pub source_height: u32,
+    pub width: u32,
+    pub height: u32,
+    pub frame_delay_ms: u32,
+    pub frames: Vec<Vec<u8>>,
+}
+
+impl VectorPreview {
+    pub fn frame(&self, index: usize) -> Option<&[u8]> {
+        self.frames.get(index).map(Vec::as_slice)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PreviewResult {
     Status(ResolverStatus),
     Text(TextPreview),
     Image(ImagePreview),
+    Vector(VectorPreview),
 }
 
 impl PreviewResult {
     pub const fn status(&self) -> Option<ResolverStatus> {
         match self {
             Self::Status(status) => Some(*status),
-            Self::Text(_) | Self::Image(_) => None,
+            Self::Text(_) | Self::Image(_) | Self::Vector(_) => None,
         }
     }
 }
@@ -201,12 +231,53 @@ pub fn encode_result(result: &PreviewResult) -> Result<Vec<u8>, PayloadError> {
             output.extend_from_slice(preview.display_name.as_bytes());
             output.extend_from_slice(&preview.premultiplied_bgra);
         }
+        PreviewResult::Vector(preview) => {
+            let frame_bytes = validate_vector(preview)?;
+            let payload_len = VECTOR_FIXED_LEN
+                .checked_add(preview.display_name.len())
+                .and_then(|length| length.checked_add(frame_bytes))
+                .ok_or(PayloadError::LengthOverflow)?;
+            ensure_vector_cap(payload_len)?;
+            output.reserve(payload_len);
+            push_u32(&mut output, RESULT_VECTOR);
+            push_u32(
+                &mut output,
+                flags(&[
+                    (preview.linked_content, FLAG_LINKED_CONTENT),
+                    (preview.animated, FLAG_VECTOR_ANIMATED),
+                ]),
+            );
+            push_u64(&mut output, preview.file_size);
+            push_i64(&mut output, preview.last_write_time);
+            push_u32(&mut output, preview.source_width);
+            push_u32(&mut output, preview.source_height);
+            push_u32(&mut output, preview.width);
+            push_u32(&mut output, preview.height);
+            push_u32(&mut output, preview.frame_delay_ms);
+            push_u32(
+                &mut output,
+                u32::try_from(preview.frames.len()).expect("the frame cap fits the wire length"),
+            );
+            push_u32(
+                &mut output,
+                u32::try_from(preview.display_name.len())
+                    .expect("the display-name cap fits the wire length"),
+            );
+            push_u32(
+                &mut output,
+                u32::try_from(frame_bytes).expect("the vector payload cap fits the wire length"),
+            );
+            output.extend_from_slice(preview.display_name.as_bytes());
+            for frame in &preview.frames {
+                output.extend_from_slice(frame);
+            }
+        }
     }
     Ok(output)
 }
 
 pub fn decode_result(bytes: &[u8]) -> Result<PreviewResult, PayloadError> {
-    if !(MIN_PREVIEW_RESULT_LEN..=MAX_PREVIEW_PAYLOAD_LEN).contains(&bytes.len()) {
+    if !(MIN_PREVIEW_RESULT_LEN..=MAX_RESULT_PAYLOAD_LEN).contains(&bytes.len()) {
         return Err(PayloadError::PayloadLengthOutOfRange {
             actual: bytes.len(),
         });
@@ -216,6 +287,7 @@ pub fn decode_result(bytes: &[u8]) -> Result<PreviewResult, PayloadError> {
         RESULT_STATUS => decode_status(bytes),
         RESULT_TEXT => decode_text(bytes),
         RESULT_IMAGE => decode_image(bytes),
+        RESULT_VECTOR => decode_vector(bytes),
         kind => Err(PayloadError::UnknownResultKind(kind)),
     }
 }
@@ -328,6 +400,167 @@ fn decode_image(bytes: &[u8]) -> Result<PreviewResult, PayloadError> {
     };
     validate_image(&preview)?;
     Ok(PreviewResult::Image(preview))
+}
+
+fn decode_vector(bytes: &[u8]) -> Result<PreviewResult, PayloadError> {
+    if bytes.len() < VECTOR_FIXED_LEN {
+        return Err(PayloadError::PayloadLengthMismatch {
+            kind: "vector",
+            expected: VECTOR_FIXED_LEN,
+            actual: bytes.len(),
+        });
+    }
+
+    let raw_flags = read_u32(bytes, 4);
+    reject_unknown_flags("vector", raw_flags, VECTOR_FLAGS)?;
+    let frame_count = read_u32(bytes, 44);
+    let display_name_len = read_u32(bytes, 48) as usize;
+    let frame_bytes = read_u32(bytes, 52) as usize;
+    let expected = VECTOR_FIXED_LEN
+        .checked_add(display_name_len)
+        .and_then(|length| length.checked_add(frame_bytes))
+        .ok_or(PayloadError::LengthOverflow)?;
+    require_exact_length("vector", bytes.len(), expected)?;
+    if display_name_len > MAX_DISPLAY_NAME_UTF8_LEN {
+        return Err(PayloadError::DisplayNameTooLong {
+            actual: display_name_len,
+        });
+    }
+    if frame_count == 0 || frame_count > MAX_VECTOR_FRAMES {
+        return Err(PayloadError::InvalidFrameCount {
+            actual: frame_count,
+        });
+    }
+
+    let width = read_u32(bytes, 32);
+    let height = read_u32(bytes, 36);
+    let (_, single_frame_bytes, total) = checked_vector_layout(width, height, frame_count)
+        .map_err(vector_layout_error)?;
+    if frame_bytes != total {
+        return Err(PayloadError::InvalidPixelLength {
+            expected: total,
+            actual: frame_bytes,
+        });
+    }
+
+    let display_name_end = VECTOR_FIXED_LEN + display_name_len;
+    let display_name = std::str::from_utf8(&bytes[VECTOR_FIXED_LEN..display_name_end])
+        .map_err(|_| PayloadError::InvalidDisplayName)?;
+    let frames: Vec<Vec<u8>> = bytes[display_name_end..]
+        .chunks_exact(single_frame_bytes)
+        .map(|frame| frame.to_vec())
+        .collect();
+    let preview = VectorPreview {
+        file_size: read_u64(bytes, 8),
+        last_write_time: read_i64(bytes, 16),
+        linked_content: raw_flags & FLAG_LINKED_CONTENT != 0,
+        animated: raw_flags & FLAG_VECTOR_ANIMATED != 0,
+        display_name: display_name.to_owned(),
+        source_width: read_u32(bytes, 24),
+        source_height: read_u32(bytes, 28),
+        width,
+        height,
+        frame_delay_ms: read_u32(bytes, 40),
+        frames,
+    };
+    validate_vector(&preview)?;
+    Ok(PreviewResult::Vector(preview))
+}
+
+/// Validates a vector preview and returns its total frame byte count.
+fn validate_vector(preview: &VectorPreview) -> Result<usize, PayloadError> {
+    validate_display_name(&preview.display_name)?;
+    if preview.source_width == 0
+        || preview.source_height == 0
+        || preview.source_width > MAX_SOURCE_IMAGE_AXIS
+        || preview.source_height > MAX_SOURCE_IMAGE_AXIS
+    {
+        return Err(PayloadError::InvalidSourceDimensions {
+            width: preview.source_width,
+            height: preview.source_height,
+        });
+    }
+    let source_pixels = u64::from(preview.source_width)
+        .checked_mul(u64::from(preview.source_height))
+        .ok_or(PayloadError::LengthOverflow)?;
+    if source_pixels > MAX_SOURCE_IMAGE_PIXELS {
+        return Err(PayloadError::TooManySourceImagePixels {
+            actual: source_pixels,
+        });
+    }
+
+    let frame_count = u32::try_from(preview.frames.len())
+        .map_err(|_| PayloadError::InvalidFrameCount { actual: u32::MAX })?;
+    if frame_count == 0 || frame_count > MAX_VECTOR_FRAMES {
+        return Err(PayloadError::InvalidFrameCount {
+            actual: frame_count,
+        });
+    }
+    if preview.animated != (frame_count > 1) {
+        return Err(PayloadError::InconsistentAnimation {
+            animated: preview.animated,
+            frames: frame_count,
+        });
+    }
+    let delay_allowed = if frame_count > 1 {
+        (MIN_VECTOR_FRAME_DELAY_MS..=MAX_VECTOR_FRAME_DELAY_MS).contains(&preview.frame_delay_ms)
+    } else {
+        preview.frame_delay_ms == 0
+    };
+    if !delay_allowed {
+        return Err(PayloadError::InvalidFrameDelay {
+            actual: preview.frame_delay_ms,
+        });
+    }
+
+    let expected_dimensions =
+        fitted_vector_dimensions(preview.source_width, preview.source_height, preview.animated)
+            .ok_or(PayloadError::LengthOverflow)?;
+    if (preview.width, preview.height) != expected_dimensions {
+        return Err(PayloadError::NonFittingPreviewDimensions {
+            expected_width: expected_dimensions.0,
+            expected_height: expected_dimensions.1,
+            actual_width: preview.width,
+            actual_height: preview.height,
+        });
+    }
+
+    let (_, frame_bytes, total) =
+        checked_vector_layout(preview.width, preview.height, frame_count)
+            .map_err(vector_layout_error)?;
+    for frame in &preview.frames {
+        if frame.len() != frame_bytes {
+            return Err(PayloadError::InvalidPixelLength {
+                expected: frame_bytes,
+                actual: frame.len(),
+            });
+        }
+        if let Some((index, _)) = frame
+            .chunks_exact(BGRA_BYTES_PER_PIXEL)
+            .enumerate()
+            .find(|(_, pixel)| pixel[0] > pixel[3] || pixel[1] > pixel[3] || pixel[2] > pixel[3])
+        {
+            return Err(PayloadError::NonPremultipliedPixel { index });
+        }
+    }
+    ensure_vector_cap(
+        VECTOR_FIXED_LEN
+            .checked_add(preview.display_name.len())
+            .and_then(|length| length.checked_add(total))
+            .ok_or(PayloadError::LengthOverflow)?,
+    )?;
+    Ok(total)
+}
+
+fn vector_layout_error(error: LayoutError) -> PayloadError {
+    match error {
+        LayoutError::InvalidDimensions { width, height } => {
+            PayloadError::InvalidPreviewDimensions { width, height }
+        }
+        LayoutError::InvalidFrameCount { actual } => PayloadError::InvalidFrameCount { actual },
+        LayoutError::ArithmeticOverflow => PayloadError::LengthOverflow,
+        LayoutError::PayloadTooLarge { actual } => PayloadError::PayloadTooLarge { actual },
+    }
 }
 
 fn validate_text(preview: &TextPreview) -> Result<(), PayloadError> {
@@ -486,6 +719,14 @@ fn ensure_payload_cap(length: usize) -> Result<(), PayloadError> {
     }
 }
 
+fn ensure_vector_cap(length: usize) -> Result<(), PayloadError> {
+    if length <= MAX_VECTOR_PAYLOAD_LEN {
+        Ok(())
+    } else {
+        Err(PayloadError::PayloadTooLarge { actual: length })
+    }
+}
+
 fn is_encoding_label(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_ENCODING_LABEL_LEN
@@ -622,6 +863,16 @@ pub enum PayloadError {
     NonPremultipliedPixel {
         index: usize,
     },
+    InvalidFrameCount {
+        actual: u32,
+    },
+    InvalidFrameDelay {
+        actual: u32,
+    },
+    InconsistentAnimation {
+        animated: bool,
+        frames: u32,
+    },
     PayloadTooLarge {
         actual: usize,
     },
@@ -633,7 +884,7 @@ impl fmt::Display for PayloadError {
             Self::PayloadLengthOutOfRange { actual } => write!(
                 formatter,
                 "preview-result payload length {actual} is outside \
-                 {MIN_PREVIEW_RESULT_LEN}-{MAX_PREVIEW_PAYLOAD_LEN}"
+                 {MIN_PREVIEW_RESULT_LEN}-{MAX_RESULT_PAYLOAD_LEN}"
             ),
             Self::UnknownResultKind(kind) => {
                 write!(formatter, "unknown preview result kind {kind}")
@@ -721,9 +972,22 @@ impl fmt::Display for PayloadError {
                 formatter,
                 "BGRA pixel {index} has a color channel greater than alpha"
             ),
+            Self::InvalidFrameCount { actual } => write!(
+                formatter,
+                "vector preview has {actual} frames; the range is 1-{MAX_VECTOR_FRAMES}"
+            ),
+            Self::InvalidFrameDelay { actual } => write!(
+                formatter,
+                "vector frame delay {actual}ms is outside \
+                 {MIN_VECTOR_FRAME_DELAY_MS}-{MAX_VECTOR_FRAME_DELAY_MS}"
+            ),
+            Self::InconsistentAnimation { animated, frames } => write!(
+                formatter,
+                "vector preview is marked animated={animated} with {frames} frames"
+            ),
             Self::PayloadTooLarge { actual } => write!(
                 formatter,
-                "preview payload length {actual} exceeds {MAX_PREVIEW_PAYLOAD_LEN} bytes"
+                "preview payload length {actual} exceeds {MAX_RESULT_PAYLOAD_LEN} bytes"
             ),
         }
     }
@@ -734,11 +998,12 @@ impl Error for PayloadError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        FLAG_IMAGE_FIRST_FRAME_ONLY, FLAG_TEXT_TRUNCATED, IMAGE_FIXED_LEN, ImageFormat,
-        ImagePreview, MAX_DISPLAY_NAME_UTF8_LEN, MAX_ENCODING_LABEL_LEN, MAX_PREVIEW_IMAGE_WIDTH,
-        MAX_SOURCE_IMAGE_AXIS, MAX_SOURCE_IMAGE_PIXELS, MAX_TEXT_LINES, MAX_TEXT_SCALARS,
-        MAX_TEXT_UTF8_LEN, PayloadError, PreviewResult, ResolverStatus, TEXT_FIXED_LEN,
-        TextPreview, decode_result, encode_result,
+        FLAG_IMAGE_FIRST_FRAME_ONLY, FLAG_TEXT_TRUNCATED, FLAG_VECTOR_ANIMATED, IMAGE_FIXED_LEN,
+        ImageFormat, ImagePreview, MAX_DISPLAY_NAME_UTF8_LEN, MAX_ENCODING_LABEL_LEN,
+        MAX_PREVIEW_IMAGE_WIDTH, MAX_SOURCE_IMAGE_AXIS, MAX_SOURCE_IMAGE_PIXELS, MAX_TEXT_LINES,
+        MAX_TEXT_SCALARS, MAX_TEXT_UTF8_LEN, MAX_VECTOR_FRAMES, MIN_VECTOR_FRAME_DELAY_MS,
+        PayloadError, PreviewResult, ResolverStatus, TEXT_FIXED_LEN, TextPreview, VECTOR_FIXED_LEN,
+        VectorPreview, decode_result, encode_result, fitted_vector_dimensions,
     };
 
     fn text_preview() -> TextPreview {
@@ -767,6 +1032,30 @@ mod tests {
             width: 3,
             height: 2,
             premultiplied_bgra: vec![0x7f; 24],
+        }
+    }
+
+    fn vector_preview(frames: usize) -> VectorPreview {
+        let animated = frames > 1;
+        let (width, height) =
+            fitted_vector_dimensions(4, 2, animated).expect("the fixture size fits");
+        let frame_bytes = (width * height * 4) as usize;
+        VectorPreview {
+            file_size: 1_234,
+            last_write_time: 133_000_000_000_000_000,
+            linked_content: false,
+            animated,
+            display_name: "logo.svg".to_owned(),
+            source_width: 4,
+            source_height: 2,
+            width,
+            height,
+            frame_delay_ms: if animated {
+                MIN_VECTOR_FRAME_DELAY_MS
+            } else {
+                0
+            },
+            frames: (0..frames).map(|_| vec![0x40; frame_bytes]).collect(),
         }
     }
 
@@ -801,6 +1090,118 @@ mod tests {
             let result = PreviewResult::Image(image);
             assert_eq!(decode_result(&encode_result(&result).unwrap()), Ok(result));
         }
+
+        for frames in [1, 2, MAX_VECTOR_FRAMES as usize] {
+            let result = PreviewResult::Vector(vector_preview(frames));
+            assert_eq!(decode_result(&encode_result(&result).unwrap()), Ok(result));
+        }
+    }
+
+    #[test]
+    fn vector_frames_dimensions_and_delays_fail_closed() {
+        let mut preview = vector_preview(1);
+        preview.frames.clear();
+        assert_eq!(
+            encode_result(&PreviewResult::Vector(preview)),
+            Err(PayloadError::InvalidFrameCount { actual: 0 })
+        );
+
+        let mut preview = vector_preview(2);
+        let frame = preview.frames[0].clone();
+        for _ in 0..MAX_VECTOR_FRAMES {
+            preview.frames.push(frame.clone());
+        }
+        assert!(matches!(
+            encode_result(&PreviewResult::Vector(preview)),
+            Err(PayloadError::InvalidFrameCount { .. })
+        ));
+
+        // A single frame must not claim animation, and several frames must not claim a still.
+        let mut preview = vector_preview(1);
+        preview.animated = true;
+        assert!(matches!(
+            encode_result(&PreviewResult::Vector(preview)),
+            Err(PayloadError::InconsistentAnimation { .. })
+        ));
+
+        let mut preview = vector_preview(2);
+        preview.frame_delay_ms = MIN_VECTOR_FRAME_DELAY_MS - 1;
+        assert_eq!(
+            encode_result(&PreviewResult::Vector(preview)),
+            Err(PayloadError::InvalidFrameDelay {
+                actual: MIN_VECTOR_FRAME_DELAY_MS - 1
+            })
+        );
+
+        let mut preview = vector_preview(1);
+        preview.frame_delay_ms = 100;
+        assert_eq!(
+            encode_result(&PreviewResult::Vector(preview)),
+            Err(PayloadError::InvalidFrameDelay { actual: 100 })
+        );
+
+        let mut preview = vector_preview(1);
+        preview.width += 1;
+        assert!(matches!(
+            encode_result(&PreviewResult::Vector(preview)),
+            Err(PayloadError::NonFittingPreviewDimensions { .. })
+        ));
+
+        let mut preview = vector_preview(1);
+        preview.source_width = 0;
+        assert!(matches!(
+            encode_result(&PreviewResult::Vector(preview)),
+            Err(PayloadError::InvalidSourceDimensions { .. })
+        ));
+
+        let mut preview = vector_preview(2);
+        preview.frames[1].pop();
+        assert!(matches!(
+            encode_result(&PreviewResult::Vector(preview)),
+            Err(PayloadError::InvalidPixelLength { .. })
+        ));
+
+        let mut preview = vector_preview(1);
+        preview.frames[0][..4].copy_from_slice(&[200, 10, 10, 100]);
+        assert_eq!(
+            encode_result(&PreviewResult::Vector(preview)),
+            Err(PayloadError::NonPremultipliedPixel { index: 0 })
+        );
+    }
+
+    #[test]
+    fn malformed_vector_wire_fields_are_rejected_before_use() {
+        let mut animated = encode_result(&PreviewResult::Vector(vector_preview(2))).unwrap();
+        animated[4..8].copy_from_slice(&(FLAG_VECTOR_ANIMATED | 0x2000_0000).to_le_bytes());
+        assert!(matches!(
+            decode_result(&animated),
+            Err(PayloadError::UnknownFlags { kind: "vector", .. })
+        ));
+
+        let mut short = vec![0; VECTOR_FIXED_LEN - 1];
+        short[..4].copy_from_slice(&3_u32.to_le_bytes());
+        assert_eq!(
+            decode_result(&short),
+            Err(PayloadError::PayloadLengthMismatch {
+                kind: "vector",
+                expected: VECTOR_FIXED_LEN,
+                actual: VECTOR_FIXED_LEN - 1
+            })
+        );
+
+        let mut zero_frames = encode_result(&PreviewResult::Vector(vector_preview(1))).unwrap();
+        zero_frames[44..48].copy_from_slice(&0_u32.to_le_bytes());
+        assert_eq!(
+            decode_result(&zero_frames),
+            Err(PayloadError::InvalidFrameCount { actual: 0 })
+        );
+
+        let mut bad_name = encode_result(&PreviewResult::Vector(vector_preview(1))).unwrap();
+        bad_name[VECTOR_FIXED_LEN] = 0xff;
+        assert_eq!(
+            decode_result(&bad_name),
+            Err(PayloadError::InvalidDisplayName)
+        );
     }
 
     #[test]

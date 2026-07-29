@@ -10,6 +10,10 @@ pub const IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "jpe", "jfif", "png", "gif", "webp", "bmp", "dib", "ico", "tif", "tiff",
 ];
 
+// Rendered by the contained vector provider. These stay in `TEXT_EXTENSIONS` as well so a document
+// the renderer refuses still falls back to an inert source-text preview.
+pub const VECTOR_EXTENSIONS: &[&str] = &["svg"];
+
 // Every entry is previewed as inert plain text. Nothing here is parsed, rendered, executed, or
 // resolved: markup, project, and patch formats reach the preview as source bytes like any log file.
 // The list is grouped to match the user-guide and README tables; keep all three in the same order.
@@ -24,8 +28,8 @@ pub const TEXT_EXTENSIONS: &[&str] = &[
     "rst",
     "adoc",
     "tex",
-    // SVG is XML markup. The text provider previews it as inert source rather than rasterizing it,
-    // so no vector renderer, font lookup, or external reference handling enters the worker.
+    // SVG is XML markup. The vector provider claims it first and renders it in the contained
+    // worker; this entry is the inert source-text fallback when rendering is refused.
     "svg",
     // Data and configuration
     "csv",
@@ -223,10 +227,18 @@ pub fn is_text_eligible_path(path: &Path) -> bool {
 }
 
 pub fn is_image_eligible_path(path: &Path) -> bool {
+    has_extension(path, IMAGE_EXTENSIONS)
+}
+
+pub fn is_vector_eligible_path(path: &Path) -> bool {
+    has_extension(path, VECTOR_EXTENSIONS)
+}
+
+fn has_extension(path: &Path, extensions: &[&str]) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| {
-            IMAGE_EXTENSIONS
+            extensions
                 .iter()
                 .any(|candidate| extension.eq_ignore_ascii_case(candidate))
         })
@@ -371,8 +383,9 @@ mod tests {
     use image::ImageFormat as DecoderFormat;
 
     use super::{
-        IMAGE_EXTENSIONS, TEXT_EXTENSIONS, TEXT_NAMES, TextByteKind, classify_text_prefix,
-        is_image_eligible_path, is_text_eligible_path, sniff_image_format,
+        IMAGE_EXTENSIONS, TEXT_EXTENSIONS, TEXT_NAMES, TextByteKind, VECTOR_EXTENSIONS,
+        classify_text_prefix, is_image_eligible_path, is_text_eligible_path,
+        is_vector_eligible_path, sniff_image_format,
     };
     use crate::payload::ImageFormat;
 
@@ -458,14 +471,24 @@ mod tests {
     }
 
     #[test]
-    fn svg_markup_is_text_eligible_and_never_image_eligible() {
+    fn svg_is_vector_eligible_with_a_text_fallback_and_never_raster_eligible() {
         for path in ["logo.svg", "logo.SVG"] {
+            assert!(is_vector_eligible_path(Path::new(path)));
             assert!(is_text_eligible_path(Path::new(path)));
             assert!(!is_image_eligible_path(Path::new(path)));
         }
-        // Compressed SVG is gzip, not markup, and stays outside both providers.
+        for extension in VECTOR_EXTENSIONS {
+            assert!(is_vector_eligible_path(Path::new(&format!(
+                "sample.{}",
+                extension.to_ascii_uppercase()
+            ))));
+            assert!(TEXT_EXTENSIONS.contains(extension));
+        }
+        // Compressed SVG is gzip, not markup, and stays outside every provider.
+        assert!(!is_vector_eligible_path(Path::new("logo.svgz")));
         assert!(!is_text_eligible_path(Path::new("logo.svgz")));
         assert!(!is_image_eligible_path(Path::new("logo.svgz")));
+        assert!(!is_vector_eligible_path(Path::new("logo.png")));
     }
 
     #[test]

@@ -7,7 +7,7 @@ use super::{
     file::{PreviewFile, PreviewFileIdentity},
     image,
     payload::PreviewResult,
-    text,
+    text, vector,
 };
 
 // The cache exists only for one contained worker session. The count cap follows QTTabBar's proven
@@ -18,16 +18,22 @@ const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 // relevant value if a future long-lived worker can switch implementation rules in-process.
 const TEXT_PROVIDER_VERSION: u32 = 2;
 const IMAGE_PROVIDER_VERSION: u32 = 2;
+const VECTOR_PROVIDER_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PreviewProvider {
     Text,
     Image,
+    Vector,
 }
 
 impl PreviewProvider {
     pub(super) fn for_path(path: &Path) -> Option<Self> {
-        if text::is_eligible_path(path) {
+        // Vector is checked first: `.svg` is also text-eligible so a refused document can fall back
+        // to an inert source preview.
+        if vector::is_eligible_path(path) {
+            Some(Self::Vector)
+        } else if text::is_eligible_path(path) {
             Some(Self::Text)
         } else if image::is_eligible_path(path) {
             Some(Self::Image)
@@ -45,6 +51,12 @@ impl PreviewProvider {
             Self::Image => PreviewProviderKey::Image {
                 version: IMAGE_PROVIDER_VERSION,
             },
+            // The vector provider falls back to text, so its key carries both policy versions.
+            Self::Vector => PreviewProviderKey::Vector {
+                version: VECTOR_PROVIDER_VERSION,
+                text_version: TEXT_PROVIDER_VERSION,
+                legacy_encoding: legacy_encoding.clone(),
+            },
         }
     }
 }
@@ -58,6 +70,11 @@ enum PreviewProviderKey {
     Image {
         version: u32,
     },
+    Vector {
+        version: u32,
+        text_version: u32,
+        legacy_encoding: LegacyEncoding,
+    },
 }
 
 impl PreviewProviderKey {
@@ -66,8 +83,12 @@ impl PreviewProviderKey {
             Self::Text {
                 legacy_encoding: LegacyEncoding::Label(label),
                 ..
+            }
+            | Self::Vector {
+                legacy_encoding: LegacyEncoding::Label(label),
+                ..
             } => label.capacity(),
-            Self::Text { .. } | Self::Image { .. } => 0,
+            Self::Text { .. } | Self::Image { .. } | Self::Vector { .. } => 0,
         }
     }
 }
@@ -122,6 +143,10 @@ fn result_heap_bytes(result: &PreviewResult) -> Option<usize> {
             .display_name
             .capacity()
             .checked_add(preview.premultiplied_bgra.capacity()),
+        PreviewResult::Vector(preview) => preview.frames.iter().try_fold(
+            preview.display_name.capacity(),
+            |total, frame| total.checked_add(frame.capacity()),
+        ),
     }
 }
 
@@ -284,13 +309,21 @@ mod tests {
     }
 
     #[test]
-    fn svg_selects_the_text_provider_instead_of_the_raster_image_decoder() {
+    fn svg_selects_the_vector_provider_ahead_of_text_and_raster() {
         for path in [r"C:\logo.svg", r"C:\logo.SVG"] {
             assert_eq!(
                 PreviewProvider::for_path(Path::new(path)),
-                Some(PreviewProvider::Text)
+                Some(PreviewProvider::Vector)
             );
         }
+        assert_eq!(
+            PreviewProvider::for_path(Path::new(r"C:\notes.txt")),
+            Some(PreviewProvider::Text)
+        );
+        assert_eq!(
+            PreviewProvider::for_path(Path::new(r"C:\photo.png")),
+            Some(PreviewProvider::Image)
+        );
         assert_eq!(PreviewProvider::for_path(Path::new(r"C:\logo.svgz")), None);
     }
 
@@ -318,6 +351,15 @@ mod tests {
         let mut image = automatic.clone();
         image.provider = PreviewProviderKey::Image { version: 1 };
         assert_ne!(automatic, image);
+
+        let mut vector = automatic.clone();
+        vector.provider = PreviewProviderKey::Vector {
+            version: 1,
+            text_version: TEXT_PROVIDER_VERSION,
+            legacy_encoding: LegacyEncoding::Auto,
+        };
+        assert_ne!(automatic, vector);
+        assert_ne!(image, vector);
     }
 
     #[test]

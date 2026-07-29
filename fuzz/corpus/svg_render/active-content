@@ -1,0 +1,1 @@
+<svg onload='x()'><script>fetch('https://example.test')</script><image href='https://example.test/a.png'/></svg>

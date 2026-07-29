@@ -204,6 +204,46 @@ Write-Seed layout extremes (
 )
 Write-Seed layout truncated ([byte[]] @(0x80, 0x07, 0))
 
+function Write-SvgSeed {
+    param(
+        [Parameter(Mandatory)]
+        [string] $Name,
+
+        [Parameter(Mandatory)]
+        [string] $Document
+    )
+
+    Write-Seed svg_render $Name ([System.Text.Encoding]::UTF8.GetBytes($Document))
+}
+
+Write-SvgSeed static-shapes (
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'>" +
+    "<rect width='16' height='16' fill='#3178c6'/>" +
+    "<path d='M2 8 L8 2 L14 8 Z' fill='none' stroke='white' stroke-width='2'/></svg>"
+)
+Write-SvgSeed smil-animation (
+    "<svg viewBox='0 0 40 10'><rect width='10' height='10'>" +
+    "<animate attributeName='x' from='0' to='30' dur='1s' repeatCount='indefinite'/></rect>" +
+    "<g><animateTransform attributeName='transform' type='rotate' values='0;360' " +
+    "dur='700ms'/></g></svg>"
+)
+Write-SvgSeed gradient-and-css (
+    "<svg viewBox='0 0 10 10'><defs><linearGradient id='g' gradientTransform='rotate(30)'>" +
+    "<stop offset='0' stop-color='red'/><stop offset='.5' stop-color='rgba(0,255,0,0.5)'/>" +
+    "<stop offset='1' stop-color='#00f'/></linearGradient></defs>" +
+    "<style>.c{fill:url(#g);stroke:currentColor}</style>" +
+    "<circle class='c' cx='5' cy='5' r='4'/></svg>"
+)
+Write-SvgSeed active-content (
+    "<svg onload='x()'><script>fetch('https://example.test')</script>" +
+    "<image href='https://example.test/a.png'/></svg>"
+)
+Write-SvgSeed entity-declaration (
+    "<!DOCTYPE svg [<!ENTITY x SYSTEM 'file:///c:/secret'>]><svg>&x;</svg>"
+)
+Write-SvgSeed malformed "<svg viewBox='0 0 4 4'><path d='M0 0 Q'/><rect width="
+Write-Seed svg_render not-utf8 ([byte[]] @(0xff, 0xfe, 0x3c, 0x00, 0x73, 0x00))
+
 $files = Get-ChildItem -LiteralPath $corpusRoot -File -Recurse | Sort-Object FullName
 foreach ($file in $files) {
     $relative = $file.FullName.Substring($corpusRoot.Length).TrimStart(

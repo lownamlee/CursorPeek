@@ -3,6 +3,7 @@ mod file;
 mod image;
 mod manager;
 mod text;
+mod vector;
 
 mod payload {
     pub(crate) use cursorpeek_core::payload::*;
@@ -40,7 +41,12 @@ pub(crate) use manager::{
 };
 #[cfg(test)]
 pub(crate) use payload::ImageFormat;
-pub(crate) use payload::{ImagePreview, PreviewResult, ResolverStatus, TextPreview};
+pub(crate) use payload::{
+    ImagePreview, PreviewResult, ResolverStatus, TextPreview, VectorPreview,
+};
+use vector::VectorDecodeResult;
+#[cfg(test)]
+pub(crate) use vector::corpus::renderable_previews as vector_corpus_previews;
 
 pub(crate) fn run_session<R, W>(
     reader: &mut R,
@@ -190,8 +196,11 @@ fn resolver_result_with_cache(
                 }
             };
             (
-                matches!(result, PreviewResult::Text(_) | PreviewResult::Image(_))
-                    .then_some(target_bounds),
+                matches!(
+                    result,
+                    PreviewResult::Text(_) | PreviewResult::Image(_) | PreviewResult::Vector(_)
+                )
+                .then_some(target_bounds),
                 result,
             )
         }
@@ -242,6 +251,10 @@ fn preview_file_result(
                 preview.display_name = file.display_name();
                 preview.last_write_time = file.last_write_time();
             }
+            PreviewResult::Vector(preview) => {
+                preview.display_name = file.display_name();
+                preview.last_write_time = file.last_write_time();
+            }
             PreviewResult::Status(_) => {}
         }
         return match file.is_unchanged() {
@@ -259,9 +272,16 @@ fn preview_file_result(
     );
     let decode_started = diagnostics::counter();
     let result = match provider {
-        PreviewProvider::Text => match text::decode(file, legacy_encoding) {
-            Ok(TextDecodeResult::Preview(preview)) => PreviewResult::Text(preview),
-            Ok(TextDecodeResult::Unsupported) => PreviewResult::Status(ResolverStatus::Unsupported),
+        PreviewProvider::Text => text_result(file, legacy_encoding),
+        PreviewProvider::Vector => match vector::decode(file) {
+            Ok(VectorDecodeResult::Preview(preview)) => PreviewResult::Vector(preview),
+            Ok(VectorDecodeResult::Fallback(reason)) => {
+                diagnostics::record(
+                    "worker.vector.refused",
+                    format_args!("reason={reason} fallback=text"),
+                );
+                text_result(file, legacy_encoding)
+            }
             Err(_) => PreviewResult::Status(ResolverStatus::Unavailable),
         },
         PreviewProvider::Image => match image::decode(file) {
@@ -300,6 +320,14 @@ fn preview_file_result(
     result
 }
 
+fn text_result(file: &PreviewFile, legacy_encoding: &LegacyEncoding) -> PreviewResult {
+    match text::decode(file, legacy_encoding) {
+        Ok(TextDecodeResult::Preview(preview)) => PreviewResult::Text(preview),
+        Ok(TextDecodeResult::Unsupported) => PreviewResult::Status(ResolverStatus::Unsupported),
+        Err(_) => PreviewResult::Status(ResolverStatus::Unavailable),
+    }
+}
+
 fn resolve_outcome_kind(outcome: &ResolveOutcome) -> &'static str {
     match outcome {
         ResolveOutcome::Resolved(_) => "resolved",
@@ -321,6 +349,7 @@ fn preview_result_kind(result: &PreviewResult) -> &'static str {
         },
         PreviewResult::Text(_) => "text",
         PreviewResult::Image(_) => "image",
+        PreviewResult::Vector(_) => "vector",
     }
 }
 
@@ -372,6 +401,25 @@ fn record_preview_result(
                 preview.height,
                 preview.premultiplied_bgra.len(),
                 preview.first_frame_only,
+                preview.linked_content,
+                target_bounds.is_some()
+            ),
+        ),
+        PreviewResult::Vector(preview) => diagnostics::record(
+            event,
+            format_args!(
+                "generation={} kind=vector file_size={} source_width={} source_height={} \
+                 width={} height={} frames={} frame_delay_ms={} animated={} linked={} \
+                 target_bounds={} elapsed_us={elapsed}",
+                generation.get(),
+                preview.file_size,
+                preview.source_width,
+                preview.source_height,
+                preview.width,
+                preview.height,
+                preview.frames.len(),
+                preview.frame_delay_ms,
+                preview.animated,
                 preview.linked_content,
                 target_bounds.is_some()
             ),
@@ -663,6 +711,52 @@ mod tests {
             resolver_result(ResolveOutcome::Unavailable, &LegacyEncoding::Auto),
             PreviewResult::Status(ResolverStatus::Unavailable)
         );
+    }
+
+    #[test]
+    fn svg_targets_render_as_vectors_and_fall_back_to_text_when_refused() {
+        let rendered_path = env::temp_dir().join(format!(
+            "cursorpeek-resolved-target-{}-{}.svg",
+            std::process::id(),
+            NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(
+            &rendered_path,
+            b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'>\
+              <rect width='16' height='16' fill='#2f81f7'/></svg>",
+        )
+        .expect("the vector fixture should be written");
+        let PreviewResult::Vector(preview) = resolver_result(
+            ResolveOutcome::Resolved(resolved_target(rendered_path.clone())),
+            &LegacyEncoding::Auto,
+        ) else {
+            panic!("a well-formed SVG should produce a vector preview");
+        };
+        assert_eq!((preview.source_width, preview.source_height), (16, 16));
+        assert_eq!(preview.frames.len(), 1);
+        assert!(!preview.animated);
+        assert_eq!(
+            preview.display_name,
+            rendered_path.file_name().unwrap().to_string_lossy()
+        );
+        fs::remove_file(&rendered_path).expect("the vector fixture should be removed");
+
+        let refused_path = env::temp_dir().join(format!(
+            "cursorpeek-resolved-target-{}-{}.svg",
+            std::process::id(),
+            NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let markup = "<svg><script>alert(1)</script></svg>";
+        fs::write(&refused_path, markup.as_bytes())
+            .expect("the refused vector fixture should be written");
+        let PreviewResult::Text(preview) = resolver_result(
+            ResolveOutcome::Resolved(resolved_target(refused_path.clone())),
+            &LegacyEncoding::Auto,
+        ) else {
+            panic!("a refused SVG should fall back to an inert text preview");
+        };
+        assert_eq!(preview.text, markup);
+        fs::remove_file(&refused_path).expect("the refused vector fixture should be removed");
     }
 
     #[test]

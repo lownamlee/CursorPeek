@@ -229,10 +229,10 @@ fn corpus_cases() -> Vec<CorpusCase> {
             false,
             false,
         ),
-        // SVG markup is retained verbatim: no element, attribute, or external reference in it is
-        // parsed, resolved, or executed on the way to the preview.
+        // The vector provider refuses this document, so the text fallback shows it verbatim: no
+        // element, attribute, or external reference in it is parsed, resolved, or executed.
         preview(
-            "svg-inert-markup",
+            "svg-refused-fallback-markup",
             svg_markup.as_bytes().to_vec(),
             LegacyEncoding::Auto,
             "UTF-8",

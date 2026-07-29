@@ -8,7 +8,7 @@ utf32be-rtl	Unicode	preview:UTF-32-BE
 windows1252-explicit	legacy	preview:windows-1252
 shiftjis-explicit	legacy	preview:Shift_JIS
 controls-bidi-sanitized	hostile	preview:sanitized
-svg-inert-markup	markup	preview:UTF-8
+svg-refused-fallback-markup	markup	preview:UTF-8
 line-limit	boundary	preview:truncated
 scalar-limit	boundary	preview:truncated
 malformed-utf8-bom	malformed	unsupported

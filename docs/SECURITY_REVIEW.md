@@ -64,7 +64,7 @@ the fuzz harness.
 - IPC parsing rejects invalid magic/version/kind/flags/order/length, unordered pointer spans,
   nonce mismatch, stale generation, trailing bytes, truncation, and allocation above the protocol
   cap.
-- Protocol v9 binds product requests to the coordinator-verified Explorer root. The worker
+- Protocol v10 binds product requests to the coordinator-verified Explorer root. The worker
   requires the same root under the pointer and correlates it with the matching `IWebBrowser2`
   window and active Shell-view identity.
 - Worker launch uses explicit inherited handles, suspended Job assignment, required creation
@@ -73,8 +73,14 @@ the fuzz harness.
   recall-on-access content, invalid final-path shapes, directories, and changed identities.
 - The worker verifies that the complete pre-preview pointer span fits the resolved Explorer item
   before file access; the coordinator repeats that geometry check before display.
-- Text and image pipelines enforce their format-specific size, arithmetic, decoding, and rendered
-  payload bounds. Retained fuzz seeds and ordinary Windows replay cover malformed boundaries.
+- Text, image, and vector pipelines enforce their format-specific size, arithmetic, decoding, and
+  rendered payload bounds. Retained fuzz seeds and ordinary Windows replay cover malformed
+  boundaries.
+- The SVG renderer refuses script, event-handler, embedding, entity-declaration, and
+  outside-the-document reference constructs before drawing, denies unsafe Rust, takes no clock
+  input, and bounds every parse and raster stage. The coordinator revalidates frame count, delay,
+  canvas fit, frame length, and premultiplied pixels before any frame reaches Direct2D, and the
+  `svg_render` fuzz target asserts determinism and those payload invariants.
 - Preview callbacks preserve Explorer focus, use no-activate/click-eating behavior, and invalidate
   stale or lifecycle-affected content. The Windows qualification gate retains real focus, click,
   DPI, topology, theme, and resume observations.

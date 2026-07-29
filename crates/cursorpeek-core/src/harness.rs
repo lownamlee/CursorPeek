@@ -5,11 +5,13 @@ use std::io::Cursor;
 use crate::{
     layout::{
         BGRA_BYTES_PER_PIXEL, MAX_PREVIEW_IMAGE_HEIGHT, MAX_PREVIEW_IMAGE_WIDTH,
-        checked_bgra_layout, fitted_preview_dimensions,
+        MAX_VECTOR_FRAMES, checked_bgra_layout, checked_vector_layout, fitted_preview_dimensions,
+        fitted_vector_dimensions,
     },
     payload::{decode_result, encode_result},
     protocol::{read_message, write_message},
     sniff::{classify_text_prefix, sniff_image_format},
+    svg::render,
 };
 
 pub fn exercise_protocol(data: &[u8]) {
@@ -75,6 +77,45 @@ pub fn exercise_content_sniff(data: &[u8]) {
     );
 }
 
+pub fn exercise_svg(data: &[u8]) {
+    let Ok(source) = std::str::from_utf8(data) else {
+        return;
+    };
+
+    let first = render(source);
+    assert_eq!(
+        render(source),
+        first,
+        "SVG rendering must be a deterministic function of the document"
+    );
+    let Ok(rendered) = first else {
+        return;
+    };
+
+    let frames = u32::try_from(rendered.frames.len()).expect("the frame cap fits u32");
+    assert!((1..=MAX_VECTOR_FRAMES).contains(&frames));
+    assert_eq!(rendered.animated, frames > 1);
+    assert_eq!(
+        fitted_vector_dimensions(
+            rendered.source_width,
+            rendered.source_height,
+            rendered.animated
+        ),
+        Some((rendered.width, rendered.height))
+    );
+    let (_, frame_bytes, _) = checked_vector_layout(rendered.width, rendered.height, frames)
+        .expect("every rendered document must fit the vector payload layout");
+    for frame in &rendered.frames {
+        assert_eq!(frame.len(), frame_bytes);
+        for pixel in frame.chunks_exact(BGRA_BYTES_PER_PIXEL) {
+            assert!(
+                pixel[0] <= pixel[3] && pixel[1] <= pixel[3] && pixel[2] <= pixel[3],
+                "rendered frames must stay premultiplied"
+            );
+        }
+    }
+}
+
 pub fn exercise_layout(data: &[u8]) {
     let values = [
         little_endian_u32(data, 0),
@@ -119,7 +160,9 @@ fn check_fitted_layout(source_width: u32, source_height: u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{exercise_content_sniff, exercise_layout, exercise_payload, exercise_protocol};
+    use super::{
+        exercise_content_sniff, exercise_layout, exercise_payload, exercise_protocol, exercise_svg,
+    };
     use crate::{
         Generation, LegacyEncoding,
         payload::{PreviewResult, ResolverStatus, encode_result},
@@ -146,6 +189,9 @@ mod tests {
         exercise_payload(&[0xff; 7]);
 
         exercise_content_sniff(b"\x01\xef\xbb\xbfhello");
+        exercise_svg(b"<svg viewBox='0 0 8 8'><rect width='8' height='8'/></svg>");
+        exercise_svg(b"<svg><script/></svg>");
+        exercise_svg(b"\xff\xfe");
         exercise_layout(
             &[
                 0x80, 0x07, 0, 0, 0x38, 0x04, 0, 0, 0xff, 0xff, 0xff, 0xff, 1, 0, 0, 0,

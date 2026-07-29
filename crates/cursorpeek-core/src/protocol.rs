@@ -8,13 +8,13 @@ use crate::{
     ExplorerWindowId, Generation, LegacyEncoding, PhysicalScreenPoint, PhysicalScreenRect,
     PhysicalScreenSpan,
     payload::{
-        MAX_PREVIEW_PAYLOAD_LEN, MIN_PREVIEW_RESULT_LEN, PayloadError, PreviewResult,
-        decode_result, encode_result,
+        MAX_RESULT_PAYLOAD_LEN, MIN_PREVIEW_RESULT_LEN, PayloadError, PreviewResult, decode_result,
+        encode_result,
     },
 };
 
 const MAGIC: [u8; 4] = *b"CPWK";
-const VERSION: u16 = 9;
+const VERSION: u16 = 10;
 const HEADER_LEN: usize = 24;
 const NONCE_LEN: usize = 16;
 const CACHE_ENTRIES_LEN: usize = 2;
@@ -23,7 +23,7 @@ const TARGET_BOUNDS_FLAG_LEN: usize = 1;
 const TARGET_BOUNDS_LEN: usize = 16;
 const MIN_PREVIEW_RESPONSE_LEN: usize = TARGET_BOUNDS_FLAG_LEN + MIN_PREVIEW_RESULT_LEN;
 const MAX_PREVIEW_RESPONSE_LEN: usize =
-    TARGET_BOUNDS_FLAG_LEN + TARGET_BOUNDS_LEN + MAX_PREVIEW_PAYLOAD_LEN;
+    TARGET_BOUNDS_FLAG_LEN + TARGET_BOUNDS_LEN + MAX_RESULT_PAYLOAD_LEN;
 const MAX_PROTOCOL_PAYLOAD_LEN: usize = MAX_PREVIEW_RESPONSE_LEN;
 
 pub const DEFAULT_PREVIEW_CACHE_ENTRIES: u16 = 128;
@@ -625,9 +625,12 @@ fn validate_target_bounds(
     result: &PreviewResult,
 ) -> Result<(), ProtocolError> {
     match (target_bounds, result) {
-        (Some(_), PreviewResult::Text(_) | PreviewResult::Image(_))
+        (
+            Some(_),
+            PreviewResult::Text(_) | PreviewResult::Image(_) | PreviewResult::Vector(_),
+        )
         | (None, PreviewResult::Status(_)) => Ok(()),
-        (None, PreviewResult::Text(_) | PreviewResult::Image(_)) => {
+        (None, PreviewResult::Text(_) | PreviewResult::Image(_) | PreviewResult::Vector(_)) => {
             Err(ProtocolError::MissingTargetBounds)
         }
         (Some(_), PreviewResult::Status(_)) => Err(ProtocolError::UnexpectedTargetBounds),

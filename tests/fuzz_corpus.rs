@@ -1,18 +1,21 @@
 use std::{fs, path::Path};
 
 use cursorpeek_core::{
-    harness::{exercise_content_sniff, exercise_layout, exercise_payload, exercise_protocol},
-    layout::MAX_PREVIEW_PAYLOAD_LEN,
+    harness::{
+        exercise_content_sniff, exercise_layout, exercise_payload, exercise_protocol, exercise_svg,
+    },
+    layout::MAX_RESULT_PAYLOAD_LEN,
 };
 
 const CORPUS_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/fuzz/corpus");
 
 #[test]
 fn retained_fuzz_corpus_replays_on_the_stable_windows_build() {
-    replay("protocol", MAX_PREVIEW_PAYLOAD_LEN + 24, exercise_protocol);
-    replay("payload", MAX_PREVIEW_PAYLOAD_LEN, exercise_payload);
+    replay("protocol", MAX_RESULT_PAYLOAD_LEN + 24, exercise_protocol);
+    replay("payload", MAX_RESULT_PAYLOAD_LEN, exercise_payload);
     replay("content_sniff", 64 * 1024 + 1, exercise_content_sniff);
     replay("layout", 16, exercise_layout);
+    replay("svg_render", 64 * 1024, exercise_svg);
 }
 
 fn replay(target: &str, maximum_bytes: usize, exercise: fn(&[u8])) {

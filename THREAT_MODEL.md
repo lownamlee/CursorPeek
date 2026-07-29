@@ -62,14 +62,37 @@ preview.
 
 ### Malformed content and resource exhaustion
 
-Only an explicit image/text extension or special filename is eligible. Image magic remains
-authoritative. Product caps bound file size, read prefixes, dimensions, pixel count, decoded
-bytes, text bytes, scalar count, lines, protocol frames, cache entries, and cache bytes. Checked
-arithmetic precedes allocation and layout.
+Only an explicit image, vector, or text extension or special filename is eligible. Image magic
+remains authoritative. Product caps bound file size, read prefixes, dimensions, pixel count,
+decoded bytes, text bytes, scalar count, lines, protocol frames, cache entries, and cache bytes.
+Checked arithmetic precedes allocation and layout.
 
 Parsing and decoding occur in the worker. One request runs at a time and only the newest pending
 request is retained. A private Job limits the worker to one process and 384 MiB, kills it when the
 Job closes, and supports forced timeout recovery. The worker retires after idle expiry.
+
+### Untrusted SVG documents
+
+SVG is markup that can reference scripts and remote resources, so the renderer is a refusal-first
+parser rather than a browser engine. It runs only in the worker, never in Explorer or the
+coordinator, and denies unsafe Rust because it lives in the platform-neutral core.
+
+The document is refused outright when it declares entities or an internal DTD subset, references an
+unknown entity, carries a `script`, `foreignObject`, `image`, `iframe`, `audio`, `video`, `handler`,
+or `listener` element, carries any `on*` attribute, or names any `href`, `src`, or `url(...)` target
+that is not a same-document `#fragment`. There is no script engine, no font, network, or filesystem
+lookup, and no redirect or download path.
+
+Rendering is a pure function of the document bytes with no clock input, so a file always produces
+the same frames. Separate bounds cap document bytes, elements, nesting depth, attributes per
+element, stylesheet rules, animations, path segments, `use` expansions, gradient inheritance depth,
+painted shapes, flattened contour points, dash runs, sampled frames, and the canvas. Exceeding any
+of them, or painting nothing the renderer supports, falls back to the inert source-text preview.
+
+The coordinator revalidates every frame it receives against the wire caps — frame count, delay,
+canvas fit, exact frame length, and premultiplied pixels — before uploading it to Direct2D. Playback
+is driven by the popup's own bounded timer, stops when the preview hides, and honours the Windows
+animation-effects preference.
 
 ### Worker spoofing, stale data, and handle inheritance
 

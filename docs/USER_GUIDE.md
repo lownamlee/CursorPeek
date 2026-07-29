@@ -80,6 +80,38 @@ Images are never enlarged beyond their decoded size and are fitted without chang
 The popup follows the displayed image size, up to the selected maximum, with file details beneath
 the image.
 
+## Supported vector graphics
+
+`.svg` files are rendered visually in the contained worker. Declarative SMIL animation
+(`<animate>`, `<animateTransform>`, `<set>`) is preserved: the worker samples one loop into up to
+12 frames and the popup plays them.
+
+Current vector limits:
+
+- source document: 4 MiB of UTF-8;
+- rendered still canvas: at most 960 x 720 pixels;
+- rendered animated canvas: at most 384 x 288 pixels;
+- frames: at most 12, each shown for 40-1,000 ms;
+- elements, path segments, and `use` expansions are separately bounded;
+- one whole-document drawing allowance is shared by every frame, so an animated document may not
+  draw more than a still one and a very detailed animation falls back to source text.
+
+Because a vector document has no pixel grid, a small icon is enlarged to a legible size, up to eight
+times its intrinsic size, and never beyond the canvas bounds.
+
+CursorPeek renders the document and nothing else. Scripts and event-handler attributes are refused,
+`<foreignObject>`, `<image>`, and other embedding elements are refused, and every reference must be
+a same-document `#fragment`: no network request, file read, redirect, or download is possible.
+Entity declarations and internal DTD subsets are refused. `<text>`, clipping, masks, filters, and
+patterns are not rendered, and CSS animation is not played.
+
+When Windows animation effects are turned off — **Settings > Accessibility > Visual effects >
+Animation effects**, or **Ease of Access** on Windows 10 — an animated preview holds its first frame
+and is labelled *motion reduced*.
+
+Any document CursorPeek refuses or cannot draw falls back to the inert source-text preview below,
+so nothing silently disappears. Compressed `.svgz` is gzip rather than markup and is not eligible.
+
 ## Supported text
 
 Eligible extensions:
@@ -114,10 +146,8 @@ apply, the default `auto` policy may select a supported legacy encoding. Guessed
 identified in the preview. Invalid sequences, binary-looking content, and unsupported encodings
 fail closed.
 
-`.svg` belongs to this text group, not to the image group. CursorPeek shows the SVG markup as
-source text and never rasterizes it, so no vector renderer runs, no font is resolved, and no
-referenced script, image, or stylesheet is fetched. Compressed `.svgz` is gzip rather than markup
-and is not eligible.
+`.svg` appears in this list as the fallback for a document the vector renderer refuses. A rendered
+SVG preview is described above.
 
 An eligible extension never implies a parser. Project, patch, registry, subtitle, property-list,
 and certificate files are read as bytes and decoded as text; nothing in them is interpreted. Binary
@@ -126,7 +156,7 @@ fail the content check and show nothing.
 
 Text is normalized and displayed as inert plain text:
 
-- HTML, SVG, and Markdown are not rendered;
+- HTML and Markdown are not rendered;
 - scripts and terminal escape sequences are not executed;
 - unsafe control and bidirectional formatting characters are neutralized;
 - tabs are retained and hard line endings are normalized;

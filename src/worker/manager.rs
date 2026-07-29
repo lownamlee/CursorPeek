@@ -1193,6 +1193,7 @@ fn preview_result_kind(result: &PreviewResult) -> &'static str {
         },
         PreviewResult::Text(_) => "text",
         PreviewResult::Image(_) => "image",
+        PreviewResult::Vector(_) => "vector",
     }
 }
 

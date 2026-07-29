@@ -12,7 +12,7 @@ use crate::{
     hover::PhysicalScreenPoint,
     preview::{PreviewPlacement, PreviewSize, ScreenRect, place_preview, place_preview_pixels},
     settings::Theme,
-    worker::{ImagePreview, TextPreview},
+    worker::{ImagePreview, TextPreview, VectorPreview},
 };
 use cursorpeek_core::{ExplorerWindowId, layout::fit_dimensions};
 
@@ -23,8 +23,8 @@ use windows::{
     UI::ViewManagement::{UIColorType, UISettings},
     Win32::{
         Foundation::{
-            D2DERR_RECREATE_TARGET, E_INVALIDARG, FILETIME, HINSTANCE, HWND, LPARAM, LRESULT, RECT,
-            SYSTEMTIME, WPARAM,
+            BOOL, D2DERR_RECREATE_TARGET, E_INVALIDARG, FILETIME, HINSTANCE, HWND, LPARAM, LRESULT,
+            RECT, SYSTEMTIME, WPARAM,
         },
         Globalization::{DATE_SHORTDATE, GetDateFormatEx, GetTimeFormatEx, TIME_NOSECONDS},
         Graphics::{
@@ -64,15 +64,16 @@ use windows::{
             WindowsAndMessaging::{
                 CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GW_HWNDPREV,
                 GWLP_USERDATA, GetClientRect, GetWindow, GetWindowLongPtrW, GetWindowRect,
-                HWND_TOPMOST, IsWindowVisible, MA_NOACTIVATEANDEAT, NONCLIENTMETRICSW,
-                PostMessageW, RegisterClassW, SPI_GETHIGHCONTRAST, SPI_GETNONCLIENTMETRICS,
-                SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
-                SWP_NOZORDER, SWP_SHOWWINDOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW,
-                SetWindowLongPtrW, SetWindowPos, SetWindowTextW, SystemParametersInfoW,
-                UnregisterClassW, WINDOW_EX_STYLE, WM_APP, WM_DISPLAYCHANGE, WM_DPICHANGED,
-                WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
-                WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOLORCHANGE, WM_THEMECHANGED, WNDCLASSW,
-                WS_BORDER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+                HWND_TOPMOST, IsWindowVisible, KillTimer, MA_NOACTIVATEANDEAT, NONCLIENTMETRICSW,
+                PostMessageW, RegisterClassW, SPI_GETCLIENTAREAANIMATION, SPI_GETHIGHCONTRAST,
+                SPI_GETNONCLIENTMETRICS, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE,
+                SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW, SetTimer, SetWindowLongPtrW,
+                SetWindowPos, SetWindowTextW, SystemParametersInfoW, USER_TIMER_MAXIMUM,
+                USER_TIMER_MINIMUM, UnregisterClassW, WINDOW_EX_STYLE, WM_APP, WM_DISPLAYCHANGE,
+                WM_DPICHANGED, WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY,
+                WM_PAINT, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOLORCHANGE, WM_THEMECHANGED, WM_TIMER,
+                WNDCLASSW, WS_BORDER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
             },
         },
     },
@@ -93,6 +94,7 @@ const IMAGE_METADATA_HEIGHT: f32 = 56.0;
 const IMAGE_MINIMUM_WIDTH: f32 = 158.0;
 const SYSTEM_APPEARANCE_CHANGED_MESSAGE: u32 = WM_APP + 20;
 const MAX_Z_ORDER_SCAN: usize = 64;
+const VECTOR_FRAME_TIMER_ID: usize = 1;
 
 pub(crate) struct PreviewWindow {
     hwnd: HWND,
@@ -180,12 +182,29 @@ impl PreviewWindow {
         )
     }
 
+    pub(crate) fn show_vector_at(
+        &self,
+        anchor: PhysicalScreenPoint,
+        size: PreviewSize,
+        preview: VectorPreview,
+    ) -> Result<PreviewPlacement> {
+        self.show(
+            anchor,
+            size,
+            Some(RetainedContent::Vector(VectorContent::from_preview(
+                preview,
+                client_area_animation_enabled(),
+            ))),
+        )
+    }
+
     fn show(
         &self,
         anchor: PhysicalScreenPoint,
         size: PreviewSize,
         content: Option<RetainedContent>,
     ) -> Result<PreviewPlacement> {
+        self.stop_frame_timer();
         // SAFETY: The hidden top-level HWND is owned by this UI thread. Moving the one-pixel setup
         // window first associates it with the anchor monitor without activating or showing it.
         unsafe {
@@ -236,6 +255,7 @@ impl PreviewWindow {
             .as_ref()
             .map_or(w!("CursorPeek preview"), RetainedContent::accessible_title);
         let has_content = content.is_some();
+        let frame_interval = content.as_ref().and_then(RetainedContent::frame_interval_ms);
         self.state.borrow_mut().configure(content, dpi)?;
         let placement = if has_content {
             let client_size = self.state.borrow().content_client_pixel_size(size)?;
@@ -272,7 +292,30 @@ impl PreviewWindow {
 
         self.state.borrow_mut().prepare(self.hwnd)?;
         self.redraw()?;
+        if let Some(interval) = frame_interval {
+            self.start_frame_timer(interval)?;
+        }
         Ok(placement)
+    }
+
+    /// Drives declarative animation from the popup's own timer, bounded by the payload's frame
+    /// delay and stopped whenever the preview is hidden, reconfigured, or destroyed.
+    fn start_frame_timer(&self, interval_ms: u32) -> Result<()> {
+        let interval_ms = interval_ms.clamp(USER_TIMER_MINIMUM, USER_TIMER_MAXIMUM);
+        // SAFETY: `self.hwnd` is the live popup owned by this UI thread. The fixed nonzero ID
+        // belongs only to that window and no callback pointer is supplied, so expiry arrives as
+        // WM_TIMER on this thread.
+        let timer = unsafe { SetTimer(Some(self.hwnd), VECTOR_FRAME_TIMER_ID, interval_ms, None) };
+        if timer == 0 {
+            return Err(Error::from_thread());
+        }
+        Ok(())
+    }
+
+    fn stop_frame_timer(&self) {
+        // SAFETY: This uses the same live owning HWND and fixed ID passed to SetTimer. Stopping a
+        // timer that was never armed simply reports failure and is ignored.
+        let _ = unsafe { KillTimer(Some(self.hwnd), VECTOR_FRAME_TIMER_ID) };
     }
 
     fn redraw(&self) -> Result<()> {
@@ -304,6 +347,7 @@ impl PreviewWindow {
     }
 
     pub(crate) fn hide(&self) -> Result<()> {
+        self.stop_frame_timer();
         // SAFETY: The live HWND belongs to this UI thread. The flags hide it without changing
         // position, size, Z order, or activation.
         unsafe {
@@ -405,8 +449,16 @@ impl PreviewWindow {
     }
 
     #[cfg(test)]
-    fn has_image_bitmap(&self) -> bool {
-        self.state.borrow().image_bitmap.is_some()
+    fn has_content_bitmap(&self) -> bool {
+        self.state.borrow().content_bitmap.is_some()
+    }
+
+    #[cfg(test)]
+    fn vector_frame(&self) -> Option<usize> {
+        match self.state.borrow().content.as_ref() {
+            Some(RetainedContent::Vector(content)) => Some(content.frame),
+            _ => None,
+        }
     }
 
     #[cfg(test)]
@@ -495,7 +547,7 @@ struct PreviewWindowState {
     content: Option<RetainedContent>,
     layouts: Option<ContentLayouts>,
     device: Option<DeviceResources>,
-    image_bitmap: Option<ID2D1Bitmap>,
+    content_bitmap: Option<ID2D1Bitmap>,
     pixel_size: D2D_SIZE_U,
     dpi: u32,
     last_paint_error: Option<HRESULT>,
@@ -526,7 +578,7 @@ impl PreviewWindowState {
             content: None,
             layouts: None,
             device: None,
-            image_bitmap: None,
+            content_bitmap: None,
             pixel_size: D2D_SIZE_U::default(),
             dpi: 96,
             last_paint_error: None,
@@ -542,7 +594,7 @@ impl PreviewWindowState {
         }
         self.content = content;
         self.layouts = None;
-        self.image_bitmap = None;
+        self.content_bitmap = None;
         self.last_paint_error = None;
         Ok(())
     }
@@ -562,6 +614,10 @@ impl PreviewWindowState {
             ),
             RetainedContent::Image(content) => {
                 image_client_pixel_size(&content.preview, maximum, self.dpi)
+                    .ok_or_else(Error::from_thread)
+            }
+            RetainedContent::Vector(content) => {
+                vector_client_pixel_size(&content.preview, maximum, self.dpi)
                     .ok_or_else(Error::from_thread)
             }
         }
@@ -584,7 +640,7 @@ impl PreviewWindowState {
     }
 
     fn discard_device_resources(&mut self) {
-        self.image_bitmap = None;
+        self.content_bitmap = None;
         self.device = None;
     }
 
@@ -660,26 +716,30 @@ impl PreviewWindowState {
                     metadata_origin_y,
                 })
             }
-            RetainedContent::Image(content) => {
-                let layout_width = (width - IMAGE_MARGIN * 2.0).max(1.0);
-                let metadata_origin_y =
-                    (height - IMAGE_MARGIN - IMAGE_METADATA_HEIGHT).max(IMAGE_MARGIN);
-                // SAFETY: The bounded UTF-16 metadata remains alive in content for this
-                // synchronous call. The returned layout owns its DirectWrite state.
-                let metadata = unsafe {
-                    self.dwrite_factory.CreateTextLayout(
-                        &content.metadata,
-                        &self.formats.metadata,
-                        layout_width,
-                        IMAGE_METADATA_HEIGHT,
-                    )?
-                };
-                Ok(ContentLayouts::Image {
-                    metadata,
-                    metadata_origin_y,
-                })
-            }
+            RetainedContent::Image(content) => self.create_bitmap_layout(&content.metadata),
+            RetainedContent::Vector(content) => self.create_bitmap_layout(&content.metadata),
         }
+    }
+
+    fn create_bitmap_layout(&self, metadata: &[u16]) -> Result<ContentLayouts> {
+        let width = pixels_to_dips(self.pixel_size.width, self.dpi);
+        let height = pixels_to_dips(self.pixel_size.height, self.dpi);
+        let layout_width = (width - IMAGE_MARGIN * 2.0).max(1.0);
+        let metadata_origin_y = (height - IMAGE_MARGIN - IMAGE_METADATA_HEIGHT).max(IMAGE_MARGIN);
+        // SAFETY: The bounded UTF-16 metadata remains alive in content for this synchronous call.
+        // The returned layout owns its DirectWrite state.
+        let metadata = unsafe {
+            self.dwrite_factory.CreateTextLayout(
+                metadata,
+                &self.formats.metadata,
+                layout_width,
+                IMAGE_METADATA_HEIGHT,
+            )?
+        };
+        Ok(ContentLayouts::Bitmap {
+            metadata,
+            metadata_origin_y,
+        })
     }
 
     fn render_with_recovery(&mut self, hwnd: HWND) -> Result<()> {
@@ -705,8 +765,12 @@ impl PreviewWindowState {
         if self.device.is_none() {
             self.device = Some(self.create_device_resources(hwnd)?);
         }
-        if matches!(self.content, Some(RetainedContent::Image(_))) && self.image_bitmap.is_none() {
-            self.image_bitmap = Some(self.create_image_bitmap()?);
+        if matches!(
+            self.content,
+            Some(RetainedContent::Image(_) | RetainedContent::Vector(_))
+        ) && self.content_bitmap.is_none()
+        {
+            self.content_bitmap = Some(self.create_content_bitmap()?);
         }
 
         let device = self
@@ -718,10 +782,8 @@ impl PreviewWindowState {
         unsafe {
             device.target.BeginDraw();
             device.target.Clear(Some(&self.colors.background));
-            if let (Some(bitmap), Some(RetainedContent::Image(content))) =
-                (self.image_bitmap.as_ref(), self.content.as_ref())
-                && let Some(destination) =
-                    image_destination_rect(&content.preview, self.pixel_size, self.dpi)
+            if let Some(bitmap) = self.content_bitmap.as_ref()
+                && let Some(destination) = self.bitmap_destination()
             {
                 device.target.DrawBitmap(
                     bitmap,
@@ -759,7 +821,7 @@ impl PreviewWindowState {
                             D2D1_DRAW_TEXT_OPTIONS_CLIP,
                         );
                     }
-                    ContentLayouts::Image {
+                    ContentLayouts::Bitmap {
                         metadata,
                         metadata_origin_y,
                     } => {
@@ -779,20 +841,50 @@ impl PreviewWindowState {
         }
     }
 
-    fn create_image_bitmap(&self) -> Result<ID2D1Bitmap> {
+    fn bitmap_destination(&self) -> Option<D2D_RECT_F> {
+        match self.content.as_ref()? {
+            RetainedContent::Text(_) => None,
+            RetainedContent::Image(content) => {
+                image_destination_rect(&content.preview, self.pixel_size, self.dpi)
+            }
+            RetainedContent::Vector(content) => {
+                vector_destination_rect(&content.preview, self.pixel_size, self.dpi)
+            }
+        }
+    }
+
+    /// Uploads the current raster image or vector frame into a fresh target-owned bitmap.
+    fn create_content_bitmap(&self) -> Result<ID2D1Bitmap> {
         let device = self
             .device
             .as_ref()
-            .expect("an image bitmap is created only after the render target");
-        let RetainedContent::Image(content) = self
+            .expect("a content bitmap is created only after the render target");
+        let content = self
             .content
             .as_ref()
-            .expect("an image bitmap is created only for retained content")
-        else {
-            return Err(Error::from_hresult(E_INVALIDARG));
+            .expect("a content bitmap is created only for retained content");
+        let (width, height, pitch, pixels) = match content {
+            RetainedContent::Text(_) => return Err(Error::from_hresult(E_INVALIDARG)),
+            RetainedContent::Image(content) => {
+                let (pitch, _) = checked_image_layout(&content.preview)
+                    .ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
+                (
+                    content.preview.width,
+                    content.preview.height,
+                    pitch,
+                    content.preview.premultiplied_bgra.as_slice(),
+                )
+            }
+            RetainedContent::Vector(content) => {
+                let (pitch, _) = checked_vector_layout(&content.preview)
+                    .ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
+                let frame = content
+                    .preview
+                    .frame(content.frame)
+                    .ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
+                (content.preview.width, content.preview.height, pitch, frame)
+            }
         };
-        let (pitch, _) = checked_image_layout(&content.preview)
-            .ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
         let properties = D2D1_BITMAP_PROPERTIES {
             pixelFormat: D2D1_PIXEL_FORMAT {
                 format: DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -801,19 +893,30 @@ impl PreviewWindowState {
             dpiX: self.dpi as f32,
             dpiY: self.dpi as f32,
         };
-        // SAFETY: checked_image_layout proves exact pitch/length and premultiplied BGRA pixels.
-        // Direct2D copies the borrowed buffer into a new target-owned bitmap during this call.
+        // SAFETY: The checked layout proves exact pitch/length and premultiplied BGRA pixels for
+        // the selected buffer. Direct2D copies it into a new target-owned bitmap during this call.
         unsafe {
             device.target.CreateBitmap(
-                D2D_SIZE_U {
-                    width: content.preview.width,
-                    height: content.preview.height,
-                },
-                Some(content.preview.premultiplied_bgra.as_ptr().cast()),
+                D2D_SIZE_U { width, height },
+                Some(pixels.as_ptr().cast()),
                 pitch,
                 &properties,
             )
         }
+    }
+
+    /// Advances an animated vector preview to its next frame. The bitmap is dropped so the next
+    /// paint uploads the new frame; the payload's frame count bounds the loop.
+    fn advance_vector_frame(&mut self) -> bool {
+        let Some(RetainedContent::Vector(content)) = self.content.as_mut() else {
+            return false;
+        };
+        if !content.playing() {
+            return false;
+        }
+        content.frame = (content.frame + 1) % content.preview.frames.len();
+        self.content_bitmap = None;
+        true
     }
 
     fn create_device_resources(&self, hwnd: HWND) -> Result<DeviceResources> {
@@ -865,6 +968,7 @@ impl TextContent {
 enum RetainedContent {
     Text(TextContent),
     Image(ImageContent),
+    Vector(VectorContent),
 }
 
 impl RetainedContent {
@@ -872,6 +976,15 @@ impl RetainedContent {
         match self {
             Self::Text(_) => w!("CursorPeek text preview"),
             Self::Image(_) => w!("CursorPeek image preview"),
+            Self::Vector(_) => w!("CursorPeek vector preview"),
+        }
+    }
+
+    /// Frame interval for content that animates, or `None` for a still preview.
+    fn frame_interval_ms(&self) -> Option<u32> {
+        match self {
+            Self::Text(_) | Self::Image(_) => None,
+            Self::Vector(content) => content.playing().then_some(content.preview.frame_delay_ms),
         }
     }
 }
@@ -890,13 +1003,41 @@ impl ImageContent {
     }
 }
 
+struct VectorContent {
+    metadata: Vec<u16>,
+    preview: VectorPreview,
+    frame: usize,
+    motion_allowed: bool,
+}
+
+impl VectorContent {
+    fn from_preview(preview: VectorPreview, motion_allowed: bool) -> Self {
+        Self {
+            metadata: vector_preview_metadata(&preview, motion_allowed)
+                .encode_utf16()
+                .collect(),
+            preview,
+            frame: 0,
+            motion_allowed,
+        }
+    }
+
+    fn playing(&self) -> bool {
+        self.motion_allowed
+            && self.preview.animated
+            && self.preview.frames.len() > 1
+            && self.preview.frame_delay_ms > 0
+    }
+}
+
 enum ContentLayouts {
     Text {
         body: Option<IDWriteTextLayout>,
         metadata: IDWriteTextLayout,
         metadata_origin_y: f32,
     },
-    Image {
+    /// Shared by raster and vector previews, which use the same bitmap-over-metadata layout.
+    Bitmap {
         metadata: IDWriteTextLayout,
         metadata_origin_y: f32,
     },
@@ -1136,6 +1277,45 @@ fn image_preview_metadata(preview: &ImagePreview) -> String {
     format!("{}\n{details}\n{modified}", preview.display_name)
 }
 
+fn vector_preview_metadata(preview: &VectorPreview, motion_allowed: bool) -> String {
+    let mut details = format!(
+        "{}    ({} \u{d7} {} vector)",
+        format_file_size(preview.file_size),
+        preview.source_width,
+        preview.source_height,
+    );
+    if preview.animated {
+        details.push_str(if motion_allowed {
+            "  \u{b7}  animated"
+        } else {
+            "  \u{b7}  motion reduced"
+        });
+    }
+    if preview.linked_content {
+        details.push_str("  \u{b7}  linked");
+    }
+    let modified = format_last_write_time(preview.last_write_time)
+        .unwrap_or_else(|| "Modified time unavailable".to_owned());
+    format!("{}\n{details}\n{modified}", preview.display_name)
+}
+
+/// Honours the Windows "Show animations" preference, which reduced-motion settings turn off.
+fn client_area_animation_enabled() -> bool {
+    let mut enabled = BOOL(1);
+    // SAFETY: `enabled` is writable storage of the size this read-only accessibility query
+    // documents. A failed query keeps the default of allowing animation.
+    let queried = unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            Some(std::ptr::from_mut(&mut enabled).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS::default(),
+        )
+    }
+    .is_ok();
+    !queried || enabled.as_bool()
+}
+
 fn format_last_write_time(value: i64) -> Option<String> {
     let value = u64::try_from(value).ok()?;
     let file_time = FILETIME {
@@ -1189,22 +1369,18 @@ fn localized_system_time_part(time: &SYSTEMTIME, date: bool) -> Option<String> {
     Some(String::from_utf16_lossy(&buffer[..length - 1]))
 }
 
-fn checked_image_layout(preview: &ImagePreview) -> Option<(u32, usize)> {
-    if preview.width == 0
-        || preview.height == 0
-        || preview.source_width == 0
-        || preview.source_height == 0
-    {
+/// Proves the exact pitch and length of a premultiplied BGRA buffer before it reaches Direct2D.
+fn checked_bitmap_layout(width: u32, height: u32, pixels: &[u8]) -> Option<(u32, usize)> {
+    if width == 0 || height == 0 {
         return None;
     }
 
-    let pitch = preview.width.checked_mul(4)?;
+    let pitch = width.checked_mul(4)?;
     let length = usize::try_from(pitch)
         .ok()?
-        .checked_mul(usize::try_from(preview.height).ok()?)?;
-    if preview.premultiplied_bgra.len() != length
-        || !preview
-            .premultiplied_bgra
+        .checked_mul(usize::try_from(height).ok()?)?;
+    if pixels.len() != length
+        || !pixels
             .chunks_exact(4)
             .all(|pixel| pixel[0] <= pixel[3] && pixel[1] <= pixel[3] && pixel[2] <= pixel[3])
     {
@@ -1212,6 +1388,32 @@ fn checked_image_layout(preview: &ImagePreview) -> Option<(u32, usize)> {
     }
 
     Some((pitch, length))
+}
+
+fn checked_image_layout(preview: &ImagePreview) -> Option<(u32, usize)> {
+    if preview.source_width == 0 || preview.source_height == 0 {
+        return None;
+    }
+    checked_bitmap_layout(
+        preview.width,
+        preview.height,
+        &preview.premultiplied_bgra,
+    )
+}
+
+fn checked_vector_layout(preview: &VectorPreview) -> Option<(u32, usize)> {
+    if preview.source_width == 0 || preview.source_height == 0 || preview.frames.is_empty() {
+        return None;
+    }
+    let mut layout = None;
+    for frame in &preview.frames {
+        let checked = checked_bitmap_layout(preview.width, preview.height, frame)?;
+        if layout.is_some_and(|previous| previous != checked) {
+            return None;
+        }
+        layout = Some(checked);
+    }
+    layout
 }
 
 fn text_client_pixel_size(
@@ -1298,7 +1500,30 @@ fn image_client_pixel_size(
     maximum: PreviewSize,
     dpi: u32,
 ) -> Option<D2D_SIZE_U> {
-    if dpi == 0 || checked_image_layout(preview).is_none() {
+    if checked_image_layout(preview).is_none() {
+        return None;
+    }
+    bitmap_client_pixel_size(preview.width, preview.height, maximum, dpi)
+}
+
+fn vector_client_pixel_size(
+    preview: &VectorPreview,
+    maximum: PreviewSize,
+    dpi: u32,
+) -> Option<D2D_SIZE_U> {
+    if checked_vector_layout(preview).is_none() {
+        return None;
+    }
+    bitmap_client_pixel_size(preview.width, preview.height, maximum, dpi)
+}
+
+fn bitmap_client_pixel_size(
+    width: u32,
+    height: u32,
+    maximum: PreviewSize,
+    dpi: u32,
+) -> Option<D2D_SIZE_U> {
+    if dpi == 0 || width == 0 || height == 0 {
         return None;
     }
 
@@ -1310,18 +1535,14 @@ fn image_client_pixel_size(
     let vertical_chrome = horizontal_chrome.checked_add(metadata_height)?;
     let available_width = max_width.checked_sub(horizontal_chrome)?;
     let available_height = max_height.checked_sub(vertical_chrome)?;
-    let (image_width, image_height) = fit_dimensions(
-        preview.width,
-        preview.height,
-        available_width,
-        available_height,
-    )?;
+    let (bitmap_width, bitmap_height) =
+        fit_dimensions(width, height, available_width, available_height)?;
     let minimum_width = dips_to_pixels(IMAGE_MINIMUM_WIDTH, dpi)?.min(available_width);
-    let content_width = image_width.max(minimum_width);
+    let content_width = bitmap_width.max(minimum_width);
 
     Some(D2D_SIZE_U {
         width: content_width.checked_add(horizontal_chrome)?,
-        height: image_height.checked_add(vertical_chrome)?,
+        height: bitmap_height.checked_add(vertical_chrome)?,
     })
 }
 
@@ -1355,7 +1576,30 @@ fn image_destination_rect(
     pixel_size: D2D_SIZE_U,
     dpi: u32,
 ) -> Option<D2D_RECT_F> {
-    if dpi == 0 || checked_image_layout(preview).is_none() {
+    if checked_image_layout(preview).is_none() {
+        return None;
+    }
+    bitmap_destination_rect(preview.width, preview.height, pixel_size, dpi)
+}
+
+fn vector_destination_rect(
+    preview: &VectorPreview,
+    pixel_size: D2D_SIZE_U,
+    dpi: u32,
+) -> Option<D2D_RECT_F> {
+    if checked_vector_layout(preview).is_none() {
+        return None;
+    }
+    bitmap_destination_rect(preview.width, preview.height, pixel_size, dpi)
+}
+
+fn bitmap_destination_rect(
+    width: u32,
+    height: u32,
+    pixel_size: D2D_SIZE_U,
+    dpi: u32,
+) -> Option<D2D_RECT_F> {
+    if dpi == 0 || width == 0 || height == 0 {
         return None;
     }
 
@@ -1367,13 +1611,13 @@ fn image_destination_rect(
         return None;
     }
 
-    let image_width = pixels_to_dips(preview.width, dpi);
-    let image_height = pixels_to_dips(preview.height, dpi);
-    let scale = (available_width / image_width)
-        .min(available_height / image_height)
+    let bitmap_width = pixels_to_dips(width, dpi);
+    let bitmap_height = pixels_to_dips(height, dpi);
+    let scale = (available_width / bitmap_width)
+        .min(available_height / bitmap_height)
         .min(1.0);
-    let rendered_width = image_width * scale;
-    let rendered_height = image_height * scale;
+    let rendered_width = bitmap_width * scale;
+    let rendered_height = bitmap_height * scale;
     let left = IMAGE_MARGIN + (available_width - rendered_width) / 2.0;
     let top = IMAGE_MARGIN;
 
@@ -1553,6 +1797,21 @@ fn dispatch_preview_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
         return LRESULT(1);
     }
 
+    if message == WM_TIMER && wparam.0 == VECTOR_FRAME_TIMER_ID {
+        // The borrow ends before the repaint is scheduled, so WM_PAINT cannot reenter it.
+        let advanced =
+            preview_state(hwnd).is_some_and(|state| state.borrow_mut().advance_vector_frame());
+        if advanced {
+            // SAFETY: This schedules one repaint of the live preview owned by this UI thread.
+            let _ = unsafe { RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE) };
+        } else {
+            // SAFETY: This stops the fixed timer ID on the live callback HWND, which owns it. Still
+            // content must not keep a frame timer armed.
+            let _ = unsafe { KillTimer(Some(hwnd), VECTOR_FRAME_TIMER_ID) };
+        }
+        return LRESULT(0);
+    }
+
     if message == WM_DPICHANGED {
         let result = (|| {
             let dpi = u32::from((wparam.0 & 0xffff) as u16);
@@ -1678,17 +1937,22 @@ fn preview_state(hwnd: HWND) -> Option<&'static RefCell<PreviewWindowState>> {
 mod tests {
     use super::{
         ContentLayouts, D2D_SIZE_U, MAX_Z_ORDER_SCAN, PreviewColors, PreviewWindow,
-        PreviewWindowState, RetainedContent, TextContent, adjusted_window_pixel_size,
-        checked_image_layout, checked_window_rect, client_pixel_size, color_from_colorref,
-        format_file_size, image_client_pixel_size, image_destination_rect, image_preview_metadata,
+        PreviewWindowState, RetainedContent, TextContent, VectorContent,
+        adjusted_window_pixel_size, checked_image_layout, checked_vector_layout,
+        checked_window_rect, client_pixel_size, color_from_colorref, format_file_size,
+        image_client_pixel_size, image_destination_rect, image_preview_metadata,
         rectangles_overlap, system_dark_mode, system_message_font, text_preview_metadata,
+        vector_client_pixel_size, vector_preview_metadata,
     };
     use crate::{
         hover::PhysicalScreenPoint,
         platform::{ApartmentKind, ComApartment},
         preview::PreviewSize,
         settings::Theme,
-        worker::{ImageFormat, ImagePreview, TextPreview, image_corpus_previews},
+        worker::{
+            ImageFormat, ImagePreview, TextPreview, VectorPreview, image_corpus_previews,
+            vector_corpus_previews,
+        },
     };
     use std::thread;
     use windows::Win32::{
@@ -1743,6 +2007,27 @@ mod tests {
             width: 2,
             height: 1,
             premultiplied_bgra: vec![10, 20, 30, 40, 0, 0, 0, 0],
+        }
+    }
+
+    fn vector_preview(frames: usize) -> VectorPreview {
+        VectorPreview {
+            file_size: 2_048,
+            last_write_time: 133_000_000_000_000_000,
+            linked_content: false,
+            animated: frames > 1,
+            display_name: "sample.svg".to_owned(),
+            source_width: 16,
+            source_height: 8,
+            width: 2,
+            height: 2,
+            frame_delay_ms: if frames > 1 { 80 } else { 0 },
+            frames: (0..frames)
+                .map(|index| {
+                    let level = 40 + u8::try_from(index).unwrap() * 10;
+                    vec![level, level, level, 255, 0, 0, 0, 0, 0, 0, 0, 0, level, level, level, 255]
+                })
+                .collect(),
         }
     }
 
@@ -2080,17 +2365,112 @@ mod tests {
             assert!(preview.is_visible());
             assert_eq!(preview.accessible_title(), "CursorPeek image preview");
             assert!(preview.has_content_layouts());
-            assert!(preview.has_image_bitmap());
+            assert!(preview.has_content_bitmap());
             assert!(preview.has_device_resources());
 
             preview
                 .force_device_loss_and_redraw()
                 .expect("a lost target and bitmap should be recreated once");
-            assert!(preview.has_image_bitmap());
+            assert!(preview.has_content_bitmap());
             assert!(preview.has_device_resources());
         })
         .join()
         .expect("the image-render test thread should not panic");
+    }
+
+    #[test]
+    fn vector_frames_render_advance_and_stop_at_the_frame_budget() {
+        thread::spawn(|| {
+            let preview = PreviewWindow::create().expect("the preview window should be created");
+            let maximum = PreviewSize::new(640, 480);
+            let content = vector_preview(3);
+            preview
+                .show_vector_at(PhysicalScreenPoint::new(200, 200), maximum, content.clone())
+                .expect("bounded vector frames should render");
+            assert!(preview.is_visible());
+            assert_eq!(preview.accessible_title(), "CursorPeek vector preview");
+            assert!(preview.has_content_layouts());
+            assert!(preview.has_content_bitmap());
+
+            let dpi = preview
+                .window_dpi()
+                .expect("the shown window should expose its monitor DPI");
+            let expected_client = vector_client_pixel_size(&content, maximum, dpi)
+                .expect("the valid vector should produce a bounded client size");
+            assert_eq!(
+                client_pixel_size(preview.handle())
+                    .expect("the live window client rectangle should be queryable"),
+                expected_client
+            );
+
+            // Each timer tick advances one frame and drops the uploaded bitmap for re-upload.
+            let advanced = preview.state.borrow_mut().advance_vector_frame();
+            if advanced {
+                assert!(!preview.has_content_bitmap());
+                assert_eq!(preview.vector_frame(), Some(1));
+                preview.redraw().expect("the next frame should repaint");
+                assert!(preview.has_content_bitmap());
+                for _ in 0..2 {
+                    assert!(preview.state.borrow_mut().advance_vector_frame());
+                }
+                assert_eq!(preview.vector_frame(), Some(0), "frames must loop");
+            }
+
+            // A still document must never arm the frame timer.
+            let still = vector_preview(1);
+            assert!(
+                RetainedContent::Vector(VectorContent::from_preview(still.clone(), true))
+                    .frame_interval_ms()
+                    .is_none()
+            );
+            preview
+                .show_vector_at(PhysicalScreenPoint::new(200, 200), maximum, still)
+                .expect("a still vector should render");
+            assert!(!preview.state.borrow_mut().advance_vector_frame());
+        })
+        .join()
+        .expect("the vector-render test thread should not panic");
+    }
+
+    #[test]
+    fn reduced_motion_freezes_a_vector_preview_on_its_first_frame() {
+        let animated = vector_preview(3);
+        let playing = VectorContent::from_preview(animated.clone(), true);
+        assert!(playing.playing());
+        assert_eq!(
+            RetainedContent::Vector(playing).frame_interval_ms(),
+            Some(animated.frame_delay_ms)
+        );
+
+        let frozen = VectorContent::from_preview(animated.clone(), false);
+        assert!(!frozen.playing());
+        assert_eq!(frozen.frame, 0);
+        assert_eq!(RetainedContent::Vector(frozen).frame_interval_ms(), None);
+        assert!(vector_preview_metadata(&animated, false).contains("motion reduced"));
+        assert!(vector_preview_metadata(&animated, true).contains("animated"));
+        assert!(!vector_preview_metadata(&vector_preview(1), true).contains("animated"));
+    }
+
+    #[test]
+    fn vector_layout_requires_uniform_premultiplied_frames() {
+        let preview = vector_preview(2);
+        assert_eq!(checked_vector_layout(&preview), Some((8, 16)));
+
+        let mut empty = preview.clone();
+        empty.frames.clear();
+        assert_eq!(checked_vector_layout(&empty), None);
+
+        let mut ragged = preview.clone();
+        ragged.frames[1].pop();
+        assert_eq!(checked_vector_layout(&ragged), None);
+
+        let mut straight_alpha = preview.clone();
+        straight_alpha.frames[0][..4].copy_from_slice(&[255, 0, 0, 128]);
+        assert_eq!(checked_vector_layout(&straight_alpha), None);
+
+        let mut no_source = preview;
+        no_source.source_width = 0;
+        assert_eq!(checked_vector_layout(&no_source), None);
     }
 
     #[test]
@@ -2108,7 +2488,7 @@ mod tests {
                         panic!("image corpus case `{}` should render: {error}", case.id)
                     });
                 assert!(preview.has_content_layouts(), "corpus case `{}`", case.id);
-                assert!(preview.has_image_bitmap(), "corpus case `{}`", case.id);
+                assert!(preview.has_content_bitmap(), "corpus case `{}`", case.id);
                 preview
                     .force_device_loss_and_redraw()
                     .unwrap_or_else(|error| {
@@ -2117,12 +2497,44 @@ mod tests {
                             case.id
                         )
                     });
-                assert!(preview.has_image_bitmap(), "corpus case `{}`", case.id);
+                assert!(preview.has_content_bitmap(), "corpus case `{}`", case.id);
                 assert!(preview.has_device_resources(), "corpus case `{}`", case.id);
             }
         })
         .join()
         .expect("the image-corpus render thread should not panic");
+    }
+
+    #[test]
+    fn generated_vector_corpus_renders_and_recovers_device_resources() {
+        thread::spawn(|| {
+            let preview = PreviewWindow::create().expect("the preview window should be created");
+            for case in vector_corpus_previews() {
+                preview
+                    .show_vector_at(
+                        PhysicalScreenPoint::new(200, 200),
+                        PreviewSize::new(640, 480),
+                        case.preview,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("vector corpus case `{}` should render: {error}", case.id)
+                    });
+                assert!(preview.has_content_layouts(), "corpus case `{}`", case.id);
+                assert!(preview.has_content_bitmap(), "corpus case `{}`", case.id);
+                preview
+                    .force_device_loss_and_redraw()
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "vector corpus case `{}` should recover device loss: {error}",
+                            case.id
+                        )
+                    });
+                assert!(preview.has_content_bitmap(), "corpus case `{}`", case.id);
+                assert!(preview.has_device_resources(), "corpus case `{}`", case.id);
+            }
+        })
+        .join()
+        .expect("the vector-corpus render thread should not panic");
     }
 
     #[test]

@@ -24,8 +24,13 @@ locality, format, or resource checks cannot be satisfied safely.
   deterministic first image, and TIFF uses a deterministic first page.
 - Text is inert plain text. CursorPeek does not render Markdown or HTML, apply syntax highlighting,
   follow links, execute scripts, or provide an editor.
-- `.svg` previews as markup source text. CursorPeek does not rasterize vector graphics, and
-  gzip-compressed `.svgz` does not preview at all.
+- `.svg` renders visually with declarative SMIL animation. The renderer draws shapes, paths,
+  groups, `use`/`symbol`, nested viewports, solid and gradient paint, strokes, and dashes. It does
+  not draw `<text>`, clipping paths, masks, filters, patterns, or markers, does not play CSS
+  animation, approximates group opacity and miter joins, and reads UTF-8 documents only. Anything
+  it refuses or cannot draw falls back to the inert source-text preview. Animated documents render
+  on a smaller canvas (384 x 288) than stills (960 x 720), for at most 12 frames.
+- gzip-compressed `.svgz` does not preview at all.
 - Project, patch, registry, property-list, subtitle, and certificate types preview as source text
   only. Nothing is parsed or interpreted, and binary variants of those names — `bplist00` property
   lists, DER-encoded `.cer`, `.pfx`/`.p12`/`.jks` containers — fail the content check.
@@ -34,7 +39,8 @@ locality, format, or resource checks cannot be satisfied safely.
 - Large images and text are bounded or truncated to the documented limits. CursorPeek does not
   expose a control for bypassing those safety limits.
 - The preview is temporary and non-interactive. It cannot be pinned, copied from, zoomed, scrolled,
-  or navigated between pages or frames.
+  or navigated between pages or frames. An animated vector preview loops on its own and offers no
+  play, pause, or seek control; turning off Windows animation effects holds its first frame.
 - Rejected files normally produce no popup or detailed reason. Run the documented diagnostics and
   use a small known-good local file when troubleshooting.
 

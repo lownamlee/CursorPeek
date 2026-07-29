@@ -502,8 +502,10 @@ mod tests {
         );
     }
 
+    // The vector provider refuses documents like this one and the worker falls back here, so the
+    // text provider must still accept `.svg` and return the markup verbatim.
     #[test]
-    fn svg_files_preview_as_inert_markup_text() {
+    fn refused_svg_documents_fall_back_to_inert_markup_text() {
         let root = TestDirectory::new("svg");
         let markup = concat!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",

@@ -6,7 +6,12 @@ This file records user-visible changes to CursorPeek. Release dates are added on
 
 ### Added
 
-- Preview `.svg` files as inert markup source text through the existing contained text provider.
+- Render `.svg` files visually in the contained worker, preserving declarative SMIL animation
+  (`<animate>`, `<animateTransform>`, `<set>`) as a bounded looping preview. Shapes, paths, groups,
+  `use`/`symbol`, nested viewports, gradients, strokes, dashes, and the CSS cascade are drawn; any
+  document the renderer refuses or cannot draw falls back to the inert source-text preview.
+- Respect the Windows animation-effects preference: an animated vector preview holds its first
+  frame and is labelled *motion reduced* when animations are turned off.
 - Extend text previews to documentation markup (`.markdown`, `.mdx`, `.rst`, `.adoc`, `.tex`), more
   structured data (`.json5`, `.jsonl`, `.ndjson`, `.plist`, `.config`, `.hcl`, `.tf`, `.tfvars`,
   `.proto`, `.graphql`), more languages (`.vb`, `.fs`, `.scala`, `.groovy`, `.swift`, `.dart`,
@@ -22,6 +27,12 @@ This file records user-visible changes to CursorPeek. Release dates are added on
 
 ### Security
 
+- Refuse SVG documents that carry script or event-handler content, embedding elements, entity
+  declarations or an internal DTD subset, or any reference outside the document itself. Vector
+  rendering runs only in the contained worker, uses no unsafe Rust, takes no clock input, and is
+  bounded by explicit element, geometry, frame, and canvas limits.
+- Revalidate every rendered frame against the wire caps in the coordinator before it reaches
+  Direct2D, and bump the worker protocol to version 10 for the new result kind.
 - Document that key, certificate, and registry previews put secret material on the display, and that
   binary variants of newly eligible names still fail the content check.
 
