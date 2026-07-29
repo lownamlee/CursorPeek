@@ -4,36 +4,26 @@ This file records user-visible changes to CursorPeek. Release dates are added on
 
 ## Unreleased
 
+## [0.3.0] - 2026-07-30
+
+This release adds native hover video playback and substantially broadens source-text preview coverage.
+
 ### Added
 
 - Preview `.svg` files as inert markup source text through the existing contained text provider.
-- Extend text previews to documentation markup (`.markdown`, `.mdx`, `.rst`, `.adoc`, `.tex`), more
-  structured data (`.json5`, `.jsonl`, `.ndjson`, `.plist`, `.config`, `.hcl`, `.tf`, `.tfvars`,
-  `.proto`, `.graphql`), more languages (`.vb`, `.fs`, `.scala`, `.groovy`, `.swift`, `.dart`,
-  `.lua`, `.r`), web tooling (`.vue`, `.svelte`, `.astro`, `.scss`, `.sass`, `.less`), PowerShell
-  modules and manifests (`.psm1`, `.psd1`), Windows and .NET project files (`.sln`, `.csproj`,
-  `.vbproj`, `.vcxproj`, `.props`, `.targets`, `.resx`, `.nuspec`, `.manifest`), other build files
-  (`.cmake`, `.mk`, `.gradle`), and plain-text data (`.diff`, `.patch`, `.reg`, `.po`, `.srt`,
-  `.vtt`, `.ics`).
-- Preview PEM-armored key and certificate files (`.pem`, `.crt`, `.cer`, `.csr`, `.key`, `.pub`,
-  `.ppk`, `.asc`) and extensionless OpenSSH key files.
-- Recognize more exact filenames, including `AUTHORS`, `CONTRIBUTING`, `CHANGELOG`, `CODEOWNERS`,
-  `VERSION`, `Rakefile`, `Procfile`, `Justfile`, `Jenkinsfile`, `.gitmodules`, and `.nvmrc`.
-- Preview header-verified MPEG-4/QuickTime/3GPP (`.mp4`, `.m4v`, `.mov`, `.mp4v`, `.3g2`, `.3gp`,
-  `.3gp2`, `.3gpp`), AVI (`.avi`), and ASF (`.asf`, `.wmv`) video containers through native
-  Windows playback.
+- Extend text previews to documentation markup (`.markdown`, `.mdx`, `.rst`, `.adoc`, `.tex`), more structured data (`.json5`, `.jsonl`, `.ndjson`, `.plist`, `.config`, `.hcl`, `.tf`, `.tfvars`, `.proto`, `.graphql`), more languages (`.vb`, `.fs`, `.scala`, `.groovy`, `.swift`, `.dart`, `.lua`, `.r`), web tooling (`.vue`, `.svelte`, `.astro`, `.scss`, `.sass`, `.less`), PowerShell modules and manifests (`.psm1`, `.psd1`), Windows and .NET project files (`.sln`, `.csproj`, `.vbproj`, `.vcxproj`, `.props`, `.targets`, `.resx`, `.nuspec`, `.manifest`), other build files (`.cmake`, `.mk`, `.gradle`), and plain-text data (`.diff`, `.patch`, `.reg`, `.po`, `.srt`, `.vtt`, `.ics`).
+- Preview PEM-armored key and certificate files (`.pem`, `.crt`, `.cer`, `.csr`, `.key`, `.pub`, `.ppk`, `.asc`) and extensionless OpenSSH key files.
+- Recognize more exact filenames, including `AUTHORS`, `CONTRIBUTING`, `CHANGELOG`, `CODEOWNERS`, `VERSION`, `Rakefile`, `Procfile`, `Justfile`, `Jenkinsfile`, `.gitmodules`, and `.nvmrc`.
+- Preview header-verified MPEG-4/QuickTime/3GPP (`.mp4`, `.m4v`, `.mov`, `.mp4v`, `.3g2`, `.3gp`, `.3gp2`, `.3gpp`), AVI (`.avi`), and ASF (`.asf`, `.wmv`) video containers through native Windows playback.
 
 ### Changed
 
-- Reveal video as soon as its verified player and preview surface are ready instead of waiting on a
-  fixed 400 ms preroll.
-- Retain one balanced Media Foundation platform session across hover players instead of restarting
-  the platform for every video.
+- Reveal video as soon as its verified player and preview surface are ready instead of waiting on a fixed 400 ms preroll.
+- Retain one balanced Media Foundation platform session across hover players instead of restarting the platform for every video.
 
 ### Security
 
-- Document that key, certificate, and registry previews put secret material on the display, and that
-  binary variants of newly eligible names still fail the content check.
+- Document that key, certificate, and registry previews put secret material on the display, and that binary variants of newly eligible names still fail the content check.
 
 ## [0.2.2] - 2026-07-29
 
@@ -123,6 +113,7 @@ This patch release restores the notification-area menu when CursorPeek is right-
 
 Version 0.1 is intentionally narrow. See [Known limitations](docs/KNOWN_LIMITATIONS.md) before installing or running this release.
 
+[0.3.0]: https://github.com/lownamlee/CursorPeek/releases/tag/v0.3.0
 [0.2.2]: https://github.com/lownamlee/CursorPeek/releases/tag/v0.2.2
 [0.2.1]: https://github.com/lownamlee/CursorPeek/releases/tag/v0.2.1
 [0.2.0]: https://github.com/lownamlee/CursorPeek/releases/tag/v0.2.0
