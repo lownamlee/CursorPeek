@@ -764,11 +764,13 @@ mod tests {
                 extension.to_ascii_uppercase()
             ))));
         }
+        // `.svg` is eligible for the text provider only; the raster decoder must never claim it.
         for path in [
             "sample",
             "sample.apng",
             "sample.avif",
             "sample.svg",
+            "sample.svgz",
             "sample.txt",
         ] {
             assert!(!is_eligible_path(Path::new(path)));

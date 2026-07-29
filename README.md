@@ -145,17 +145,25 @@ settings, and uninstall details.
 | Type | Supported extensions or filenames |
 | --- | --- |
 | **Images** | `.jpg`, `.jpeg`, `.jpe`, `.jfif`, `.png`, `.gif`, `.webp`, `.bmp`, `.dib`, `.ico`, `.tif`, `.tiff` |
-| **Text, logs, and markup** | `.txt`, `.text`, `.log`, `.md` |
-| **Data and configuration** | `.csv`, `.tsv`, `.json`, `.jsonc`, `.xml`, `.yaml`, `.yml`, `.toml`, `.ini`, `.cfg`, `.conf`, `.properties` |
+| **Text, logs, and markup** | `.txt`, `.text`, `.log`, `.md`, `.markdown`, `.mdx`, `.rst`, `.adoc`, `.tex`, `.svg` |
+| **Data and configuration** | `.csv`, `.tsv`, `.json`, `.jsonc`, `.json5`, `.jsonl`, `.ndjson`, `.xml`, `.plist`, `.yaml`, `.yml`, `.toml`, `.ini`, `.cfg`, `.conf`, `.config`, `.properties`, `.hcl`, `.tf`, `.tfvars`, `.proto`, `.graphql` |
 | **C and C++** | `.c`, `.h`, `.cc`, `.cpp`, `.cxx`, `.hh`, `.hpp`, `.hxx`, `.ipp`, `.inl` |
-| **Other source code** | `.rs`, `.cs`, `.java`, `.kt`, `.kts`, `.go`, `.py`, `.pyw`, `.rb`, `.php` |
-| **Web, JavaScript, and TypeScript** | `.js`, `.mjs`, `.cjs`, `.jsx`, `.ts`, `.mts`, `.cts`, `.tsx`, `.html`, `.htm`, `.css` |
-| **Scripts and queries** | `.sql`, `.sh`, `.bash`, `.zsh`, `.ps1`, `.bat`, `.cmd` |
-| **Exact filenames** | `README`, `LICENSE`, `COPYING`, `NOTICE`, `Makefile`, `Dockerfile`, `Gemfile`, `.env`, `.editorconfig`, `.gitattributes`, `.gitignore`, `.dockerignore`, `.npmrc`, `.prettierrc`, `.prettierignore`, `.eslintrc`, `.eslintignore` |
+| **Other source code** | `.rs`, `.cs`, `.vb`, `.fs`, `.java`, `.kt`, `.kts`, `.scala`, `.groovy`, `.go`, `.swift`, `.dart`, `.py`, `.pyw`, `.rb`, `.php`, `.lua`, `.r` |
+| **Web, JavaScript, and TypeScript** | `.js`, `.mjs`, `.cjs`, `.jsx`, `.ts`, `.mts`, `.cts`, `.tsx`, `.vue`, `.svelte`, `.astro`, `.html`, `.htm`, `.css`, `.scss`, `.sass`, `.less` |
+| **Scripts and queries** | `.sql`, `.sh`, `.bash`, `.zsh`, `.ps1`, `.psm1`, `.psd1`, `.bat`, `.cmd` |
+| **Projects and build files** | `.sln`, `.csproj`, `.vbproj`, `.vcxproj`, `.props`, `.targets`, `.resx`, `.nuspec`, `.manifest`, `.cmake`, `.mk`, `.gradle` |
+| **Keys and certificates** | `.pem`, `.crt`, `.cer`, `.csr`, `.key`, `.pub`, `.ppk`, `.asc` |
+| **Patches, registry, and other data** | `.diff`, `.patch`, `.reg`, `.po`, `.srt`, `.vtt`, `.ics` |
+| **Exact filenames** | `README`, `LICENSE`, `COPYING`, `NOTICE`, `AUTHORS`, `CONTRIBUTING`, `CHANGELOG`, `CODEOWNERS`, `VERSION`, `Makefile`, `Dockerfile`, `Gemfile`, `Rakefile`, `Procfile`, `Justfile`, `Jenkinsfile`, `.env`, `.editorconfig`, `.gitattributes`, `.gitignore`, `.gitmodules`, `.dockerignore`, `.npmrc`, `.nvmrc`, `.prettierrc`, `.prettierignore`, `.eslintrc`, `.eslintignore`, `id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519`, `known_hosts`, `authorized_keys` |
 
-Matching is case-insensitive. Images and text are validated before previewing. See the
-[format reference](docs/USER_GUIDE.md#supported-images) and
+Matching is case-insensitive. Images and text are validated before previewing. Everything outside
+the **Images** row is shown as inert source text — `.svg` is not rasterized, and markup, projects,
+and patches are not rendered. See the [format reference](docs/USER_GUIDE.md#supported-images) and
 [known limitations](docs/KNOWN_LIMITATIONS.md) for behavior and limits.
+
+> [!WARNING]
+> Key, certificate, and secrets files are eligible, so hovering one displays its contents. CursorPeek
+> never uploads anything, but pause or exit it before screen sharing or recording.
 
 ## ⚙️ Settings
 

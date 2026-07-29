@@ -4,6 +4,27 @@ This file records user-visible changes to CursorPeek. Release dates are added on
 
 ## Unreleased
 
+### Added
+
+- Preview `.svg` files as inert markup source text through the existing contained text provider.
+- Extend text previews to documentation markup (`.markdown`, `.mdx`, `.rst`, `.adoc`, `.tex`), more
+  structured data (`.json5`, `.jsonl`, `.ndjson`, `.plist`, `.config`, `.hcl`, `.tf`, `.tfvars`,
+  `.proto`, `.graphql`), more languages (`.vb`, `.fs`, `.scala`, `.groovy`, `.swift`, `.dart`,
+  `.lua`, `.r`), web tooling (`.vue`, `.svelte`, `.astro`, `.scss`, `.sass`, `.less`), PowerShell
+  modules and manifests (`.psm1`, `.psd1`), Windows and .NET project files (`.sln`, `.csproj`,
+  `.vbproj`, `.vcxproj`, `.props`, `.targets`, `.resx`, `.nuspec`, `.manifest`), other build files
+  (`.cmake`, `.mk`, `.gradle`), and plain-text data (`.diff`, `.patch`, `.reg`, `.po`, `.srt`,
+  `.vtt`, `.ics`).
+- Preview PEM-armored key and certificate files (`.pem`, `.crt`, `.cer`, `.csr`, `.key`, `.pub`,
+  `.ppk`, `.asc`) and extensionless OpenSSH key files.
+- Recognize more exact filenames, including `AUTHORS`, `CONTRIBUTING`, `CHANGELOG`, `CODEOWNERS`,
+  `VERSION`, `Rakefile`, `Procfile`, `Justfile`, `Jenkinsfile`, `.gitmodules`, and `.nvmrc`.
+
+### Security
+
+- Document that key, certificate, and registry previews put secret material on the display, and that
+  binary variants of newly eligible names still fail the content check.
+
 ## [0.2.2] - 2026-07-29
 
 This patch shortens the preview wait and adds opt-in diagnostics for investigating Explorer performance.

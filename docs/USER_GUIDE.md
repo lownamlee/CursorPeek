@@ -85,17 +85,26 @@ the image.
 Eligible extensions:
 
 ```text
-txt text log md csv tsv json jsonc xml yaml yml toml ini cfg conf properties
-rs c h cc cpp cxx hh hpp hxx ipp inl cs java kt kts go py pyw rb php
-js mjs cjs jsx ts mts cts tsx html htm css sql sh bash zsh ps1 bat cmd
+txt text log md markdown mdx rst adoc tex svg
+csv tsv json jsonc json5 jsonl ndjson xml plist yaml yml toml ini cfg conf config
+properties hcl tf tfvars proto graphql
+rs c h cc cpp cxx hh hpp hxx ipp inl cs vb fs java kt kts scala groovy go swift
+dart py pyw rb php lua r
+js mjs cjs jsx ts mts cts tsx vue svelte astro html htm css scss sass less
+sql sh bash zsh ps1 psm1 psd1 bat cmd
+sln csproj vbproj vcxproj props targets resx nuspec manifest cmake mk gradle
+pem crt cer csr key pub ppk asc
+diff patch reg po srt vtt ics
 ```
 
 Eligible exact filenames:
 
 ```text
-README LICENSE COPYING NOTICE Makefile Dockerfile Gemfile
-.env .editorconfig .gitattributes .gitignore .dockerignore .npmrc
-.prettierrc .prettierignore .eslintrc .eslintignore
+README LICENSE COPYING NOTICE AUTHORS CONTRIBUTING CHANGELOG CODEOWNERS VERSION
+Makefile Dockerfile Gemfile Rakefile Procfile Justfile Jenkinsfile
+.env .editorconfig .gitattributes .gitignore .gitmodules .dockerignore
+.npmrc .nvmrc .prettierrc .prettierignore .eslintrc .eslintignore
+id_rsa id_dsa id_ecdsa id_ed25519 known_hosts authorized_keys
 ```
 
 Filename matching is case-insensitive. A file must still pass the binary-content checks.
@@ -105,9 +114,19 @@ apply, the default `auto` policy may select a supported legacy encoding. Guessed
 identified in the preview. Invalid sequences, binary-looking content, and unsupported encodings
 fail closed.
 
+`.svg` belongs to this text group, not to the image group. CursorPeek shows the SVG markup as
+source text and never rasterizes it, so no vector renderer runs, no font is resolved, and no
+referenced script, image, or stylesheet is fetched. Compressed `.svgz` is gzip rather than markup
+and is not eligible.
+
+An eligible extension never implies a parser. Project, patch, registry, subtitle, property-list,
+and certificate files are read as bytes and decoded as text; nothing in them is interpreted. Binary
+variants of these names — a `bplist00` property list, a DER-encoded `.cer`, a `.pfx` container —
+fail the content check and show nothing.
+
 Text is normalized and displayed as inert plain text:
 
-- HTML and Markdown are not rendered;
+- HTML, SVG, and Markdown are not rendered;
 - scripts and terminal escape sequences are not executed;
 - unsafe control and bidirectional formatting characters are neutralized;
 - tabs are retained and hard line endings are normalized;
@@ -117,9 +136,12 @@ Text is normalized and displayed as inert plain text:
 The popup measures the rendered text and shrinks to fit short or empty files. The selected preview
 size remains the maximum for longer content, and file details appear beneath the text.
 
-Previewing a sensitive text file, including `.env`, displays its content on your screen. CursorPeek
-does not upload that content, but you should pause or exit CursorPeek when screen sharing or when
-other people can see the display.
+Previewing a sensitive text file displays its content on your screen. This includes `.env`, private
+keys and certificates (`.pem`, `.key`, `.ppk`, `.asc`, `id_rsa` and friends), and `.reg` exports.
+CursorPeek is local and does not upload that content, but hovering such a file puts it on the
+display: pause or exit CursorPeek when screen sharing, recording, presenting, or when other people
+can see the screen. **Pause** is the quickest option and is not persisted, so it lasts only until
+you resume or restart CursorPeek.
 
 ## Files that intentionally do not preview
 

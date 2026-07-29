@@ -240,7 +240,7 @@ mod tests {
     use cursorpeek_core::protocol::DEFAULT_PREVIEW_CACHE_ENTRIES;
     use std::{
         env, fs,
-        path::PathBuf,
+        path::{Path, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
     };
 
@@ -281,6 +281,17 @@ mod tests {
             encoding: "UTF-8".to_owned(),
             text: text.to_owned(),
         })
+    }
+
+    #[test]
+    fn svg_selects_the_text_provider_instead_of_the_raster_image_decoder() {
+        for path in [r"C:\logo.svg", r"C:\logo.SVG"] {
+            assert_eq!(
+                PreviewProvider::for_path(Path::new(path)),
+                Some(PreviewProvider::Text)
+            );
+        }
+        assert_eq!(PreviewProvider::for_path(Path::new(r"C:\logo.svgz")), None);
     }
 
     #[test]

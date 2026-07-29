@@ -24,6 +24,13 @@ locality, format, or resource checks cannot be satisfied safely.
   deterministic first image, and TIFF uses a deterministic first page.
 - Text is inert plain text. CursorPeek does not render Markdown or HTML, apply syntax highlighting,
   follow links, execute scripts, or provide an editor.
+- `.svg` previews as markup source text. CursorPeek does not rasterize vector graphics, and
+  gzip-compressed `.svgz` does not preview at all.
+- Project, patch, registry, property-list, subtitle, and certificate types preview as source text
+  only. Nothing is parsed or interpreted, and binary variants of those names — `bplist00` property
+  lists, DER-encoded `.cer`, `.pfx`/`.p12`/`.jks` containers — fail the content check.
+- Exact filenames match the whole name, so suffixed variants such as `Dockerfile.prod`,
+  `Makefile.am`, and `.env.local` do not preview.
 - Large images and text are bounded or truncated to the documented limits. CursorPeek does not
   expose a control for bypassing those safety limits.
 - The preview is temporary and non-interactive. It cannot be pinned, copied from, zoomed, scrolled,
@@ -57,8 +64,10 @@ locality, format, or resource checks cannot be satisfied safely.
   sandbox.
 - A process already running as the same user, a compromised Windows installation, malicious
   drivers, and executable replacement are outside the security boundary.
-- Previewing an eligible secrets file displays its content on screen. Pause or exit CursorPeek
-  before screen sharing or when another person can see the display.
+- Previewing an eligible secrets file displays its content on screen. Eligible types deliberately
+  include `.env`, PEM-armored keys and certificates, OpenSSH key files, and `.reg` exports, because
+  previews are local and shown only to the person at the keyboard. Pause or exit CursorPeek before
+  screen sharing, recording, or when another person can see the display.
 
 See the [user guide](USER_GUIDE.md) for supported formats and troubleshooting, and the
 [threat model](../THREAT_MODEL.md) for the complete security boundary.

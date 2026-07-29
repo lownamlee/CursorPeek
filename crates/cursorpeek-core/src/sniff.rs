@@ -10,23 +10,48 @@ pub const IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "jpe", "jfif", "png", "gif", "webp", "bmp", "dib", "ico", "tif", "tiff",
 ];
 
+// Every entry is previewed as inert plain text. Nothing here is parsed, rendered, executed, or
+// resolved: markup, project, and patch formats reach the preview as source bytes like any log file.
+// The list is grouped to match the user-guide and README tables; keep all three in the same order.
 pub const TEXT_EXTENSIONS: &[&str] = &[
+    // Text, logs, and markup
     "txt",
     "text",
     "log",
     "md",
+    "markdown",
+    "mdx",
+    "rst",
+    "adoc",
+    "tex",
+    // SVG is XML markup. The text provider previews it as inert source rather than rasterizing it,
+    // so no vector renderer, font lookup, or external reference handling enters the worker.
+    "svg",
+    // Data and configuration
     "csv",
     "tsv",
     "json",
     "jsonc",
+    "json5",
+    "jsonl",
+    "ndjson",
     "xml",
+    // Only textual property lists qualify. A binary `bplist00` payload fails the content check.
+    "plist",
     "yaml",
     "yml",
     "toml",
     "ini",
     "cfg",
     "conf",
+    "config",
     "properties",
+    "hcl",
+    "tf",
+    "tfvars",
+    "proto",
+    "graphql",
+    // Source code
     "rs",
     "c",
     "h",
@@ -39,14 +64,23 @@ pub const TEXT_EXTENSIONS: &[&str] = &[
     "ipp",
     "inl",
     "cs",
+    "vb",
+    "fs",
     "java",
     "kt",
     "kts",
+    "scala",
+    "groovy",
     "go",
+    "swift",
+    "dart",
     "py",
     "pyw",
     "rb",
     "php",
+    "lua",
+    "r",
+    // Web, JavaScript, and TypeScript
     "js",
     "mjs",
     "cjs",
@@ -55,16 +89,58 @@ pub const TEXT_EXTENSIONS: &[&str] = &[
     "mts",
     "cts",
     "tsx",
+    "vue",
+    "svelte",
+    "astro",
     "html",
     "htm",
     "css",
+    "scss",
+    "sass",
+    "less",
+    // Scripts and queries
     "sql",
     "sh",
     "bash",
     "zsh",
     "ps1",
+    "psm1",
+    "psd1",
     "bat",
     "cmd",
+    // Projects and build files
+    "sln",
+    "csproj",
+    "vbproj",
+    "vcxproj",
+    "props",
+    "targets",
+    "resx",
+    "nuspec",
+    "manifest",
+    "cmake",
+    "mk",
+    "gradle",
+    // PEM-armored key and certificate material. These preview their contents like any other text
+    // file, so the user guide's screen-sharing warning covers them. DER-encoded `.cer`/`.crt` and
+    // binary containers such as `.pfx` are rejected by the content check instead.
+    "pem",
+    "crt",
+    "cer",
+    "csr",
+    "key",
+    "pub",
+    "ppk",
+    "asc",
+    // Patches, registry exports, and other plain-text data
+    "diff",
+    "patch",
+    // Registry exports are usually UTF-16 LE with a BOM, which the text decoder already handles.
+    "reg",
+    "po",
+    "srt",
+    "vtt",
+    "ics",
 ];
 
 pub const TEXT_NAMES: &[&str] = &[
@@ -72,19 +148,37 @@ pub const TEXT_NAMES: &[&str] = &[
     "LICENSE",
     "COPYING",
     "NOTICE",
+    "AUTHORS",
+    "CONTRIBUTING",
+    "CHANGELOG",
+    "CODEOWNERS",
+    "VERSION",
     "Makefile",
     "Dockerfile",
     "Gemfile",
+    "Rakefile",
+    "Procfile",
+    "Justfile",
+    "Jenkinsfile",
     ".env",
     ".editorconfig",
     ".gitattributes",
     ".gitignore",
+    ".gitmodules",
     ".dockerignore",
     ".npmrc",
+    ".nvmrc",
     ".prettierrc",
     ".prettierignore",
     ".eslintrc",
     ".eslintignore",
+    // Extensionless OpenSSH key material, previewed under the same policy as `.pem` and `.key`.
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    "known_hosts",
+    "authorized_keys",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -302,6 +396,79 @@ mod tests {
     }
 
     #[test]
+    fn closely_related_extensions_are_each_listed_explicitly() {
+        for path in [
+            "app.conf",
+            "app.config",
+            "module.ps1",
+            "module.psm1",
+            "module.psd1",
+            "Info.plist",
+            "bundle.tf",
+            "bundle.tfvars",
+        ] {
+            assert!(is_text_eligible_path(Path::new(path)), "{path}");
+        }
+    }
+
+    // Eligibility here is a deliberate product decision: previews are local, offline, and shown
+    // only to the person at the keyboard, so key material is treated like `.env`.
+    #[test]
+    fn pem_armored_key_material_is_eligible_by_policy() {
+        for path in [
+            "server.pem",
+            "server.crt",
+            "server.cer",
+            "server.csr",
+            "server.key",
+            "id_ed25519.pub",
+            "putty.ppk",
+            "release.asc",
+            "id_rsa",
+            "id_ed25519",
+            "known_hosts",
+            "authorized_keys",
+        ] {
+            assert!(is_text_eligible_path(Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn deliberate_text_exclusions_stay_ineligible() {
+        for path in [
+            // Compressed markup rather than markup.
+            "logo.svgz",
+            // Exact names match the whole file name; suffixed variants are out of scope.
+            "Dockerfile.prod",
+            "Makefile.am",
+            ".env.local",
+            // Only the final extension is considered.
+            "archive.tar.gz",
+            // Binary key containers, unlike their PEM-armored counterparts.
+            "store.pfx",
+            "store.p12",
+            "store.jks",
+            // Formats that need a parser the worker does not have.
+            "report.pdf",
+            "book.docx",
+            "notes.rtf",
+        ] {
+            assert!(!is_text_eligible_path(Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn svg_markup_is_text_eligible_and_never_image_eligible() {
+        for path in ["logo.svg", "logo.SVG"] {
+            assert!(is_text_eligible_path(Path::new(path)));
+            assert!(!is_image_eligible_path(Path::new(path)));
+        }
+        // Compressed SVG is gzip, not markup, and stays outside both providers.
+        assert!(!is_text_eligible_path(Path::new("logo.svgz")));
+        assert!(!is_image_eligible_path(Path::new("logo.svgz")));
+    }
+
+    #[test]
     fn binary_signatures_and_null_noise_fail_closed() {
         assert_eq!(classify_text_prefix(b"\x89PNG\r\n\x1a\n", false), None);
         assert_eq!(
@@ -309,6 +476,16 @@ mod tests {
             Some(TextByteKind::Utf16LeLikely)
         );
         assert_eq!(classify_text_prefix(b"\0\0\0\0\0\0\0\0", false), None);
+        // Binary variants of newly eligible extensions still fail the content check: a `bplist00`
+        // property list and a DER-encoded certificate are rejected despite `.plist`/`.cer` names.
+        assert_eq!(
+            classify_text_prefix(b"bplist00\x00\x08\x00\x00\x00\x00\x00\x01", false),
+            None
+        );
+        assert_eq!(
+            classify_text_prefix(b"\x30\x82\x01\x0a\x02\x82\x01\x01\x00", false),
+            None
+        );
     }
 
     #[test]
