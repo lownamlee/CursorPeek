@@ -17,7 +17,7 @@ use crate::{
 use cursorpeek_core::{
     ExplorerWindowId,
     layout::fit_dimensions,
-    payload::{ImageFormat, VideoPreview},
+    payload::{AnimatedGifFrame, AnimatedGifPreview, ImageFormat, VideoPreview},
 };
 
 use super::explorer::is_explorer_infotip_window;
@@ -118,6 +118,7 @@ const VIDEO_AUDIO_FADE_TIMER_ID: usize = 2;
 const VIDEO_AUDIO_FADE_INTERVAL_MS: u32 = 20;
 const VIDEO_AUDIO_FADE_STEPS: u8 = 8;
 const VIDEO_FRAME_FADE_MS: u32 = 180;
+const GIF_FRAME_TIMER_ID: usize = 4;
 const MAX_Z_ORDER_SCAN: usize = 64;
 
 pub(crate) struct PreviewWindow {
@@ -188,6 +189,7 @@ impl PreviewWindow {
         size: PreviewSize,
         preview: &TextPreview,
     ) -> Result<PreviewPlacement> {
+        self.stop_gif_animation();
         self.stop_video();
         self.show(
             anchor,
@@ -202,12 +204,52 @@ impl PreviewWindow {
         size: PreviewSize,
         preview: ImagePreview,
     ) -> Result<PreviewPlacement> {
+        self.stop_gif_animation();
         self.stop_video();
         self.show(
             anchor,
             size,
             Some(RetainedContent::Image(ImageContent::from_preview(preview))),
         )
+    }
+
+    pub(crate) fn show_animated_gif_at(
+        &self,
+        anchor: PhysicalScreenPoint,
+        size: PreviewSize,
+        gif: AnimatedGifPreview,
+    ) -> Result<PreviewPlacement> {
+        self.stop_video();
+        self.stop_gif_animation();
+        let first = gif
+            .frames
+            .first()
+            .ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
+        let image = ImagePreview {
+            file_size: gif.file_size,
+            last_write_time: gif.last_write_time,
+            linked_content: gif.linked_content,
+            first_frame_only: false,
+            display_name: gif.display_name,
+            format: ImageFormat::Gif,
+            source_width: gif.source_width,
+            source_height: gif.source_height,
+            width: gif.width,
+            height: gif.height,
+            premultiplied_bgra: first.premultiplied_bgra.clone(),
+        };
+        let placement = self.show(
+            anchor,
+            size,
+            Some(RetainedContent::Image(ImageContent::from_preview(image))),
+        )?;
+        let first_delay = self.state.borrow_mut().begin_gif_animation(gif.frames)?;
+        // SAFETY: This live preview HWND owns the fixed animation timer identifier.
+        if unsafe { SetTimer(Some(self.hwnd), GIF_FRAME_TIMER_ID, first_delay, None) } == 0 {
+            self.stop_gif_animation();
+            return Err(Error::from_thread());
+        }
+        Ok(placement)
     }
 
     pub(crate) fn show_video_at(
@@ -218,6 +260,7 @@ impl PreviewWindow {
         play_audio: bool,
         smooth_start: bool,
     ) -> Result<PreviewPlacement> {
+        self.stop_gif_animation();
         let file_lock = crate::worker::video::lock_for_playback(&preview.path)
             .map_err(|_| Error::from_hresult(E_INVALIDARG))?;
         let thumbnail = shell_video_thumbnail(&preview).ok();
@@ -306,6 +349,12 @@ impl PreviewWindow {
         self.state.borrow_mut().cancel_audio_fade();
         self.state.borrow_mut().cancel_video_fade();
         self.video_player.borrow_mut().take();
+    }
+
+    fn stop_gif_animation(&self) {
+        // SAFETY: Killing an absent timer is benign; this HWND remains live for the UI-thread call.
+        let _ = unsafe { KillTimer(Some(self.hwnd), GIF_FRAME_TIMER_ID) };
+        self.state.borrow_mut().cancel_gif_animation();
     }
 
     fn start_audio_fade_timer(&self) -> Result<()> {
@@ -463,6 +512,7 @@ impl PreviewWindow {
     }
 
     pub(crate) fn hide(&self) -> Result<()> {
+        self.stop_gif_animation();
         self.stop_video();
         // SAFETY: The live HWND belongs to this UI thread. The flags hide it without changing
         // position, size, Z order, or activation.
@@ -1051,6 +1101,8 @@ struct PreviewWindowState {
     audio_fade_player: Option<IMFPMediaPlayer>,
     audio_fade_step: u8,
     video_fade_window: Option<HWND>,
+    gif_frames: Vec<AnimatedGifFrame>,
+    gif_frame_index: usize,
     #[cfg(test)]
     force_recreate_target: bool,
 }
@@ -1087,6 +1139,8 @@ impl PreviewWindowState {
             audio_fade_player: None,
             audio_fade_step: 0,
             video_fade_window: None,
+            gif_frames: Vec::new(),
+            gif_frame_index: 0,
             #[cfg(test)]
             force_recreate_target: false,
         })
@@ -1174,6 +1228,40 @@ impl PreviewWindowState {
 
     fn cancel_video_fade(&mut self) {
         self.video_fade_window = None;
+    }
+
+    fn begin_gif_animation(&mut self, frames: Vec<AnimatedGifFrame>) -> Result<u32> {
+        if frames.len() < 2 {
+            return Err(Error::from_hresult(E_INVALIDARG));
+        }
+        let first_delay = frames[0].delay_ms;
+        self.gif_frames = frames;
+        self.gif_frame_index = 0;
+        Ok(first_delay)
+    }
+
+    fn advance_gif_animation(&mut self) -> Option<u32> {
+        if self.gif_frames.len() < 2 {
+            return None;
+        }
+        self.gif_frame_index = (self.gif_frame_index + 1) % self.gif_frames.len();
+        let frame = &self.gif_frames[self.gif_frame_index];
+        let RetainedContent::Image(content) = self.content.as_mut()? else {
+            self.cancel_gif_animation();
+            return None;
+        };
+        content
+            .preview
+            .premultiplied_bgra
+            .clone_from(&frame.premultiplied_bgra);
+        self.image_bitmap = None;
+        self.last_paint_error = None;
+        Some(frame.delay_ms)
+    }
+
+    fn cancel_gif_animation(&mut self) {
+        self.gif_frames.clear();
+        self.gif_frame_index = 0;
     }
 
     fn content_client_pixel_size(&self, maximum: PreviewSize) -> Result<D2D_SIZE_U> {
@@ -2427,6 +2515,27 @@ fn dispatch_preview_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
         return LRESULT(0);
     }
 
+    if message == WM_TIMER && wparam.0 == GIF_FRAME_TIMER_ID {
+        // SAFETY: Consume and reschedule the private variable-delay animation timer.
+        let _ = unsafe { KillTimer(Some(hwnd), GIF_FRAME_TIMER_ID) };
+        let next_delay =
+            preview_state(hwnd).and_then(|state| state.borrow_mut().advance_gif_animation());
+        if let Some(delay) = next_delay {
+            // SAFETY: The live preview HWND owns this bounded animation timer.
+            let _ = unsafe { SetTimer(Some(hwnd), GIF_FRAME_TIMER_ID, delay, None) };
+            // SAFETY: The retained frame buffer was updated on this UI thread; redraw it now.
+            let _ = unsafe {
+                RedrawWindow(
+                    Some(hwnd),
+                    None,
+                    None,
+                    RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW,
+                )
+            };
+        }
+        return LRESULT(0);
+    }
+
     if message == WM_DPICHANGED {
         let result = (|| {
             let dpi = u32::from((wparam.0 & 0xffff) as u16);
@@ -2551,8 +2660,8 @@ fn preview_state(hwnd: HWND) -> Option<&'static RefCell<PreviewWindowState>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContentLayouts, D2D_SIZE_U, MAX_Z_ORDER_SCAN, PreviewColors, PreviewWindow,
-        PreviewWindowState, RetainedContent, TextContent, VIDEO_PREROLL_TIMER_ID,
+        ContentLayouts, D2D_SIZE_U, GIF_FRAME_TIMER_ID, MAX_Z_ORDER_SCAN, PreviewColors,
+        PreviewWindow, PreviewWindowState, RetainedContent, TextContent, VIDEO_PREROLL_TIMER_ID,
         adjusted_window_pixel_size, checked_image_layout, checked_window_rect, client_pixel_size,
         color_from_colorref, format_file_size, format_media_duration, image_client_pixel_size,
         image_destination_rect, image_preview_metadata, media_foundation_path, rectangles_overlap,
@@ -2565,7 +2674,7 @@ mod tests {
         settings::Theme,
         worker::{ImageFormat, ImagePreview, TextPreview, image_corpus_previews},
     };
-    use cursorpeek_core::payload::VideoPreview;
+    use cursorpeek_core::payload::{AnimatedGifFrame, AnimatedGifPreview, VideoPreview};
     use std::{env, os::windows::ffi::OsStrExt, path::PathBuf, thread};
     use windows::Win32::{
         Foundation::{HWND, LPARAM, RECT, WPARAM},
@@ -3147,6 +3256,68 @@ mod tests {
         let mut straight_alpha = preview;
         straight_alpha.premultiplied_bgra[2] = 41;
         assert_eq!(checked_image_layout(&straight_alpha), None);
+    }
+
+    #[test]
+    fn animated_gif_timer_advances_and_loops_composited_frames() {
+        let _apartment = ComApartment::initialize(ApartmentKind::SingleThreaded)
+            .expect("the test thread should initialize COM");
+        let window = PreviewWindow::create().expect("the preview window should be created");
+        let gif = AnimatedGifPreview {
+            file_size: 512,
+            last_write_time: 133_000_000_000_000_000,
+            linked_content: false,
+            display_name: "animated.gif".to_owned(),
+            source_width: 2,
+            source_height: 1,
+            width: 2,
+            height: 1,
+            frames: vec![
+                AnimatedGifFrame {
+                    delay_ms: 40,
+                    premultiplied_bgra: vec![10, 10, 10, 255, 10, 10, 10, 255],
+                },
+                AnimatedGifFrame {
+                    delay_ms: 60,
+                    premultiplied_bgra: vec![20, 20, 20, 255, 20, 20, 20, 255],
+                },
+            ],
+        };
+        window
+            .show_animated_gif_at(
+                PhysicalScreenPoint::new(100, 100),
+                PreviewSize::new(320, 240),
+                gif,
+            )
+            .expect("the GIF preview should render");
+        let pixels = || {
+            let state = window.state.borrow();
+            let Some(RetainedContent::Image(content)) = state.content.as_ref() else {
+                panic!("animated GIF should use retained image content");
+            };
+            content.preview.premultiplied_bgra.clone()
+        };
+        assert_eq!(pixels()[0], 10);
+        // SAFETY: Deliver the private timer synchronously to the live preview HWND.
+        unsafe {
+            SendMessageW(
+                window.handle(),
+                WM_TIMER,
+                Some(WPARAM(GIF_FRAME_TIMER_ID)),
+                Some(LPARAM(0)),
+            )
+        };
+        assert_eq!(pixels()[0], 20);
+        // SAFETY: A second private timer tick loops back to the first composited frame.
+        unsafe {
+            SendMessageW(
+                window.handle(),
+                WM_TIMER,
+                Some(WPARAM(GIF_FRAME_TIMER_ID)),
+                Some(LPARAM(0)),
+            )
+        };
+        assert_eq!(pixels()[0], 10);
     }
 
     #[test]

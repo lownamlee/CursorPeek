@@ -1194,6 +1194,7 @@ fn preview_result_kind(result: &PreviewResult) -> &'static str {
         PreviewResult::Text(_) => "text",
         PreviewResult::Image(_) => "image",
         PreviewResult::Video(_) => "video",
+        PreviewResult::AnimatedGif(_) => "animated_gif",
     }
 }
 

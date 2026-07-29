@@ -4,7 +4,7 @@ use std::{error::Error, fmt, io::BufReader};
 pub(super) mod corpus;
 
 use ::image::{
-    DynamicImage, ImageDecoder, ImageError, ImageFormat as DecoderFormat, Limits,
+    AnimationDecoder, DynamicImage, ImageDecoder, ImageError, ImageFormat as DecoderFormat, Limits,
     codecs::{
         bmp::BmpDecoder, gif::GifDecoder, ico::IcoDecoder, jpeg::JpegDecoder, png::PngDecoder,
         tiff::TiffDecoder, webp::WebPDecoder,
@@ -17,6 +17,7 @@ use cursorpeek_core::sniff::IMAGE_EXTENSIONS;
 pub(super) use cursorpeek_core::sniff::is_image_eligible_path as is_eligible_path;
 use cursorpeek_core::{
     layout::{LayoutError, checked_bgra_layout as core_checked_bgra_layout},
+    payload::{AnimatedGifFrame, AnimatedGifPreview, MAX_ANIMATED_GIF_FRAMES},
     sniff::sniff_image_format,
 };
 
@@ -33,6 +34,8 @@ const MAGIC_PREFIX_LEN: usize = 16;
 const MAX_IMAGE_FILE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_DECODED_IMAGE_BYTES: u64 = 160 * 1024 * 1024;
 const MAX_DECODER_ALLOC_BYTES: u64 = 256 * 1024 * 1024;
+const ANIMATED_GIF_MAX_AXIS: u32 = 320;
+const MAX_SOURCE_GIF_FRAMES: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ValidatedImage {
@@ -155,6 +158,7 @@ fn premultiply_rgba(pixels: &mut ::image::RgbaImage) {
 #[derive(Debug)]
 pub(super) enum ImageDecodeResult {
     Decoded(DecodedImage),
+    AnimatedGif(AnimatedGifPreview),
     Unsupported,
 }
 
@@ -198,6 +202,15 @@ pub(super) fn decode(file: &PreviewFile) -> Result<ImageDecodeResult, ImageValid
     let Some((decoder_format, format)) = selected_format(file)? else {
         return Ok(ImageDecodeResult::Unsupported);
     };
+    if decoder_format == DecoderFormat::Gif {
+        let result = decode_gif(file, decoder_limits())?;
+        if !file.is_unchanged()? {
+            return Err(ImageValidationError::File(
+                PreviewFileError::ChangedDuringRead,
+            ));
+        }
+        return Ok(result);
+    }
     let decoded = decode_selected(
         BufReader::new(file.duplicate_reader()?),
         decoder_format,
@@ -210,6 +223,136 @@ pub(super) fn decode(file: &PreviewFile) -> Result<ImageDecodeResult, ImageValid
         ));
     }
     Ok(ImageDecodeResult::Decoded(decoded))
+}
+
+fn decode_gif(
+    file: &PreviewFile,
+    limits: Limits,
+) -> Result<ImageDecodeResult, ImageValidationError> {
+    let mut counting_decoder = GifDecoder::new(BufReader::new(file.duplicate_reader()?))?;
+    counting_decoder.set_limits(limits.clone())?;
+    let (source_width, source_height) = counting_decoder.dimensions();
+    let decoded_bytes = u64::from(source_width)
+        .checked_mul(u64::from(source_height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or(ImageValidationError::ArithmeticOverflow)?;
+    let _metadata = validated_metadata(
+        ImageFormat::Gif,
+        source_width,
+        source_height,
+        decoded_bytes,
+        Orientation::NoTransforms,
+    )?;
+    let total_frames = counting_decoder
+        .into_frames()
+        .take(MAX_SOURCE_GIF_FRAMES + 1)
+        .try_fold(0_usize, |count, frame| {
+            frame?;
+            Ok::<_, ImageError>(count + 1)
+        })?;
+    if total_frames == 1 {
+        return decode_selected(
+            BufReader::new(file.duplicate_reader()?),
+            DecoderFormat::Gif,
+            ImageFormat::Gif,
+            limits,
+        )
+        .map(ImageDecodeResult::Decoded);
+    }
+    if !(2..=MAX_SOURCE_GIF_FRAMES).contains(&total_frames) {
+        return Err(ImageValidationError::PreviewPayloadTooLarge {
+            actual: total_frames,
+        });
+    }
+    let retained_count = total_frames.min(MAX_ANIMATED_GIF_FRAMES);
+    let fixed_overhead = 52_usize
+        .checked_add(file.display_name().len())
+        .ok_or(ImageValidationError::ArithmeticOverflow)?;
+    let bytes_per_frame = MAX_PREVIEW_PAYLOAD_LEN
+        .saturating_sub(fixed_overhead)
+        .checked_div(retained_count)
+        .unwrap_or(0)
+        .saturating_sub(4);
+    let (width, height) = (1..=ANIMATED_GIF_MAX_AXIS)
+        .rev()
+        .find_map(|axis| {
+            let dimensions =
+                cursorpeek_core::layout::fit_dimensions(source_width, source_height, axis, axis)?;
+            let (_, frame_bytes) = checked_bgra_layout(dimensions.0, dimensions.1).ok()?;
+            (frame_bytes <= bytes_per_frame).then_some(dimensions)
+        })
+        .ok_or(ImageValidationError::ArithmeticOverflow)?;
+
+    let selected_indices: Vec<usize> = (0..retained_count)
+        .map(|index| index * (total_frames - 1) / (retained_count - 1))
+        .collect();
+    let mut decoder = GifDecoder::new(BufReader::new(file.duplicate_reader()?))?;
+    decoder.set_limits(limits)?;
+    let mut selected = selected_indices.into_iter().peekable();
+    let mut frames: Vec<AnimatedGifFrame> = Vec::with_capacity(retained_count);
+    for (index, frame) in decoder.into_frames().enumerate() {
+        let frame = frame?;
+        let delay_ms = gif_frame_delay_ms(frame.delay());
+        if selected.peek().copied() != Some(index) {
+            if let Some(previous) = frames.last_mut() {
+                previous.delay_ms = previous.delay_ms.saturating_add(delay_ms).min(60_000);
+            }
+            continue;
+        }
+        selected.next();
+        let mut rgba = frame.into_buffer();
+        if rgba.dimensions() != (source_width, source_height) {
+            return Err(ImageValidationError::DecodedLayoutMismatch {
+                expected_width: source_width,
+                expected_height: source_height,
+                expected_bytes: decoded_bytes,
+                actual_width: rgba.width(),
+                actual_height: rgba.height(),
+                actual_bytes: rgba.as_raw().len(),
+            });
+        }
+        premultiply_rgba(&mut rgba);
+        let pixels = if (width, height) == (source_width, source_height) {
+            rgba
+        } else {
+            imageops::resize(&rgba, width, height, FilterType::Triangle)
+        };
+        let mut premultiplied_bgra = pixels.into_raw();
+        for pixel in premultiplied_bgra.chunks_exact_mut(BGRA_BYTES_PER_PIXEL) {
+            pixel.swap(0, 2);
+        }
+        frames.push(AnimatedGifFrame {
+            delay_ms,
+            premultiplied_bgra,
+        });
+    }
+    if frames.len() != retained_count || selected.peek().is_some() {
+        return Err(ImageValidationError::ArithmeticOverflow);
+    }
+    Ok(ImageDecodeResult::AnimatedGif(AnimatedGifPreview {
+        file_size: file.file_size(),
+        last_write_time: file.last_write_time(),
+        linked_content: file.is_linked_content(),
+        display_name: file.display_name(),
+        source_width,
+        source_height,
+        width,
+        height,
+        frames,
+    }))
+}
+
+fn gif_frame_delay_ms(delay: ::image::Delay) -> u32 {
+    let (numerator, denominator) = delay.numer_denom_ms();
+    if denominator == 0 {
+        100
+    } else {
+        numerator
+            .saturating_add(denominator / 2)
+            .checked_div(denominator)
+            .unwrap_or(100)
+            .clamp(10, 60_000)
+    }
 }
 
 fn selected_format(
@@ -564,8 +707,8 @@ mod tests {
         },
     };
     use image::{
-        DynamicImage, ExtendedColorType, Frame, ImageEncoder, ImageFormat as DecoderFormat, Rgba,
-        RgbaImage,
+        Delay, DynamicImage, ExtendedColorType, Frame, ImageEncoder, ImageFormat as DecoderFormat,
+        Rgba, RgbaImage,
         codecs::{gif::GifEncoder, png::PngEncoder},
         metadata::Orientation,
     };
@@ -659,6 +802,25 @@ mod tests {
             encoder
                 .encode_frames([first, second])
                 .expect("the animated GIF should encode");
+        }
+        output
+    }
+
+    fn long_gif(frame_count: u8) -> Vec<u8> {
+        let frames = (0..frame_count).map(|index| {
+            Frame::from_parts(
+                RgbaImage::from_pixel(2, 1, Rgba([index, 255 - index, 40, 255])),
+                0,
+                0,
+                Delay::from_numer_denom_ms(100, 1),
+            )
+        });
+        let mut output = Vec::new();
+        {
+            let mut encoder = GifEncoder::new(&mut output);
+            encoder
+                .encode_frames(frames)
+                .expect("the long GIF should encode");
         }
         output
     }
@@ -923,21 +1085,43 @@ mod tests {
     }
 
     #[test]
-    fn animated_gif_uses_only_the_first_composited_frame() {
+    fn animated_gif_preserves_composited_frames_and_delays() {
         let root = TestDirectory::new("gif-first-frame");
         let path = root.path().join("animated.gif");
         fs::write(&path, two_frame_gif()).unwrap();
         let file = PreviewFile::open(&path).unwrap();
 
-        let ImageDecodeResult::Decoded(decoded) = decode(&file).unwrap() else {
+        let ImageDecodeResult::AnimatedGif(decoded) = decode(&file).unwrap() else {
             panic!("the animated GIF should decode");
         };
-        assert_eq!((decoded.pixels.width(), decoded.pixels.height()), (2, 1));
-        for pixel in decoded.pixels.to_rgba8().pixels() {
-            assert!(pixel.0[0] > 180);
-            assert!(pixel.0[1] < 40);
-            assert!(pixel.0[2] < 50);
-        }
+        assert_eq!((decoded.width, decoded.height), (2, 1));
+        assert_eq!(decoded.frames.len(), 2);
+        assert!(decoded.frames.iter().all(|frame| frame.delay_ms >= 10));
+        assert_ne!(
+            decoded.frames[0].premultiplied_bgra,
+            decoded.frames[1].premultiplied_bgra
+        );
+    }
+
+    #[test]
+    fn long_gif_sampling_reaches_the_final_frame_before_looping() {
+        let root = TestDirectory::new("gif-full-timeline");
+        let path = root.path().join("long.gif");
+        fs::write(&path, long_gif(70)).unwrap();
+        let file = PreviewFile::open(&path).unwrap();
+        let ImageDecodeResult::AnimatedGif(decoded) = decode(&file).unwrap() else {
+            panic!("the long GIF should decode as animation");
+        };
+        assert_eq!(decoded.frames.len(), 64);
+        assert_eq!(decoded.frames.last().unwrap().premultiplied_bgra[2], 69);
+        assert_eq!(
+            decoded
+                .frames
+                .iter()
+                .map(|frame| u64::from(frame.delay_ms))
+                .sum::<u64>(),
+            7_000
+        );
     }
 
     #[test]

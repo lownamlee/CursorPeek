@@ -1357,6 +1357,9 @@ impl MessageWindow {
         let shown = match result {
             PreviewResult::Text(text) => preview.show_text_at(anchor, self.preview_size, &text),
             PreviewResult::Image(image) => preview.show_image_at(anchor, self.preview_size, image),
+            PreviewResult::AnimatedGif(gif) => {
+                preview.show_animated_gif_at(anchor, self.preview_size, gif)
+            }
             PreviewResult::Video(video) => {
                 let settings = self
                     .settings_document
@@ -1937,6 +1940,7 @@ fn preview_result_kind(result: &PreviewResult) -> &'static str {
         PreviewResult::Text(_) => "text",
         PreviewResult::Image(_) => "image",
         PreviewResult::Video(_) => "video",
+        PreviewResult::AnimatedGif(_) => "animated_gif",
     }
 }
 

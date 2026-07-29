@@ -19,6 +19,7 @@ const RESULT_STATUS: u32 = 0;
 const RESULT_TEXT: u32 = 1;
 const RESULT_IMAGE: u32 = 2;
 const RESULT_VIDEO: u32 = 3;
+const RESULT_ANIMATED_GIF: u32 = 4;
 const STATUS_PAYLOAD_LEN: usize = 8;
 const TEXT_FIXED_LEN: usize = 36;
 const FLAG_LINKED_CONTENT: u32 = 1 << 0;
@@ -29,6 +30,9 @@ const FLAG_IMAGE_FIRST_FRAME_ONLY: u32 = 1 << 1;
 const IMAGE_FLAGS: u32 = FLAG_LINKED_CONTENT | FLAG_IMAGE_FIRST_FRAME_ONLY;
 const VIDEO_FIXED_LEN: usize = 32;
 const VIDEO_FLAGS: u32 = FLAG_LINKED_CONTENT;
+const ANIMATED_GIF_FIXED_LEN: usize = 52;
+const ANIMATED_GIF_FLAGS: u32 = FLAG_LINKED_CONTENT;
+pub const MAX_ANIMATED_GIF_FRAMES: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResolverStatus {
@@ -118,18 +122,38 @@ pub struct VideoPreview {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnimatedGifFrame {
+    pub delay_ms: u32,
+    pub premultiplied_bgra: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnimatedGifPreview {
+    pub file_size: u64,
+    pub last_write_time: i64,
+    pub linked_content: bool,
+    pub display_name: String,
+    pub source_width: u32,
+    pub source_height: u32,
+    pub width: u32,
+    pub height: u32,
+    pub frames: Vec<AnimatedGifFrame>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PreviewResult {
     Status(ResolverStatus),
     Text(TextPreview),
     Image(ImagePreview),
     Video(VideoPreview),
+    AnimatedGif(AnimatedGifPreview),
 }
 
 impl PreviewResult {
     pub const fn status(&self) -> Option<ResolverStatus> {
         match self {
             Self::Status(status) => Some(*status),
-            Self::Text(_) | Self::Image(_) | Self::Video(_) => None,
+            Self::Text(_) | Self::Image(_) | Self::Video(_) | Self::AnimatedGif(_) => None,
         }
     }
 }
@@ -250,6 +274,54 @@ pub fn encode_result(result: &PreviewResult) -> Result<Vec<u8>, PayloadError> {
                 output.extend_from_slice(&unit.to_le_bytes());
             }
         }
+        PreviewResult::AnimatedGif(preview) => {
+            validate_animated_gif(preview)?;
+            let frame_bytes = checked_frame_layout(preview.width, preview.height)?;
+            let frames_bytes = preview
+                .frames
+                .len()
+                .checked_mul(
+                    frame_bytes
+                        .checked_add(4)
+                        .ok_or(PayloadError::LengthOverflow)?,
+                )
+                .ok_or(PayloadError::LengthOverflow)?;
+            let payload_len = ANIMATED_GIF_FIXED_LEN
+                .checked_add(preview.display_name.len())
+                .and_then(|length| length.checked_add(frames_bytes))
+                .ok_or(PayloadError::LengthOverflow)?;
+            ensure_payload_cap(payload_len)?;
+            output.reserve(payload_len);
+            push_u32(&mut output, RESULT_ANIMATED_GIF);
+            push_u32(
+                &mut output,
+                flags(&[(preview.linked_content, FLAG_LINKED_CONTENT)]),
+            );
+            push_u64(&mut output, preview.file_size);
+            push_i64(&mut output, preview.last_write_time);
+            push_u32(&mut output, preview.source_width);
+            push_u32(&mut output, preview.source_height);
+            push_u32(&mut output, preview.width);
+            push_u32(&mut output, preview.height);
+            push_u32(
+                &mut output,
+                u32::try_from(preview.display_name.len())
+                    .expect("the display-name cap fits the wire length"),
+            );
+            push_u32(
+                &mut output,
+                u32::try_from(preview.frames.len()).expect("the frame cap fits the wire length"),
+            );
+            push_u32(
+                &mut output,
+                u32::try_from(frame_bytes).expect("the payload cap fits the wire length"),
+            );
+            output.extend_from_slice(preview.display_name.as_bytes());
+            for frame in &preview.frames {
+                push_u32(&mut output, frame.delay_ms);
+                output.extend_from_slice(&frame.premultiplied_bgra);
+            }
+        }
     }
     Ok(output)
 }
@@ -266,8 +338,66 @@ pub fn decode_result(bytes: &[u8]) -> Result<PreviewResult, PayloadError> {
         RESULT_TEXT => decode_text(bytes),
         RESULT_IMAGE => decode_image(bytes),
         RESULT_VIDEO => decode_video(bytes),
+        RESULT_ANIMATED_GIF => decode_animated_gif(bytes),
         kind => Err(PayloadError::UnknownResultKind(kind)),
     }
+}
+
+fn decode_animated_gif(bytes: &[u8]) -> Result<PreviewResult, PayloadError> {
+    if bytes.len() < ANIMATED_GIF_FIXED_LEN {
+        return Err(PayloadError::PayloadLengthMismatch {
+            kind: "animated GIF",
+            expected: ANIMATED_GIF_FIXED_LEN,
+            actual: bytes.len(),
+        });
+    }
+    let raw_flags = read_u32(bytes, 4);
+    reject_unknown_flags("animated GIF", raw_flags, ANIMATED_GIF_FLAGS)?;
+    let display_name_len = read_u32(bytes, 40) as usize;
+    let frame_count = read_u32(bytes, 44) as usize;
+    let frame_bytes = read_u32(bytes, 48) as usize;
+    let frames_bytes = frame_count
+        .checked_mul(
+            frame_bytes
+                .checked_add(4)
+                .ok_or(PayloadError::LengthOverflow)?,
+        )
+        .ok_or(PayloadError::LengthOverflow)?;
+    let expected = ANIMATED_GIF_FIXED_LEN
+        .checked_add(display_name_len)
+        .and_then(|length| length.checked_add(frames_bytes))
+        .ok_or(PayloadError::LengthOverflow)?;
+    require_exact_length("animated GIF", bytes.len(), expected)?;
+    let display_name_end = ANIMATED_GIF_FIXED_LEN + display_name_len;
+    let display_name = std::str::from_utf8(&bytes[ANIMATED_GIF_FIXED_LEN..display_name_end])
+        .map_err(|_| PayloadError::InvalidDisplayName)?;
+    let mut cursor = display_name_end;
+    let mut frames = Vec::with_capacity(frame_count);
+    for _ in 0..frame_count {
+        let delay_ms = read_u32(bytes, cursor);
+        cursor += 4;
+        let end = cursor
+            .checked_add(frame_bytes)
+            .ok_or(PayloadError::LengthOverflow)?;
+        frames.push(AnimatedGifFrame {
+            delay_ms,
+            premultiplied_bgra: bytes[cursor..end].to_vec(),
+        });
+        cursor = end;
+    }
+    let preview = AnimatedGifPreview {
+        file_size: read_u64(bytes, 8),
+        last_write_time: read_i64(bytes, 16),
+        linked_content: raw_flags & FLAG_LINKED_CONTENT != 0,
+        source_width: read_u32(bytes, 24),
+        source_height: read_u32(bytes, 28),
+        width: read_u32(bytes, 32),
+        height: read_u32(bytes, 36),
+        display_name: display_name.to_owned(),
+        frames,
+    };
+    validate_animated_gif(&preview)?;
+    Ok(PreviewResult::AnimatedGif(preview))
 }
 
 fn decode_video(bytes: &[u8]) -> Result<PreviewResult, PayloadError> {
@@ -548,6 +678,108 @@ fn validate_image(preview: &ImagePreview) -> Result<(), PayloadError> {
     )
 }
 
+fn validate_animated_gif(preview: &AnimatedGifPreview) -> Result<(), PayloadError> {
+    validate_display_name(&preview.display_name)?;
+    if preview.source_width == 0
+        || preview.source_height == 0
+        || preview.source_width > MAX_SOURCE_IMAGE_AXIS
+        || preview.source_height > MAX_SOURCE_IMAGE_AXIS
+    {
+        return Err(PayloadError::InvalidSourceDimensions {
+            width: preview.source_width,
+            height: preview.source_height,
+        });
+    }
+    let source_pixels = u64::from(preview.source_width)
+        .checked_mul(u64::from(preview.source_height))
+        .ok_or(PayloadError::LengthOverflow)?;
+    if source_pixels > MAX_SOURCE_IMAGE_PIXELS {
+        return Err(PayloadError::TooManySourceImagePixels {
+            actual: source_pixels,
+        });
+    }
+    if preview.width == 0
+        || preview.height == 0
+        || preview.width > MAX_PREVIEW_IMAGE_WIDTH
+        || preview.height > MAX_PREVIEW_IMAGE_HEIGHT
+    {
+        return Err(PayloadError::InvalidPreviewDimensions {
+            width: preview.width,
+            height: preview.height,
+        });
+    }
+    if preview.width > preview.source_width || preview.height > preview.source_height {
+        return Err(PayloadError::PreviewUpscalesSource);
+    }
+    let aspect_fit = crate::layout::fit_dimensions(
+        preview.source_width,
+        preview.source_height,
+        preview.width,
+        preview.height,
+    )
+    .ok_or(PayloadError::LengthOverflow)?;
+    if aspect_fit != (preview.width, preview.height) {
+        return Err(PayloadError::NonFittingPreviewDimensions {
+            expected_width: aspect_fit.0,
+            expected_height: aspect_fit.1,
+            actual_width: preview.width,
+            actual_height: preview.height,
+        });
+    }
+    if !(2..=MAX_ANIMATED_GIF_FRAMES).contains(&preview.frames.len()) {
+        return Err(PayloadError::InvalidAnimationFrameCount {
+            actual: preview.frames.len(),
+        });
+    }
+    let frame_bytes = checked_frame_layout(preview.width, preview.height)?;
+    for frame in &preview.frames {
+        if !(10..=60_000).contains(&frame.delay_ms) {
+            return Err(PayloadError::InvalidAnimationDelay(frame.delay_ms));
+        }
+        if frame.premultiplied_bgra.len() != frame_bytes {
+            return Err(PayloadError::InvalidPixelLength {
+                expected: frame_bytes,
+                actual: frame.premultiplied_bgra.len(),
+            });
+        }
+        if let Some((index, _)) = frame
+            .premultiplied_bgra
+            .chunks_exact(BGRA_BYTES_PER_PIXEL)
+            .enumerate()
+            .find(|(_, pixel)| pixel[0] > pixel[3] || pixel[1] > pixel[3] || pixel[2] > pixel[3])
+        {
+            return Err(PayloadError::NonPremultipliedPixel { index });
+        }
+    }
+    let frames_bytes = preview
+        .frames
+        .len()
+        .checked_mul(
+            frame_bytes
+                .checked_add(4)
+                .ok_or(PayloadError::LengthOverflow)?,
+        )
+        .ok_or(PayloadError::LengthOverflow)?;
+    ensure_payload_cap(
+        ANIMATED_GIF_FIXED_LEN
+            .checked_add(preview.display_name.len())
+            .and_then(|length| length.checked_add(frames_bytes))
+            .ok_or(PayloadError::LengthOverflow)?,
+    )
+}
+
+fn checked_frame_layout(width: u32, height: u32) -> Result<usize, PayloadError> {
+    checked_bgra_layout(width, height)
+        .map(|(_, length)| length)
+        .map_err(|error| match error {
+            LayoutError::InvalidDimensions { width, height } => {
+                PayloadError::InvalidPreviewDimensions { width, height }
+            }
+            LayoutError::ArithmeticOverflow => PayloadError::LengthOverflow,
+            LayoutError::PayloadTooLarge { actual } => PayloadError::PayloadTooLarge { actual },
+        })
+}
+
 fn validate_video(preview: &VideoPreview) -> Result<(), PayloadError> {
     validate_display_name(&preview.display_name)?;
     if preview.path.is_empty()
@@ -708,6 +940,10 @@ pub enum PayloadError {
     },
     InvalidDisplayName,
     InvalidVideoPath,
+    InvalidAnimationFrameCount {
+        actual: usize,
+    },
+    InvalidAnimationDelay(u32),
     InvalidSourceDimensions {
         width: u32,
         height: u32,
@@ -798,6 +1034,13 @@ impl fmt::Display for PayloadError {
             ),
             Self::InvalidDisplayName => write!(formatter, "invalid preview display name"),
             Self::InvalidVideoPath => write!(formatter, "invalid preview video path"),
+            Self::InvalidAnimationFrameCount { actual } => write!(
+                formatter,
+                "animated GIF frame count {actual} is outside 2-{MAX_ANIMATED_GIF_FRAMES}"
+            ),
+            Self::InvalidAnimationDelay(delay) => {
+                write!(formatter, "invalid animated GIF frame delay {delay} ms")
+            }
             Self::InvalidSourceDimensions { width, height } => write!(
                 formatter,
                 "invalid source image dimensions {width}x{height}"
@@ -846,11 +1089,12 @@ impl Error for PayloadError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        FLAG_IMAGE_FIRST_FRAME_ONLY, FLAG_TEXT_TRUNCATED, IMAGE_FIXED_LEN, ImageFormat,
-        ImagePreview, MAX_DISPLAY_NAME_UTF8_LEN, MAX_ENCODING_LABEL_LEN, MAX_PREVIEW_IMAGE_WIDTH,
-        MAX_SOURCE_IMAGE_AXIS, MAX_SOURCE_IMAGE_PIXELS, MAX_TEXT_LINES, MAX_TEXT_SCALARS,
-        MAX_TEXT_UTF8_LEN, PayloadError, PreviewResult, ResolverStatus, TEXT_FIXED_LEN,
-        TextPreview, VideoPreview, decode_result, encode_result,
+        AnimatedGifFrame, AnimatedGifPreview, FLAG_IMAGE_FIRST_FRAME_ONLY, FLAG_TEXT_TRUNCATED,
+        IMAGE_FIXED_LEN, ImageFormat, ImagePreview, MAX_DISPLAY_NAME_UTF8_LEN,
+        MAX_ENCODING_LABEL_LEN, MAX_PREVIEW_IMAGE_WIDTH, MAX_SOURCE_IMAGE_AXIS,
+        MAX_SOURCE_IMAGE_PIXELS, MAX_TEXT_LINES, MAX_TEXT_SCALARS, MAX_TEXT_UTF8_LEN, PayloadError,
+        PreviewResult, ResolverStatus, TEXT_FIXED_LEN, TextPreview, VideoPreview, decode_result,
+        encode_result,
     };
 
     fn text_preview() -> TextPreview {
@@ -892,6 +1136,29 @@ mod tests {
         }
     }
 
+    fn animated_gif_preview() -> AnimatedGifPreview {
+        AnimatedGifPreview {
+            file_size: 8_192,
+            last_write_time: 133_000_000_000_000_000,
+            linked_content: false,
+            display_name: "animated.gif".to_owned(),
+            source_width: 3,
+            source_height: 2,
+            width: 3,
+            height: 2,
+            frames: vec![
+                AnimatedGifFrame {
+                    delay_ms: 100,
+                    premultiplied_bgra: vec![0x40; 24],
+                },
+                AnimatedGifFrame {
+                    delay_ms: 120,
+                    premultiplied_bgra: vec![0x7f; 24],
+                },
+            ],
+        }
+    }
+
     #[test]
     fn every_result_kind_round_trips_with_typed_metadata() {
         for status in [
@@ -926,6 +1193,9 @@ mod tests {
 
         let video = PreviewResult::Video(video_preview());
         assert_eq!(decode_result(&encode_result(&video).unwrap()), Ok(video));
+
+        let gif = PreviewResult::AnimatedGif(animated_gif_preview());
+        assert_eq!(decode_result(&encode_result(&gif).unwrap()), Ok(gif));
     }
 
     #[test]

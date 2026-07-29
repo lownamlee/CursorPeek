@@ -136,6 +136,12 @@ fn result_heap_bytes(result: &PreviewResult) -> Option<usize> {
             .display_name
             .capacity()
             .checked_add(preview.path.capacity().checked_mul(size_of::<u16>())?),
+        PreviewResult::AnimatedGif(preview) => preview
+            .frames
+            .iter()
+            .try_fold(preview.display_name.capacity(), |total, frame| {
+                total.checked_add(frame.premultiplied_bgra.capacity())
+            }),
     }
 }
 

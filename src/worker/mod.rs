@@ -193,7 +193,10 @@ fn resolver_result_with_cache(
             (
                 matches!(
                     result,
-                    PreviewResult::Text(_) | PreviewResult::Image(_) | PreviewResult::Video(_)
+                    PreviewResult::Text(_)
+                        | PreviewResult::Image(_)
+                        | PreviewResult::Video(_)
+                        | PreviewResult::AnimatedGif(_)
                 )
                 .then_some(target_bounds),
                 result,
@@ -250,6 +253,10 @@ fn preview_file_result(
                 preview.display_name = file.display_name();
                 preview.last_write_time = file.last_write_time();
             }
+            PreviewResult::AnimatedGif(preview) => {
+                preview.display_name = file.display_name();
+                preview.last_write_time = file.last_write_time();
+            }
             PreviewResult::Status(_) => {}
         }
         return match file.is_unchanged() {
@@ -280,6 +287,7 @@ fn preview_file_result(
                 }
                 Err(_) => PreviewResult::Status(ResolverStatus::Unavailable),
             },
+            Ok(ImageDecodeResult::AnimatedGif(preview)) => PreviewResult::AnimatedGif(preview),
             Ok(ImageDecodeResult::Unsupported) => {
                 PreviewResult::Status(ResolverStatus::Unsupported)
             }
@@ -334,6 +342,7 @@ fn preview_result_kind(result: &PreviewResult) -> &'static str {
         PreviewResult::Text(_) => "text",
         PreviewResult::Image(_) => "image",
         PreviewResult::Video(_) => "video",
+        PreviewResult::AnimatedGif(_) => "animated_gif",
     }
 }
 
@@ -397,6 +406,16 @@ fn record_preview_result(
                 target_bounds.is_some(),
                 preview.file_size,
                 diagnostics::elapsed_us(started).unwrap_or(0)
+            ),
+        ),
+        PreviewResult::AnimatedGif(preview) => diagnostics::record(
+            "worker.preview",
+            format_args!(
+                "kind=animated_gif bytes={} frames={} width={} height={}",
+                preview.file_size,
+                preview.frames.len(),
+                preview.width,
+                preview.height
             ),
         ),
     }
@@ -467,7 +486,9 @@ mod tests {
     use crate::resolver::{PointResolver, ResolveOutcome, ResolvedTarget};
     use crate::settings::LegacyEncoding;
     use crate::worker::payload::{PreviewResult, ResolverStatus};
-    use ::image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
+    use ::image::{
+        Delay, DynamicImage, Frame, ImageFormat, Rgba, RgbaImage, codecs::gif::GifEncoder,
+    };
     use cursorpeek_core::{ExplorerWindowId, PhysicalScreenRect, PhysicalScreenSpan};
     use protocol::{SessionNonce, WorkerMessage};
     use std::{
@@ -649,6 +670,49 @@ mod tests {
             [20, 40, 60, 128, 20, 40, 60, 128]
         );
         fs::remove_file(image_path).expect("the valid image fixture should be removed");
+
+        let gif_path = env::temp_dir().join(format!(
+            "cursorpeek-resolved-target-{}-{}.gif",
+            std::process::id(),
+            NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut gif_bytes = Vec::new();
+        {
+            let mut encoder = GifEncoder::new(&mut gif_bytes);
+            encoder
+                .encode_frames([
+                    Frame::from_parts(
+                        RgbaImage::from_pixel(2, 1, Rgba([220, 10, 10, 255])),
+                        0,
+                        0,
+                        Delay::from_numer_denom_ms(40, 1),
+                    ),
+                    Frame::from_parts(
+                        RgbaImage::from_pixel(2, 1, Rgba([10, 220, 10, 255])),
+                        0,
+                        0,
+                        Delay::from_numer_denom_ms(60, 1),
+                    ),
+                ])
+                .expect("the animated GIF fixture should encode");
+        }
+        fs::write(&gif_path, gif_bytes).expect("the animated GIF fixture should be written");
+        let (target_bounds, result) = resolver_result_with_cache(
+            ResolveOutcome::Resolved(resolved_target(gif_path.clone())),
+            PhysicalScreenSpan::from_point(PhysicalScreenPoint::new(0, 0)),
+            &LegacyEncoding::Auto,
+            &mut PreviewCache::default(),
+        );
+        assert_eq!(
+            target_bounds,
+            Some(PhysicalScreenRect::try_new(-100, -50, 200, 250).unwrap())
+        );
+        let PreviewResult::AnimatedGif(preview) = result else {
+            panic!("the resolved animated GIF should preserve its bound preview result");
+        };
+        assert_eq!(preview.frames.len(), 2);
+        assert_eq!((preview.width, preview.height), (2, 1));
+        fs::remove_file(gif_path).expect("the animated GIF fixture should be removed");
 
         let legacy_path = env::temp_dir().join(format!(
             "cursorpeek-resolved-target-{}-{}.txt",

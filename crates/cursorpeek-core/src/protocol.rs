@@ -625,11 +625,21 @@ fn validate_target_bounds(
     result: &PreviewResult,
 ) -> Result<(), ProtocolError> {
     match (target_bounds, result) {
-        (Some(_), PreviewResult::Text(_) | PreviewResult::Image(_) | PreviewResult::Video(_))
+        (
+            Some(_),
+            PreviewResult::Text(_)
+            | PreviewResult::Image(_)
+            | PreviewResult::Video(_)
+            | PreviewResult::AnimatedGif(_),
+        )
         | (None, PreviewResult::Status(_)) => Ok(()),
-        (None, PreviewResult::Text(_) | PreviewResult::Image(_) | PreviewResult::Video(_)) => {
-            Err(ProtocolError::MissingTargetBounds)
-        }
+        (
+            None,
+            PreviewResult::Text(_)
+            | PreviewResult::Image(_)
+            | PreviewResult::Video(_)
+            | PreviewResult::AnimatedGif(_),
+        ) => Err(ProtocolError::MissingTargetBounds),
         (Some(_), PreviewResult::Status(_)) => Err(ProtocolError::UnexpectedTargetBounds),
     }
 }
