@@ -82,11 +82,15 @@ function Get-ProcessSample {
             return $null
         }
         $Process.Refresh()
+        $threads = @($Process.Threads)
+        if ($threads.Count -eq 0 -or $Process.HasExited) {
+            return $null
+        }
         return [PSCustomObject]@{
             WorkingSet = [long] $Process.WorkingSet64
             PrivateBytes = [long] $Process.PrivateMemorySize64
             Handles = [int] $Process.HandleCount
-            Threads = [int] $Process.Threads.Count
+            Threads = [int] $threads.Count
         }
     }
     catch [System.InvalidOperationException] {
