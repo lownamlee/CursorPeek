@@ -100,6 +100,7 @@ pub(crate) struct AppSettings {
     start_with_windows: bool,
     video_previews: bool,
     video_audio: bool,
+    video_smooth_start: bool,
 }
 
 impl Default for AppSettings {
@@ -114,6 +115,7 @@ impl Default for AppSettings {
             start_with_windows: false,
             video_previews: true,
             video_audio: false,
+            video_smooth_start: true,
         }
     }
 }
@@ -157,6 +159,10 @@ impl AppSettings {
 
     pub(crate) const fn video_audio(&self) -> bool {
         self.video_audio
+    }
+
+    pub(crate) const fn video_smooth_start(&self) -> bool {
+        self.video_smooth_start
     }
 
     fn validate(&self) -> Result<(), SettingsParseError> {
@@ -231,6 +237,10 @@ impl SettingsDocument {
 
     pub(crate) fn set_video_audio(&mut self, enabled: bool) {
         self.settings.video_audio = enabled;
+    }
+
+    pub(crate) fn set_video_smooth_start(&mut self, enabled: bool) {
+        self.settings.video_smooth_start = enabled;
     }
 
     pub(crate) fn set_theme(&mut self, theme: Theme) {
@@ -328,6 +338,10 @@ impl SettingsDocument {
                     document.settings.video_audio =
                         parse_boolean(value, line_number, INVALID_VIDEO_AUDIO)?;
                 }
+                "video_smooth_start" => {
+                    document.settings.video_smooth_start =
+                        parse_boolean(value, line_number, INVALID_VIDEO_SMOOTH_START)?;
+                }
                 _ => {
                     if document.unknown.len() == MAX_UNKNOWN_SETTINGS {
                         return Err(SettingsParseError::new(line_number, TOO_MANY_UNKNOWN));
@@ -390,6 +404,12 @@ impl SettingsDocument {
             .expect("writing to a String cannot fail");
         writeln!(output, "video_audio={}", self.settings.video_audio)
             .expect("writing to a String cannot fail");
+        writeln!(
+            output,
+            "video_smooth_start={}",
+            self.settings.video_smooth_start
+        )
+        .expect("writing to a String cannot fail");
 
         if !self.unknown.is_empty() {
             output.push_str("\n# Preserved settings not understood by this version\n");
@@ -416,6 +436,7 @@ const KNOWN_KEYS: &[&str] = &[
     "start_with_windows",
     "video_previews",
     "video_audio",
+    "video_smooth_start",
 ];
 
 const LINE_TOO_LONG: &str = "line exceeds 1024 bytes";
@@ -433,6 +454,8 @@ const INVALID_START_WITH_WINDOWS: &str =
     "invalid `start_with_windows` value: expected `true` or `false`";
 const INVALID_VIDEO_PREVIEWS: &str = "invalid `video_previews` value: expected `true` or `false`";
 const INVALID_VIDEO_AUDIO: &str = "invalid `video_audio` value: expected `true` or `false`";
+const INVALID_VIDEO_SMOOTH_START: &str =
+    "invalid `video_smooth_start` value: expected `true` or `false`";
 
 fn parse_boolean(
     value: &str,
@@ -963,7 +986,8 @@ mod tests {
              legacy_encoding=auto\n\
              start_with_windows=false\n\
              video_previews=true\n\
-             video_audio=false\n"
+             video_audio=false\n\
+             video_smooth_start=true\n"
         );
         assert_eq!(
             SettingsDocument::parse(text).expect("canonical defaults should parse"),
@@ -984,6 +1008,7 @@ mod tests {
 	                     start_with_windows=true\n\
 	                     video_previews=false\n\
 	                     video_audio=true\n\
+	                     video_smooth_start=false\n\
                      future.setting = 保留\n";
         let document = SettingsDocument::parse(input).expect("valid settings should parse");
 
@@ -999,6 +1024,7 @@ mod tests {
         assert!(document.settings.start_with_windows);
         assert!(!document.settings.video_previews);
         assert!(document.settings.video_audio);
+        assert!(!document.settings.video_smooth_start);
 
         let encoded = document.encode().expect("valid settings should encode");
         let encoded = std::str::from_utf8(&encoded).expect("settings are UTF-8");
@@ -1031,6 +1057,7 @@ mod tests {
         document.set_theme(Theme::Dark);
         document.set_video_previews(false);
         document.set_video_audio(true);
+        document.set_video_smooth_start(false);
         assert_eq!(document.settings().dwell_delay_ms(), 700);
         assert_eq!(
             (
@@ -1043,6 +1070,7 @@ mod tests {
         assert_eq!(document.settings().theme(), Theme::Dark);
         assert!(!document.settings().video_previews());
         assert!(document.settings().video_audio());
+        assert!(!document.settings().video_smooth_start());
         assert!(
             std::str::from_utf8(&document.encode().unwrap())
                 .unwrap()
@@ -1072,6 +1100,7 @@ mod tests {
             ("start_with_windows=1\n", "true"),
             ("video_previews=1\n", "true"),
             ("video_audio=yes\n", "true"),
+            ("video_smooth_start=fast\n", "true"),
             ("theme=dark\ntheme=light\n", "duplicate"),
             ("missing separator\n", "key=value"),
             ("9invalid=value\n", "invalid key"),

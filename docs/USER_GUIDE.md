@@ -45,6 +45,9 @@ Right-click the CursorPeek icon:
   - **Play video previews** enables or disables MP4 playback on hover. Enabled by default.
   - **Play sound** enables MP4 audio. Disabled by default. Hiding the preview stops audio
     immediately.
+  - **Startup > Immediate** shows playback as soon as the native player is ready.
+  - **Startup > Smooth (400 ms preroll)** warms the decoder while hidden before revealing the
+    video. This is the default.
 - **Settings > Start with Windows** — adds or removes the current executable from the current
   user’s startup list.
 - **About CursorPeek** — shows the product version.
@@ -210,6 +213,7 @@ legacy_encoding=auto
 start_with_windows=false
 video_previews=true
 video_audio=false
+video_smooth_start=true
 ```
 
 | Key | Accepted value |
@@ -223,6 +227,7 @@ video_audio=false
 | `start_with_windows` | `true` or `false` |
 | `video_previews` | `true` or `false`; controls MP4 playback |
 | `video_audio` | `true` or `false`; controls MP4 sound and defaults to `false` |
+| `video_smooth_start` | `true` selects smooth preroll; `false` selects immediate startup |
 
 The tray exposes safe presets rather than every numeric value. To use another accepted value,
 including a different cache capacity, exit CursorPeek, edit `config.ini` as UTF-8, and restart it.

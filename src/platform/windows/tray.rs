@@ -40,6 +40,8 @@ const THEME_LIGHT_COMMAND: usize = 41;
 const THEME_DARK_COMMAND: usize = 42;
 const TOGGLE_VIDEO_PREVIEWS_COMMAND: usize = 50;
 const TOGGLE_VIDEO_AUDIO_COMMAND: usize = 51;
+const VIDEO_START_IMMEDIATE_COMMAND: usize = 52;
+const VIDEO_START_SMOOTH_COMMAND: usize = 53;
 const NIN_KEYSELECT: u32 = NIN_SELECT + 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,6 +71,7 @@ pub(crate) struct TrayMenuState {
     pub(crate) start_with_windows: bool,
     pub(crate) video_previews: bool,
     pub(crate) video_audio: bool,
+    pub(crate) video_smooth_start: bool,
 }
 
 pub(crate) struct TrayIcon {
@@ -250,6 +253,7 @@ pub(crate) enum TrayCommand {
     ToggleStartWithWindows,
     ToggleVideoPreviews,
     ToggleVideoAudio,
+    SetVideoSmoothStart(bool),
     About,
     Exit,
 }
@@ -408,6 +412,18 @@ impl PopupMenu {
             w!("Play sound"),
             state.video_audio,
         )?;
+        let startup = Self::new()?;
+        startup.append_command(
+            VIDEO_START_IMMEDIATE_COMMAND,
+            w!("Immediate"),
+            !state.video_smooth_start,
+        )?;
+        startup.append_command(
+            VIDEO_START_SMOOTH_COMMAND,
+            w!("Smooth (400 ms preroll)"),
+            state.video_smooth_start,
+        )?;
+        video.append_submenu(startup, w!("Startup"))?;
         settings.append_submenu(video, w!("Video"))?;
         settings.append_separator()?;
         settings.append_command(
@@ -523,6 +539,8 @@ fn command_from_id(id: usize) -> Option<TrayCommand> {
         TOGGLE_STARTUP_COMMAND => Some(TrayCommand::ToggleStartWithWindows),
         TOGGLE_VIDEO_PREVIEWS_COMMAND => Some(TrayCommand::ToggleVideoPreviews),
         TOGGLE_VIDEO_AUDIO_COMMAND => Some(TrayCommand::ToggleVideoAudio),
+        VIDEO_START_IMMEDIATE_COMMAND => Some(TrayCommand::SetVideoSmoothStart(false)),
+        VIDEO_START_SMOOTH_COMMAND => Some(TrayCommand::SetVideoSmoothStart(true)),
         ABOUT_COMMAND => Some(TrayCommand::About),
         EXIT_COMMAND => Some(TrayCommand::Exit),
         _ => None,
@@ -559,7 +577,8 @@ mod tests {
         PREVIEW_COMPACT_COMMAND, PREVIEW_LARGE_COMMAND, PREVIEW_STANDARD_COMMAND, PopupMenu,
         THEME_DARK_COMMAND, THEME_LIGHT_COMMAND, THEME_SYSTEM_COMMAND, TOGGLE_PAUSE_COMMAND,
         TOGGLE_STARTUP_COMMAND, TOGGLE_VIDEO_AUDIO_COMMAND, TOGGLE_VIDEO_PREVIEWS_COMMAND,
-        TrayCommand, TrayMenuState, TrayStatus, callback_anchor, command_from_id,
+        TrayCommand, TrayMenuState, TrayStatus, VIDEO_START_IMMEDIATE_COMMAND,
+        VIDEO_START_SMOOTH_COMMAND, callback_anchor, command_from_id,
         establish_notification_area_registration, write_wide_z,
     };
     use crate::settings::Theme;
@@ -662,6 +681,14 @@ mod tests {
             command_from_id(TOGGLE_VIDEO_AUDIO_COMMAND),
             Some(TrayCommand::ToggleVideoAudio)
         );
+        assert_eq!(
+            command_from_id(VIDEO_START_IMMEDIATE_COMMAND),
+            Some(TrayCommand::SetVideoSmoothStart(false))
+        );
+        assert_eq!(
+            command_from_id(VIDEO_START_SMOOTH_COMMAND),
+            Some(TrayCommand::SetVideoSmoothStart(true))
+        );
         assert_eq!(command_from_id(0), None);
         assert_eq!(command_from_id(usize::MAX), None);
     }
@@ -677,6 +704,7 @@ mod tests {
             start_with_windows: true,
             video_previews: true,
             video_audio: false,
+            video_smooth_start: true,
         })
         .expect("the native popup hierarchy should be created");
 

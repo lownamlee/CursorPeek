@@ -69,14 +69,14 @@ use windows::{
             WindowsAndMessaging::{
                 CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GW_HWNDPREV,
                 GWLP_USERDATA, GetClientRect, GetWindow, GetWindowLongPtrW, GetWindowRect,
-                HWND_TOPMOST, IsWindowVisible, MA_NOACTIVATEANDEAT, NONCLIENTMETRICSW,
+                HWND_TOPMOST, IsWindowVisible, KillTimer, MA_NOACTIVATEANDEAT, NONCLIENTMETRICSW,
                 PostMessageW, RegisterClassW, SPI_GETHIGHCONTRAST, SPI_GETNONCLIENTMETRICS,
                 SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
                 SWP_NOZORDER, SWP_SHOWWINDOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW,
-                SetWindowLongPtrW, SetWindowPos, SetWindowTextW, SystemParametersInfoW,
+                SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, SystemParametersInfoW,
                 UnregisterClassW, WINDOW_EX_STYLE, WM_APP, WM_DISPLAYCHANGE, WM_DPICHANGED,
                 WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
-                WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOLORCHANGE, WM_THEMECHANGED, WNDCLASSW,
+                WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOLORCHANGE, WM_THEMECHANGED, WM_TIMER, WNDCLASSW,
                 WS_BORDER, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
                 WS_VISIBLE,
             },
@@ -98,6 +98,11 @@ const IMAGE_MARGIN: f32 = 4.0;
 const IMAGE_METADATA_HEIGHT: f32 = 56.0;
 const IMAGE_MINIMUM_WIDTH: f32 = 158.0;
 const SYSTEM_APPEARANCE_CHANGED_MESSAGE: u32 = WM_APP + 20;
+const VIDEO_PREROLL_TIMER_ID: usize = 1;
+const VIDEO_PREROLL_MS: u32 = 400;
+const VIDEO_AUDIO_FADE_TIMER_ID: usize = 2;
+const VIDEO_AUDIO_FADE_INTERVAL_MS: u32 = 20;
+const VIDEO_AUDIO_FADE_STEPS: u8 = 8;
 const MAX_Z_ORDER_SCAN: usize = 64;
 
 pub(crate) struct PreviewWindow {
@@ -196,19 +201,53 @@ impl PreviewWindow {
         size: PreviewSize,
         preview: VideoPreview,
         play_audio: bool,
+        smooth_start: bool,
     ) -> Result<PreviewPlacement> {
         self.stop_video();
         let file_lock = crate::worker::video::lock_for_playback(&preview.path)
             .map_err(|_| Error::from_hresult(E_INVALIDARG))?;
-        match VideoPlayer::create(self.hwnd, &preview.path, play_audio, file_lock) {
+        match VideoPlayer::create(self.hwnd, &preview.path, file_lock) {
             Ok(player) => {
                 let (native_width, native_height) = player.native_size();
                 let (width, height) =
                     fit_dimensions(native_width, native_height, size.width(), size.height())
                         .ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
-                let placement = self.show(anchor, PreviewSize::new(width, height), None)?;
+                let placement = self.show_with_visibility(
+                    anchor,
+                    PreviewSize::new(width, height),
+                    None,
+                    !smooth_start,
+                )?;
                 player.fill_parent()?;
+                if smooth_start {
+                    self.state
+                        .borrow_mut()
+                        .begin_video_preroll(player.player.clone(), play_audio);
+                } else {
+                    if play_audio {
+                        self.state
+                            .borrow_mut()
+                            .begin_audio_fade(player.player.clone())?;
+                        self.start_audio_fade_timer()?;
+                    }
+                }
                 self.video_player.replace(Some(player));
+                if smooth_start {
+                    // SAFETY: This live preview HWND owns the fixed private timer identifier.
+                    // Expiry is delivered as WM_TIMER on the same UI thread without a callback.
+                    if unsafe {
+                        SetTimer(
+                            Some(self.hwnd),
+                            VIDEO_PREROLL_TIMER_ID,
+                            VIDEO_PREROLL_MS,
+                            None,
+                        )
+                    } == 0
+                    {
+                        self.stop_video();
+                        return Err(Error::from_thread());
+                    }
+                }
                 Ok(placement)
             }
             Err(error) => {
@@ -219,7 +258,29 @@ impl PreviewWindow {
     }
 
     fn stop_video(&self) {
+        // SAFETY: Killing an absent timer is benign; this HWND remains live for the UI-thread call.
+        let _ = unsafe { KillTimer(Some(self.hwnd), VIDEO_PREROLL_TIMER_ID) };
+        // SAFETY: Killing an absent timer is benign; this HWND remains live for the UI-thread call.
+        let _ = unsafe { KillTimer(Some(self.hwnd), VIDEO_AUDIO_FADE_TIMER_ID) };
+        self.state.borrow_mut().cancel_video_preroll();
+        self.state.borrow_mut().cancel_audio_fade();
         self.video_player.borrow_mut().take();
+    }
+
+    fn start_audio_fade_timer(&self) -> Result<()> {
+        // SAFETY: This live preview HWND owns the fixed private timer identifier.
+        if unsafe {
+            SetTimer(
+                Some(self.hwnd),
+                VIDEO_AUDIO_FADE_TIMER_ID,
+                VIDEO_AUDIO_FADE_INTERVAL_MS,
+                None,
+            )
+        } == 0
+        {
+            return Err(Error::from_thread());
+        }
+        Ok(())
     }
 
     fn show(
@@ -228,6 +289,21 @@ impl PreviewWindow {
         size: PreviewSize,
         content: Option<RetainedContent>,
     ) -> Result<PreviewPlacement> {
+        self.show_with_visibility(anchor, size, content, true)
+    }
+
+    fn show_with_visibility(
+        &self,
+        anchor: PhysicalScreenPoint,
+        size: PreviewSize,
+        content: Option<RetainedContent>,
+        visible: bool,
+    ) -> Result<PreviewPlacement> {
+        let visibility = if visible {
+            SWP_SHOWWINDOW
+        } else {
+            Default::default()
+        };
         // SAFETY: The hidden top-level HWND is owned by this UI thread. Moving the one-pixel setup
         // window first associates it with the anchor monitor without activating or showing it.
         unsafe {
@@ -308,7 +384,7 @@ impl PreviewWindow {
                 placement.y,
                 placement.width,
                 placement.height,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                SWP_NOACTIVATE | visibility,
             )?;
         }
 
@@ -517,7 +593,6 @@ impl VideoPlayer {
     fn create(
         hwnd: HWND,
         path: &[u16],
-        play_audio: bool,
         file_lock: crate::worker::video::PlaybackFileLock,
     ) -> Result<Self> {
         let terminated = media_foundation_path(path)?;
@@ -582,9 +657,13 @@ impl VideoPlayer {
         }
         // SAFETY: Both interfaces are live and owned through this synchronous setup sequence.
         unsafe { owner.player.SetMediaItem(&item)? };
-        // Audio is opt-in. Muting happens before returning control to the message loop.
+        // Keep the audio path unmuted from the outset, but silent at zero volume. Toggling MFPlay
+        // mute after playback starts can open the audio endpoint abruptly and produce a click.
         // SAFETY: MFPlay returned this live player interface on the current COM-initialized thread.
-        unsafe { owner.player.SetMute(!play_audio)? };
+        unsafe {
+            owner.player.SetVolume(0.0)?;
+            owner.player.SetMute(false)?;
+        }
         // SAFETY: The media item, video child, and player remain live in `owner`.
         unsafe { owner.player.Play()? };
         Ok(owner)
@@ -770,6 +849,10 @@ struct PreviewWindowState {
     pixel_size: D2D_SIZE_U,
     dpi: u32,
     last_paint_error: Option<HRESULT>,
+    preroll_player: Option<IMFPMediaPlayer>,
+    preroll_enable_audio: bool,
+    audio_fade_player: Option<IMFPMediaPlayer>,
+    audio_fade_step: u8,
     #[cfg(test)]
     force_recreate_target: bool,
 }
@@ -801,6 +884,10 @@ impl PreviewWindowState {
             pixel_size: D2D_SIZE_U::default(),
             dpi: 96,
             last_paint_error: None,
+            preroll_player: None,
+            preroll_enable_audio: false,
+            audio_fade_player: None,
+            audio_fade_step: 0,
             #[cfg(test)]
             force_recreate_target: false,
         })
@@ -816,6 +903,58 @@ impl PreviewWindowState {
         self.image_bitmap = None;
         self.last_paint_error = None;
         Ok(())
+    }
+
+    fn begin_video_preroll(&mut self, player: IMFPMediaPlayer, enable_audio: bool) {
+        self.preroll_player = Some(player);
+        self.preroll_enable_audio = enable_audio;
+    }
+
+    fn finish_video_preroll(&mut self) -> Result<bool> {
+        let should_fade_audio = self.preroll_enable_audio;
+        if self.preroll_enable_audio
+            && let Some(player) = self.preroll_player.as_ref()
+        {
+            self.begin_audio_fade(player.clone())?;
+        }
+        self.cancel_video_preroll();
+        Ok(should_fade_audio)
+    }
+
+    fn cancel_video_preroll(&mut self) {
+        self.preroll_player = None;
+        self.preroll_enable_audio = false;
+    }
+
+    fn begin_audio_fade(&mut self, player: IMFPMediaPlayer) -> Result<()> {
+        // Playback already owns an open, unmuted audio path at zero volume. Only changing volume
+        // here avoids the endpoint transition that can produce a click on some audio drivers.
+        // SAFETY: The retained player belongs to the live video preview on this UI thread.
+        unsafe { player.SetVolume(0.0)? };
+        self.audio_fade_player = Some(player);
+        self.audio_fade_step = 0;
+        Ok(())
+    }
+
+    fn advance_audio_fade(&mut self) -> bool {
+        let Some(player) = self.audio_fade_player.as_ref() else {
+            return true;
+        };
+        self.audio_fade_step = self.audio_fade_step.saturating_add(1);
+        let volume = f32::from(self.audio_fade_step) / f32::from(VIDEO_AUDIO_FADE_STEPS);
+        // SAFETY: The retained player belongs to the live video preview on this UI thread.
+        if unsafe { player.SetVolume(volume.min(1.0)) }.is_err()
+            || self.audio_fade_step >= VIDEO_AUDIO_FADE_STEPS
+        {
+            self.cancel_audio_fade();
+            return true;
+        }
+        false
+    }
+
+    fn cancel_audio_fade(&mut self) {
+        self.audio_fade_player = None;
+        self.audio_fade_step = 0;
     }
 
     fn content_client_pixel_size(&self, maximum: PreviewSize) -> Result<D2D_SIZE_U> {
@@ -1824,6 +1963,53 @@ fn dispatch_preview_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
         return LRESULT(1);
     }
 
+    if message == WM_TIMER && wparam.0 == VIDEO_PREROLL_TIMER_ID {
+        // SAFETY: This consumes the private one-shot timer owned by this live preview HWND.
+        let _ = unsafe { KillTimer(Some(hwnd), VIDEO_PREROLL_TIMER_ID) };
+        if let Some(state) = preview_state(hwnd)
+            && state.borrow_mut().finish_video_preroll().unwrap_or(false)
+        {
+            // SAFETY: The live preview HWND owns this private fade timer.
+            let _ = unsafe {
+                SetTimer(
+                    Some(hwnd),
+                    VIDEO_AUDIO_FADE_TIMER_ID,
+                    VIDEO_AUDIO_FADE_INTERVAL_MS,
+                    None,
+                )
+            };
+        }
+        // SAFETY: Preroll positioned and sized the hidden top-level preview already. This reveals
+        // it without activation, movement, resizing, ownership, or Z-order changes.
+        let _ = unsafe {
+            SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_SHOWWINDOW
+                    | SWP_NOACTIVATE
+                    | SWP_NOMOVE
+                    | SWP_NOSIZE
+                    | SWP_NOOWNERZORDER
+                    | SWP_NOZORDER,
+            )
+        };
+        return LRESULT(0);
+    }
+
+    if message == WM_TIMER && wparam.0 == VIDEO_AUDIO_FADE_TIMER_ID {
+        let finished =
+            preview_state(hwnd).is_none_or(|state| state.borrow_mut().advance_audio_fade());
+        if finished {
+            // SAFETY: Killing an absent timer is benign for this live preview HWND.
+            let _ = unsafe { KillTimer(Some(hwnd), VIDEO_AUDIO_FADE_TIMER_ID) };
+        }
+        return LRESULT(0);
+    }
+
     if message == WM_DPICHANGED {
         let result = (|| {
             let dpi = u32::from((wparam.0 & 0xffff) as u16);
@@ -1949,11 +2135,11 @@ fn preview_state(hwnd: HWND) -> Option<&'static RefCell<PreviewWindowState>> {
 mod tests {
     use super::{
         ContentLayouts, D2D_SIZE_U, MAX_Z_ORDER_SCAN, PreviewColors, PreviewWindow,
-        PreviewWindowState, RetainedContent, TextContent, adjusted_window_pixel_size,
-        checked_image_layout, checked_window_rect, client_pixel_size, color_from_colorref,
-        format_file_size, image_client_pixel_size, image_destination_rect, image_preview_metadata,
-        media_foundation_path, rectangles_overlap, system_dark_mode, system_message_font,
-        text_preview_metadata,
+        PreviewWindowState, RetainedContent, TextContent, VIDEO_PREROLL_TIMER_ID,
+        adjusted_window_pixel_size, checked_image_layout, checked_window_rect, client_pixel_size,
+        color_from_colorref, format_file_size, image_client_pixel_size, image_destination_rect,
+        image_preview_metadata, media_foundation_path, rectangles_overlap, system_dark_mode,
+        system_message_font, text_preview_metadata,
     };
     use crate::{
         hover::PhysicalScreenPoint,
@@ -1968,8 +2154,9 @@ mod tests {
         Foundation::{HWND, LPARAM, RECT, WPARAM},
         Graphics::DirectWrite::DWRITE_TEXT_METRICS,
         UI::WindowsAndMessaging::{
-            GW_HWNDPREV, GetForegroundWindow, GetWindow, GetWindowRect, IsWindow, SWP_NOACTIVATE,
-            SWP_NOMOVE, SWP_NOSIZE, SendMessageW, SetWindowPos, WM_DPICHANGED,
+            GW_HWNDPREV, GetForegroundWindow, GetWindow, GetWindowRect, IsWindow, IsWindowVisible,
+            SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SendMessageW, SetWindowPos, WM_DPICHANGED,
+            WM_TIMER,
         },
     };
 
@@ -2655,7 +2842,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires CURSORPEEK_TEST_MP4 pointing to a local playable MP4"]
-    fn native_mp4_player_starts_muted_and_stops_with_the_preview() {
+    fn native_mp4_player_starts_silent_and_stops_with_the_preview() {
         let path = PathBuf::from(
             env::var_os("CURSORPEEK_TEST_MP4")
                 .expect("CURSORPEEK_TEST_MP4 must point to a local playable MP4"),
@@ -2679,8 +2866,22 @@ mod tests {
                 PreviewSize::new(480, 360),
                 preview,
                 false,
+                true,
             )
             .expect("MFPlay should accept and start the local MP4");
+        // SAFETY: The preview HWND is live and should remain hidden during preroll.
+        assert!(!unsafe { IsWindowVisible(window.handle()).as_bool() });
+        // SAFETY: Deliver the private timer message synchronously to exercise preroll completion.
+        unsafe {
+            SendMessageW(
+                window.handle(),
+                WM_TIMER,
+                Some(WPARAM(VIDEO_PREROLL_TIMER_ID)),
+                Some(LPARAM(0)),
+            )
+        };
+        // SAFETY: The same preview HWND remains live after timer dispatch.
+        assert!(unsafe { IsWindowVisible(window.handle()).as_bool() });
         let video_surface = window
             .video_player
             .borrow()
@@ -2699,6 +2900,29 @@ mod tests {
             )
             .expect("an image should render after the video surface is destroyed");
         window.hide().expect("the image preview should hide");
+        let immediate_preview = VideoPreview {
+            file_size: metadata.len(),
+            last_write_time: 0,
+            linked_content: false,
+            display_name: "immediate-player-test.mp4".to_owned(),
+            path: {
+                let mut value: Vec<u16> = r"\\?\".encode_utf16().collect();
+                value.extend(path.as_os_str().encode_wide());
+                value
+            },
+        };
+        window
+            .show_video_at(
+                PhysicalScreenPoint::new(100, 100),
+                PreviewSize::new(480, 360),
+                immediate_preview,
+                false,
+                false,
+            )
+            .expect("immediate mode should start the same MP4");
+        // SAFETY: Immediate mode reveals the live preview before returning.
+        assert!(unsafe { IsWindowVisible(window.handle()).as_bool() });
+        window.hide().expect("the immediate preview should hide");
     }
 
     #[test]

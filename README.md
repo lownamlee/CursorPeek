@@ -162,7 +162,8 @@ Matching is case-insensitive. Images, video, and text are validated before previ
 
 Right-click the tray icon to pause previews or change the dwell delay, maximum preview size, theme,
 video playback, sound, and startup behavior. Video previews are enabled by default; sound is
-opt-in. See [settings and configuration](docs/USER_GUIDE.md#tray-menu).
+opt-in, and smooth startup is selected by default. See
+[settings and configuration](docs/USER_GUIDE.md#tray-menu).
 
 <p align="center">
   <img

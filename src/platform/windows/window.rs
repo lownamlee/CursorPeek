@@ -1367,7 +1367,13 @@ impl MessageWindow {
                     self.hide_product_preview();
                     return;
                 }
-                preview.show_video_at(anchor, self.preview_size, video, settings.video_audio())
+                preview.show_video_at(
+                    anchor,
+                    self.preview_size,
+                    video,
+                    settings.video_audio(),
+                    settings.video_smooth_start(),
+                )
             }
             PreviewResult::Status(_) => unreachable!("statuses returned before window creation"),
         };
@@ -1607,6 +1613,10 @@ impl MessageWindow {
                 self.toggle_video_audio();
                 Ok(false)
             }
+            Some(TrayCommand::SetVideoSmoothStart(enabled)) => {
+                self.set_video_smooth_start(enabled);
+                Ok(false)
+            }
             Some(TrayCommand::About) => {
                 self.tray_icon
                     .as_ref()
@@ -1633,6 +1643,7 @@ impl MessageWindow {
             start_with_windows: settings.start_with_windows(),
             video_previews: settings.video_previews(),
             video_audio: settings.video_audio(),
+            video_smooth_start: settings.video_smooth_start(),
         }
     }
 
@@ -1769,6 +1780,19 @@ impl MessageWindow {
             .clone();
         let enabled = !updated.settings().video_audio();
         updated.set_video_audio(enabled);
+        if self.save_settings(&updated) {
+            self.settings_document = Some(updated);
+            self.cancel_dwell();
+        }
+    }
+
+    fn set_video_smooth_start(&mut self, enabled: bool) {
+        let mut updated = self
+            .settings_document
+            .as_ref()
+            .expect("a settings command requires the loaded document")
+            .clone();
+        updated.set_video_smooth_start(enabled);
         if self.save_settings(&updated) {
             self.settings_document = Some(updated);
             self.cancel_dwell();
