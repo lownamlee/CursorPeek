@@ -1,12 +1,12 @@
-# CursorPeek 0.2 known limitations
+# CursorPeek known limitations
 
-This document describes the deliberate scope boundaries of CursorPeek 0.2. A file that does not
+This document describes the deliberate scope boundaries of the current CursorPeek release. A file that does not
 preview is not necessarily an application failure: CursorPeek normally shows nothing when identity,
 locality, format, or resource checks cannot be satisfied safely.
 
 ## Platform and Explorer
 
-- CursorPeek 0.2 supports x64 Windows 10 22H2 and Windows 11. There is no x86 or ARM64 package.
+- CursorPeek supports x64 Windows 10 22H2 and Windows 11. There is no x86 or ARM64 package.
 - Previews work in Windows File Explorer. The desktop, file pickers, archive viewers, third-party
   file managers, browsers, and other list controls are outside the 0.2 scope.
 - CursorPeek requires one unambiguous local filesystem item from the visible view in the Explorer
@@ -25,7 +25,8 @@ locality, format, or resource checks cannot be satisfied safely.
   embedded stream is decodable. Native decoding currently runs in the coordinator rather than the
   contained image/text worker. Video controls and scrubbing are not shown; the hover preview loops
   until dismissed.
-- Animated GIF files use the first composited frame. WebP uses a still preview, ICO uses a
+- GIF and WebP animate only when the entire bounded upgrade fits the documented frame, pixel,
+  duration, and payload limits. Otherwise the already-visible first frame remains. ICO uses a
   deterministic first image, and TIFF uses a deterministic first page.
 - Text is inert plain text. CursorPeek does not render Markdown or HTML, apply syntax highlighting,
   follow links, execute scripts, or provide an editor.

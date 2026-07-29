@@ -13,7 +13,7 @@ use crate::{
     hover::PhysicalScreenPoint,
     preview::{PreviewPlacement, PreviewSize, ScreenRect, place_preview, place_preview_pixels},
     settings::Theme,
-    worker::{ImagePreview, TextPreview},
+    worker::{ImageAnimationPreview, ImagePreview, TextPreview},
 };
 use cursorpeek_core::{ExplorerWindowId, layout::fit_dimensions, payload::VideoPreview};
 
@@ -100,6 +100,7 @@ const IMAGE_METADATA_HEIGHT: f32 = 56.0;
 const IMAGE_MINIMUM_WIDTH: f32 = 158.0;
 const SYSTEM_APPEARANCE_CHANGED_MESSAGE: u32 = WM_APP + 20;
 const VIDEO_AUDIO_FADE_TIMER_ID: usize = 2;
+const IMAGE_ANIMATION_TIMER_ID: usize = 3;
 const VIDEO_AUDIO_FADE_INTERVAL_MS: u32 = 20;
 const VIDEO_AUDIO_FADE_STEPS: u8 = 8;
 const MAX_Z_ORDER_SCAN: usize = 64;
@@ -198,6 +199,7 @@ impl PreviewWindow {
         preview: &TextPreview,
     ) -> Result<PreviewPlacement> {
         self.stop_video();
+        self.stop_image_animation();
         self.show(
             anchor,
             size,
@@ -212,11 +214,36 @@ impl PreviewWindow {
         preview: ImagePreview,
     ) -> Result<PreviewPlacement> {
         self.stop_video();
+        self.stop_image_animation();
         self.show(
             anchor,
             size,
             Some(RetainedContent::Image(ImageContent::from_preview(preview))),
         )
+    }
+
+    pub(crate) fn attach_image_animation(&self, animation: ImageAnimationPreview) -> Result<bool> {
+        self.stop_image_animation();
+        let delay = {
+            let mut state = self.state.borrow_mut();
+            if !state.attach_image_animation(animation) {
+                return Ok(false);
+            }
+            state
+                .current_image_delay_ms()
+                .ok_or_else(|| Error::from_hresult(E_INVALIDARG))?
+        };
+        if let Err(error) = self.redraw() {
+            self.stop_image_animation();
+            let _ = self.redraw();
+            return Err(error);
+        }
+        if let Err(error) = self.start_image_animation_timer(delay) {
+            self.stop_image_animation();
+            let _ = self.redraw();
+            return Err(error);
+        }
+        Ok(true)
     }
 
     pub(crate) fn show_video_at(
@@ -228,6 +255,7 @@ impl PreviewWindow {
     ) -> Result<PreviewPlacement> {
         let total_started = diagnostics::counter();
         self.stop_video();
+        self.stop_image_animation();
         self.ensure_media_foundation()?;
         let lock_started = diagnostics::counter();
         let file_lock = crate::video::lock_for_playback(&preview).map_err(|error| {
@@ -331,6 +359,12 @@ impl PreviewWindow {
         self.video_player.borrow_mut().take();
     }
 
+    fn stop_image_animation(&self) {
+        // SAFETY: Killing an absent timer is benign; this HWND remains live for the UI-thread call.
+        let _ = unsafe { KillTimer(Some(self.hwnd), IMAGE_ANIMATION_TIMER_ID) };
+        self.state.borrow_mut().detach_image_animation();
+    }
+
     fn ensure_media_foundation(&self) -> Result<()> {
         if self.media_foundation.borrow().is_some() {
             return Ok(());
@@ -352,6 +386,15 @@ impl PreviewWindow {
             )
         } == 0
         {
+            return Err(Error::from_thread());
+        }
+        Ok(())
+    }
+
+    fn start_image_animation_timer(&self, delay_ms: u32) -> Result<()> {
+        // SAFETY: The live preview HWND owns this fixed private timer identifier. Payload
+        // validation has already bounded the nonzero interval.
+        if unsafe { SetTimer(Some(self.hwnd), IMAGE_ANIMATION_TIMER_ID, delay_ms, None) } == 0 {
             return Err(Error::from_thread());
         }
         Ok(())
@@ -497,6 +540,7 @@ impl PreviewWindow {
 
     pub(crate) fn hide(&self) -> Result<()> {
         self.stop_video();
+        self.stop_image_animation();
         // SAFETY: The live HWND belongs to this UI thread. The flags hide it without changing
         // position, size, Z order, or activation.
         unsafe {
@@ -941,6 +985,47 @@ impl PreviewWindowState {
         Ok(())
     }
 
+    fn attach_image_animation(&mut self, animation: ImageAnimationPreview) -> bool {
+        let Some(RetainedContent::Image(content)) = self.content.as_mut() else {
+            return false;
+        };
+        if !content.attach_animation(animation) {
+            return false;
+        }
+        self.layouts = None;
+        self.image_bitmap = None;
+        true
+    }
+
+    fn detach_image_animation(&mut self) {
+        let Some(RetainedContent::Image(content)) = self.content.as_mut() else {
+            return;
+        };
+        if content.animation.take().is_some() {
+            self.layouts = None;
+            self.image_bitmap = None;
+            content.metadata = image_preview_metadata(&content.preview)
+                .encode_utf16()
+                .collect();
+        }
+    }
+
+    fn current_image_delay_ms(&self) -> Option<u32> {
+        let Some(RetainedContent::Image(content)) = self.content.as_ref() else {
+            return None;
+        };
+        content.current_frame_delay_ms()
+    }
+
+    fn advance_image_animation(&mut self) -> Option<u32> {
+        let Some(RetainedContent::Image(content)) = self.content.as_mut() else {
+            return None;
+        };
+        let delay = content.advance_animation()?;
+        self.image_bitmap = None;
+        Some(delay)
+    }
+
     fn begin_audio_fade(&mut self, player: IMFPMediaPlayer) -> Result<()> {
         // Playback already owns an open, unmuted audio path at zero volume. Only changing volume
         // here avoids the endpoint transition that can produce a click on some audio drivers.
@@ -1302,8 +1387,12 @@ impl PreviewWindowState {
         else {
             return Err(Error::from_hresult(E_INVALIDARG));
         };
-        let (pitch, _) = checked_image_layout(&content.preview)
+        let (width, height, pixels) = content.current_frame();
+        let (pitch, expected) = checked_raw_bgra_layout(width, height)
             .ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
+        if pixels.len() != expected {
+            return Err(Error::from_hresult(E_INVALIDARG));
+        }
         let properties = D2D1_BITMAP_PROPERTIES {
             pixelFormat: D2D1_PIXEL_FORMAT {
                 format: DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -1316,11 +1405,8 @@ impl PreviewWindowState {
         // Direct2D copies the borrowed buffer into a new target-owned bitmap during this call.
         unsafe {
             device.target.CreateBitmap(
-                D2D_SIZE_U {
-                    width: content.preview.width,
-                    height: content.preview.height,
-                },
-                Some(content.preview.premultiplied_bgra.as_ptr().cast()),
+                D2D_SIZE_U { width, height },
+                Some(pixels.as_ptr().cast()),
                 pitch,
                 &properties,
             )
@@ -1373,6 +1459,8 @@ impl TextContent {
     }
 }
 
+// Keeping the active payload inline avoids another allocation on the first-visible preview path.
+#[allow(clippy::large_enum_variant)]
 enum RetainedContent {
     Text(TextContent),
     Image(ImageContent),
@@ -1392,6 +1480,7 @@ impl RetainedContent {
 struct ImageContent {
     metadata: Vec<u16>,
     preview: ImagePreview,
+    animation: Option<ImageAnimationPlayback>,
 }
 
 impl ImageContent {
@@ -1399,8 +1488,72 @@ impl ImageContent {
         Self {
             metadata: image_preview_metadata(&preview).encode_utf16().collect(),
             preview,
+            animation: None,
         }
     }
+
+    fn attach_animation(&mut self, preview: ImageAnimationPreview) -> bool {
+        if preview.file_size != self.preview.file_size
+            || preview.last_write_time != self.preview.last_write_time
+            || preview.format != self.preview.format
+            || preview.source_width != self.preview.source_width
+            || preview.source_height != self.preview.source_height
+        {
+            return false;
+        }
+        self.metadata = image_animation_metadata(&self.preview, preview.truncated)
+            .encode_utf16()
+            .collect();
+        self.animation = Some(ImageAnimationPlayback {
+            preview,
+            frame_index: 0,
+        });
+        true
+    }
+
+    fn current_frame(&self) -> (u32, u32, &[u8]) {
+        self.animation.as_ref().map_or(
+            (
+                self.preview.width,
+                self.preview.height,
+                &self.preview.premultiplied_bgra,
+            ),
+            |animation| {
+                (
+                    animation.preview.width,
+                    animation.preview.height,
+                    animation
+                        .preview
+                        .frame(animation.frame_index)
+                        .expect("validated animation retains every indexed frame"),
+                )
+            },
+        )
+    }
+
+    fn current_frame_delay_ms(&self) -> Option<u32> {
+        let animation = self.animation.as_ref()?;
+        animation
+            .preview
+            .frame_delays_ms
+            .get(animation.frame_index)
+            .copied()
+    }
+
+    fn advance_animation(&mut self) -> Option<u32> {
+        let animation = self.animation.as_mut()?;
+        animation.frame_index = (animation.frame_index + 1) % animation.preview.frames.len();
+        animation
+            .preview
+            .frame_delays_ms
+            .get(animation.frame_index)
+            .copied()
+    }
+}
+
+struct ImageAnimationPlayback {
+    preview: ImageAnimationPreview,
+    frame_index: usize,
 }
 
 struct VideoContent {
@@ -1671,6 +1824,24 @@ fn image_preview_metadata(preview: &ImagePreview) -> String {
     format!("{}\n{details}\n{modified}", preview.display_name)
 }
 
+fn image_animation_metadata(preview: &ImagePreview, truncated: bool) -> String {
+    let mut details = format!(
+        "{}    ({} \u{d7} {})  \u{b7}  animated",
+        format_file_size(preview.file_size),
+        preview.source_width,
+        preview.source_height,
+    );
+    if truncated {
+        details.push_str("  \u{b7}  bounded");
+    }
+    if preview.linked_content {
+        details.push_str("  \u{b7}  linked");
+    }
+    let modified = format_last_write_time(preview.last_write_time)
+        .unwrap_or_else(|| "Modified time unavailable".to_owned());
+    format!("{}\n{details}\n{modified}", preview.display_name)
+}
+
 fn video_preview_metadata(preview: &VideoPreview, native_width: u32, native_height: u32) -> String {
     let mut details = format!(
         "{}    ({} \u{d7} {})",
@@ -1748,10 +1919,7 @@ fn checked_image_layout(preview: &ImagePreview) -> Option<(u32, usize)> {
         return None;
     }
 
-    let pitch = preview.width.checked_mul(4)?;
-    let length = usize::try_from(pitch)
-        .ok()?
-        .checked_mul(usize::try_from(preview.height).ok()?)?;
+    let (pitch, length) = checked_raw_bgra_layout(preview.width, preview.height)?;
     if preview.premultiplied_bgra.len() != length
         || !preview
             .premultiplied_bgra
@@ -1761,6 +1929,17 @@ fn checked_image_layout(preview: &ImagePreview) -> Option<(u32, usize)> {
         return None;
     }
 
+    Some((pitch, length))
+}
+
+fn checked_raw_bgra_layout(width: u32, height: u32) -> Option<(u32, usize)> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let pitch = width.checked_mul(4)?;
+    let length = usize::try_from(pitch)
+        .ok()?
+        .checked_mul(usize::try_from(height).ok()?)?;
     Some((pitch, length))
 }
 
@@ -2156,6 +2335,36 @@ fn dispatch_preview_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
         return LRESULT(1);
     }
 
+    if message == WM_TIMER && wparam.0 == IMAGE_ANIMATION_TIMER_ID {
+        let next_delay =
+            preview_state(hwnd).and_then(|state| state.borrow_mut().advance_image_animation());
+        let Some(next_delay) = next_delay else {
+            // SAFETY: Killing an absent timer is benign for this live preview HWND.
+            let _ = unsafe { KillTimer(Some(hwnd), IMAGE_ANIMATION_TIMER_ID) };
+            return LRESULT(0);
+        };
+        // SAFETY: The live preview HWND owns this timer and the validated delay is nonzero.
+        let timer = unsafe { SetTimer(Some(hwnd), IMAGE_ANIMATION_TIMER_ID, next_delay, None) };
+        // SAFETY: The live HWND is synchronously repainted after releasing the state borrow.
+        let redrawn = unsafe {
+            RedrawWindow(
+                Some(hwnd),
+                None,
+                None,
+                RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW,
+            )
+        }
+        .as_bool();
+        if timer == 0 || !redrawn {
+            // SAFETY: Killing an absent timer is benign for this live preview HWND.
+            let _ = unsafe { KillTimer(Some(hwnd), IMAGE_ANIMATION_TIMER_ID) };
+            if let Some(state) = preview_state(hwnd) {
+                state.borrow_mut().detach_image_animation();
+            }
+        }
+        return LRESULT(0);
+    }
+
     if message == WM_TIMER && wparam.0 == VIDEO_AUDIO_FADE_TIMER_ID {
         let finished =
             preview_state(hwnd).is_none_or(|state| state.borrow_mut().advance_audio_fade());
@@ -2290,7 +2499,7 @@ fn preview_state(hwnd: HWND) -> Option<&'static RefCell<PreviewWindowState>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContentLayouts, D2D_SIZE_U, MAX_Z_ORDER_SCAN, PreviewColors, PreviewWindow,
+        ContentLayouts, D2D_SIZE_U, ImageContent, MAX_Z_ORDER_SCAN, PreviewColors, PreviewWindow,
         PreviewWindowState, RetainedContent, TextContent, VideoChildWindow,
         adjusted_window_pixel_size, checked_image_layout, checked_window_rect, client_pixel_size,
         color_from_colorref, format_file_size, image_client_pixel_size, image_destination_rect,
@@ -2303,7 +2512,9 @@ mod tests {
         platform::{ApartmentKind, ComApartment},
         preview::PreviewSize,
         settings::Theme,
-        worker::{ImageFormat, ImagePreview, TextPreview, image_corpus_previews},
+        worker::{
+            ImageAnimationPreview, ImageFormat, ImagePreview, TextPreview, image_corpus_previews,
+        },
     };
     use cursorpeek_core::payload::{VideoContainer, VideoPreview};
     use std::{env, path::PathBuf, thread};
@@ -2359,6 +2570,7 @@ mod tests {
             source_height: 1,
             width: 2,
             height: 1,
+            animation_source: None,
             premultiplied_bgra: vec![10, 20, 30, 40, 0, 0, 0, 0],
         }
     }
@@ -2920,6 +3132,40 @@ mod tests {
     }
 
     #[test]
+    fn animated_image_upgrade_matches_identity_advances_and_loops() {
+        let mut still = image_preview();
+        still.display_name = "sample.gif".to_owned();
+        still.format = ImageFormat::Gif;
+        let mut content = ImageContent::from_preview(still);
+        let first = vec![10, 20, 30, 255, 40, 50, 60, 255];
+        let second = vec![60, 50, 40, 255, 30, 20, 10, 255];
+        let animation = ImageAnimationPreview {
+            file_size: 12_800,
+            last_write_time: 133_000_000_000_000_000,
+            format: ImageFormat::Gif,
+            source_width: 2,
+            source_height: 1,
+            width: 2,
+            height: 1,
+            truncated: false,
+            frame_delays_ms: vec![40, 60],
+            frames: vec![first.clone(), second.clone()],
+        };
+
+        assert!(content.attach_animation(animation.clone()));
+        assert_eq!(content.current_frame(), (2, 1, first.as_slice()));
+        assert_eq!(content.current_frame_delay_ms(), Some(40));
+        assert_eq!(content.advance_animation(), Some(60));
+        assert_eq!(content.current_frame(), (2, 1, second.as_slice()));
+        assert_eq!(content.advance_animation(), Some(40));
+        assert_eq!(content.current_frame(), (2, 1, first.as_slice()));
+
+        let mut changed = animation;
+        changed.last_write_time += 1;
+        assert!(!content.attach_animation(changed));
+    }
+
+    #[test]
     fn video_metadata_and_surface_follow_the_image_footer_contract() {
         let preview = video_preview();
         let metadata = video_preview_metadata(&preview, 1_920, 1_080);
@@ -2969,6 +3215,7 @@ mod tests {
             source_height: height,
             width,
             height,
+            animation_source: None,
             premultiplied_bgra: vec![0; width as usize * height as usize * 4],
         };
         let maximum = PreviewSize::new(640, 480);
@@ -3023,6 +3270,7 @@ mod tests {
             source_height: 540,
             width: 960,
             height: 540,
+            animation_source: None,
             premultiplied_bgra: vec![0; 960 * 540 * 4],
         };
 

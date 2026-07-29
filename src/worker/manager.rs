@@ -31,7 +31,7 @@ use cursorpeek_core::{
 };
 
 use super::{
-    payload::{PreviewResult, ResolverStatus},
+    payload::{ImageAnimationSource, PreviewResult, ResolverStatus},
     protocol::{self, ProtocolStreamError, SessionNonce, WorkerMessage},
 };
 
@@ -267,13 +267,37 @@ impl WorkerManager {
         notifier: CompletionNotifier,
     ) -> Result<PendingWorkerResolution, WorkerManagerError> {
         Ok(PendingWorkerResolution {
-            receiver: self.requests.submit_with_notifier(
+            receiver: self.requests.submit_request(RequestSubmission {
+                kind: WorkerRequestKind::Primary,
                 generation,
                 point,
-                Some(explorer_window),
+                explorer_window: Some(explorer_window),
                 pointer_span,
-                notifier,
-            )?,
+                animation_source: None,
+                completion_notifier: Some(notifier),
+            })?,
+        })
+    }
+
+    pub(crate) fn submit_image_animation_with_notifier(
+        &self,
+        generation: Generation,
+        point: PhysicalScreenPoint,
+        explorer_window: ExplorerWindowId,
+        pointer_span: PhysicalScreenSpan,
+        source: ImageAnimationSource,
+        notifier: CompletionNotifier,
+    ) -> Result<PendingWorkerResolution, WorkerManagerError> {
+        Ok(PendingWorkerResolution {
+            receiver: self.requests.submit_request(RequestSubmission {
+                kind: WorkerRequestKind::ImageAnimation,
+                generation,
+                point,
+                explorer_window: Some(explorer_window),
+                pointer_span,
+                animation_source: Some(source),
+                completion_notifier: Some(notifier),
+            })?,
         })
     }
 
@@ -393,18 +417,38 @@ impl PendingWorkerResolution {
     }
 }
 
+// Polling is the hot worker-to-UI delivery path; boxing Ready would add one allocation per result.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum PendingWorkerPoll {
     Pending,
     Ready(Result<WorkerResolution, WorkerManagerError>),
 }
 
 struct PendingRequest {
+    kind: WorkerRequestKind,
     generation: Generation,
     point: PhysicalScreenPoint,
     explorer_window: Option<ExplorerWindowId>,
     pointer_span: PhysicalScreenSpan,
+    animation_source: Option<ImageAnimationSource>,
     response_sender: SyncSender<Result<WorkerResolution, WorkerManagerError>>,
     completion_notifier: Option<CompletionNotifier>,
+}
+
+struct RequestSubmission {
+    kind: WorkerRequestKind,
+    generation: Generation,
+    point: PhysicalScreenPoint,
+    explorer_window: Option<ExplorerWindowId>,
+    pointer_span: PhysicalScreenSpan,
+    animation_source: Option<ImageAnimationSource>,
+    completion_notifier: Option<CompletionNotifier>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerRequestKind {
+    Primary,
+    ImageAnimation,
 }
 
 #[derive(Clone, Copy)]
@@ -478,40 +522,30 @@ impl LatestRequestMailbox {
         generation: Generation,
         point: PhysicalScreenPoint,
     ) -> Result<Receiver<Result<WorkerResolution, WorkerManagerError>>, WorkerManagerError> {
-        self.submit_request(
+        self.submit_request(RequestSubmission {
+            kind: WorkerRequestKind::Primary,
             generation,
             point,
-            None,
-            PhysicalScreenSpan::from_point(point),
-            None,
-        )
-    }
-
-    fn submit_with_notifier(
-        &self,
-        generation: Generation,
-        point: PhysicalScreenPoint,
-        explorer_window: Option<ExplorerWindowId>,
-        pointer_span: PhysicalScreenSpan,
-        notifier: CompletionNotifier,
-    ) -> Result<Receiver<Result<WorkerResolution, WorkerManagerError>>, WorkerManagerError> {
-        self.submit_request(
-            generation,
-            point,
-            explorer_window,
-            pointer_span,
-            Some(notifier),
-        )
+            explorer_window: None,
+            pointer_span: PhysicalScreenSpan::from_point(point),
+            animation_source: None,
+            completion_notifier: None,
+        })
     }
 
     fn submit_request(
         &self,
-        generation: Generation,
-        point: PhysicalScreenPoint,
-        explorer_window: Option<ExplorerWindowId>,
-        pointer_span: PhysicalScreenSpan,
-        completion_notifier: Option<CompletionNotifier>,
+        submission: RequestSubmission,
     ) -> Result<Receiver<Result<WorkerResolution, WorkerManagerError>>, WorkerManagerError> {
+        let RequestSubmission {
+            kind,
+            generation,
+            point,
+            explorer_window,
+            pointer_span,
+            animation_source,
+            completion_notifier,
+        } = submission;
         let (response_sender, response_receiver) = mpsc::sync_channel(1);
         let replaced = {
             let mut state = self
@@ -523,10 +557,12 @@ impl LatestRequestMailbox {
             }
 
             let replaced = state.pending.replace(PendingRequest {
+                kind,
                 generation,
                 point,
                 explorer_window,
                 pointer_span,
+                animation_source,
                 response_sender,
                 completion_notifier,
             });
@@ -551,7 +587,7 @@ impl LatestRequestMailbox {
         diagnostics::record(
             "worker.mailbox.queued",
             format_args!(
-                "generation={} x={} y={} explorer={} notifier={}",
+                "generation={} request={kind:?} x={} y={} explorer={} notifier={}",
                 generation.get(),
                 point.x,
                 point.y,
@@ -689,10 +725,12 @@ fn manager_loop(
             .map(|_| remaining(last_used + config.idle_lifetime));
         match requests.take(timeout)? {
             MailboxTake::Request(PendingRequest {
+                kind,
                 generation,
                 point,
                 explorer_window,
                 pointer_span,
+                animation_source,
                 response_sender,
                 completion_notifier,
             }) => {
@@ -700,7 +738,7 @@ fn manager_loop(
                 diagnostics::record(
                     "worker.manager.dequeued",
                     format_args!(
-                        "generation={} session_live={} x={} y={} explorer={}",
+                        "generation={} request={kind:?} session_live={} x={} y={} explorer={}",
                         generation.get(),
                         session.is_some(),
                         point.x,
@@ -743,7 +781,14 @@ fn manager_loop(
                 let result = session
                     .as_ref()
                     .expect("a session is created before request dispatch")
-                    .resolve(generation, point, explorer_window, pointer_span);
+                    .resolve(
+                        kind,
+                        generation,
+                        point,
+                        explorer_window,
+                        pointer_span,
+                        animation_source,
+                    );
                 last_used = Instant::now();
 
                 match result {
@@ -988,16 +1033,18 @@ impl WorkerSession {
 
     fn resolve(
         &self,
+        kind: WorkerRequestKind,
         generation: Generation,
         point: PhysicalScreenPoint,
         explorer_window: Option<ExplorerWindowId>,
         pointer_span: PhysicalScreenSpan,
+        animation_source: Option<ImageAnimationSource>,
     ) -> Result<WorkerResponse, WorkerManagerError> {
         let started = diagnostics::counter();
         diagnostics::record(
             "worker.protocol.request",
             format_args!(
-                "session={} generation={} x={} y={} explorer={}",
+                "session={} generation={} request={kind:?} x={} y={} explorer={}",
                 self.id,
                 generation.get(),
                 point.x,
@@ -1010,10 +1057,12 @@ impl WorkerSession {
             .as_ref()
             .expect("live sessions retain their protocol sender")
             .send(ProtocolCommand {
+                kind,
                 generation,
                 point,
                 explorer_window,
                 pointer_span,
+                animation_source,
                 response_sender,
             })
             .map_err(|_| WorkerManagerError::ProtocolChannelDisconnected)?;
@@ -1090,10 +1139,12 @@ impl WorkerSession {
 }
 
 struct ProtocolCommand {
+    kind: WorkerRequestKind,
     generation: Generation,
     point: PhysicalScreenPoint,
     explorer_window: Option<ExplorerWindowId>,
     pointer_span: PhysicalScreenSpan,
+    animation_source: Option<ImageAnimationSource>,
     response_sender: SyncSender<Result<WorkerResponse, WorkerManagerError>>,
 }
 
@@ -1149,17 +1200,24 @@ fn protocol_loop(
     while let Ok(command) = command_receiver.recv() {
         let started = diagnostics::counter();
         let result = (|| {
-            protocol::write_message(
-                &mut stdin,
-                WorkerMessage::ResolvePoint {
+            let request = match command.kind {
+                WorkerRequestKind::Primary => WorkerMessage::ResolvePoint {
                     generation: command.generation,
                     point: command.point,
                     explorer_window: command.explorer_window,
                     pointer_span: command.pointer_span,
                 },
-            )?;
+                WorkerRequestKind::ImageAnimation => WorkerMessage::DecodeImageAnimation {
+                    generation: command.generation,
+                    source: command
+                        .animation_source
+                        .expect("animation requests carry a validated source"),
+                },
+            };
+            protocol::write_message(&mut stdin, request)?;
             validate_result(
                 protocol::read_message(&mut stdout)?,
+                command.kind,
                 command.generation,
                 command.point,
             )
@@ -1168,8 +1226,9 @@ fn protocol_loop(
         diagnostics::record(
             "worker.protocol.roundtrip",
             format_args!(
-                "generation={} outcome={} elapsed_us={}",
+                "generation={} request={:?} outcome={} elapsed_us={}",
                 command.generation.get(),
+                command.kind,
                 if failed { "error" } else { "success" },
                 diagnostics::elapsed_us(started).unwrap_or(0)
             ),
@@ -1194,6 +1253,7 @@ fn preview_result_kind(result: &PreviewResult) -> &'static str {
         PreviewResult::Text(_) => "text",
         PreviewResult::Image(_) => "image",
         PreviewResult::Video(_) => "video",
+        PreviewResult::ImageAnimation(_) => "image-animation",
     }
 }
 
@@ -1213,6 +1273,7 @@ fn validate_ready(
 
 fn validate_result(
     message: Option<WorkerMessage>,
+    expected_kind: WorkerRequestKind,
     expected_generation: Generation,
     expected_point: PhysicalScreenPoint,
 ) -> Result<WorkerResponse, WorkerManagerError> {
@@ -1224,6 +1285,16 @@ fn validate_result(
         }) if generation == expected_generation => {
             if target_bounds.is_some_and(|bounds| !bounds.contains(expected_point)) {
                 return Err(WorkerManagerError::TargetBoundsMismatch);
+            }
+            let kind_matches = match expected_kind {
+                WorkerRequestKind::Primary => !matches!(&result, PreviewResult::ImageAnimation(_)),
+                WorkerRequestKind::ImageAnimation => matches!(
+                    &result,
+                    PreviewResult::ImageAnimation(_) | PreviewResult::Status(_)
+                ),
+            };
+            if !kind_matches {
+                return Err(WorkerManagerError::UnexpectedResult);
             }
             Ok(WorkerResponse {
                 target_bounds,
@@ -1573,13 +1644,14 @@ impl From<ProtocolStreamError> for WorkerManagerError {
 mod tests {
     use super::{
         CompletionNotifier, DEFAULT_WORKER_IDLE_LIFETIME, LatestRequestMailbox, MailboxTake,
-        PendingWorkerPoll, PendingWorkerResolution, WorkerManager, WorkerManagerConfig,
-        WorkerManagerError, WorkerResolution, complete_request, validate_ready, validate_result,
+        PendingWorkerPoll, PendingWorkerResolution, RequestSubmission, WorkerManager,
+        WorkerManagerConfig, WorkerManagerError, WorkerRequestKind, WorkerResolution,
+        complete_request, validate_ready, validate_result,
     };
     use crate::{
         hover::{Generation, PhysicalScreenPoint},
         worker::{
-            payload::{PreviewResult, ResolverStatus},
+            payload::{ImageAnimationPreview, ImageFormat, PreviewResult, ResolverStatus},
             protocol::{SessionNonce, WorkerMessage},
         },
     };
@@ -1673,10 +1745,53 @@ mod tests {
                     target_bounds: None,
                     result: PreviewResult::Status(ResolverStatus::Unavailable),
                 }),
+                WorkerRequestKind::Primary,
                 Generation::from_raw(1),
                 PhysicalScreenPoint::new(10, 20),
             ),
             Err(WorkerManagerError::GenerationMismatch)
+        ));
+    }
+
+    #[test]
+    fn parent_accepts_animation_only_for_the_animation_request_lane() {
+        let result = PreviewResult::ImageAnimation(ImageAnimationPreview {
+            file_size: 8,
+            last_write_time: 1,
+            format: ImageFormat::Gif,
+            source_width: 2,
+            source_height: 1,
+            width: 2,
+            height: 1,
+            truncated: false,
+            frame_delays_ms: vec![40, 60],
+            frames: vec![vec![0; 8], vec![0; 8]],
+        });
+        let message = || {
+            Some(WorkerMessage::PreviewResult {
+                generation: Generation::from_raw(1),
+                target_bounds: None,
+                result: result.clone(),
+            })
+        };
+
+        assert!(
+            validate_result(
+                message(),
+                WorkerRequestKind::ImageAnimation,
+                Generation::from_raw(1),
+                PhysicalScreenPoint::new(10, 20),
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            validate_result(
+                message(),
+                WorkerRequestKind::Primary,
+                Generation::from_raw(1),
+                PhysicalScreenPoint::new(10, 20),
+            ),
+            Err(WorkerManagerError::UnexpectedResult)
         ));
     }
 
@@ -1699,6 +1814,7 @@ mod tests {
                         text: "sample".to_owned(),
                     }),
                 }),
+                WorkerRequestKind::Primary,
                 Generation::from_raw(1),
                 PhysicalScreenPoint::new(200, 150),
             ),
@@ -1760,13 +1876,15 @@ mod tests {
         let explorer_window = ExplorerWindowId::try_from_raw(0x1234).unwrap();
         let point = PhysicalScreenPoint::new(20, 30);
         let pending = mailbox
-            .submit_with_notifier(
-                Generation::from_raw(3),
+            .submit_request(RequestSubmission {
+                kind: WorkerRequestKind::Primary,
+                generation: Generation::from_raw(3),
                 point,
-                Some(explorer_window),
-                PhysicalScreenSpan::from_point(point),
-                CompletionNotifier::new(1, record_notification),
-            )
+                explorer_window: Some(explorer_window),
+                pointer_span: PhysicalScreenSpan::from_point(point),
+                animation_source: None,
+                completion_notifier: Some(CompletionNotifier::new(1, record_notification)),
+            })
             .unwrap();
 
         let request = match mailbox.take(Some(Duration::ZERO)).unwrap() {
@@ -1796,13 +1914,15 @@ mod tests {
         NOTIFICATION_COUNT.store(0, Ordering::SeqCst);
         let mailbox = LatestRequestMailbox::new();
         let older = mailbox
-            .submit_with_notifier(
-                Generation::from_raw(1),
-                PhysicalScreenPoint::new(1, 1),
-                None,
-                PhysicalScreenSpan::from_point(PhysicalScreenPoint::new(1, 1)),
-                CompletionNotifier::new(1, record_notification),
-            )
+            .submit_request(RequestSubmission {
+                kind: WorkerRequestKind::Primary,
+                generation: Generation::from_raw(1),
+                point: PhysicalScreenPoint::new(1, 1),
+                explorer_window: None,
+                pointer_span: PhysicalScreenSpan::from_point(PhysicalScreenPoint::new(1, 1)),
+                animation_source: None,
+                completion_notifier: Some(CompletionNotifier::new(1, record_notification)),
+            })
             .unwrap();
 
         let _newer = mailbox

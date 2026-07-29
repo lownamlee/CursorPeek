@@ -17,12 +17,14 @@ const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 // relevant value if a future long-lived worker can switch implementation rules in-process.
 const TEXT_PROVIDER_VERSION: u32 = 2;
 const IMAGE_PROVIDER_VERSION: u32 = 2;
+const IMAGE_ANIMATION_PROVIDER_VERSION: u32 = 1;
 const VIDEO_PROVIDER_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PreviewProvider {
     Text,
     Image,
+    ImageAnimation,
     Video,
 }
 
@@ -48,6 +50,9 @@ impl PreviewProvider {
             Self::Image => PreviewProviderKey::Image {
                 version: IMAGE_PROVIDER_VERSION,
             },
+            Self::ImageAnimation => PreviewProviderKey::ImageAnimation {
+                version: IMAGE_ANIMATION_PROVIDER_VERSION,
+            },
             Self::Video => PreviewProviderKey::Video {
                 version: VIDEO_PROVIDER_VERSION,
             },
@@ -64,6 +69,9 @@ enum PreviewProviderKey {
     Image {
         version: u32,
     },
+    ImageAnimation {
+        version: u32,
+    },
     Video {
         version: u32,
     },
@@ -76,7 +84,10 @@ impl PreviewProviderKey {
                 legacy_encoding: LegacyEncoding::Label(label),
                 ..
             } => label.capacity(),
-            Self::Text { .. } | Self::Image { .. } | Self::Video { .. } => 0,
+            Self::Text { .. }
+            | Self::Image { .. }
+            | Self::ImageAnimation { .. }
+            | Self::Video { .. } => 0,
         }
     }
 }
@@ -130,7 +141,31 @@ fn result_heap_bytes(result: &PreviewResult) -> Option<usize> {
         PreviewResult::Image(preview) => preview
             .display_name
             .capacity()
-            .checked_add(preview.premultiplied_bgra.capacity()),
+            .checked_add(preview.premultiplied_bgra.capacity())
+            .and_then(|length| {
+                preview
+                    .animation_source
+                    .as_ref()
+                    .map_or(Some(length), |source| {
+                        length.checked_add(source.path.capacity().checked_mul(size_of::<u16>())?)
+                    })
+            }),
+        PreviewResult::ImageAnimation(preview) => preview
+            .frame_delays_ms
+            .capacity()
+            .checked_mul(size_of::<u32>())?
+            .checked_add(
+                preview
+                    .frames
+                    .capacity()
+                    .checked_mul(size_of::<Vec<u8>>())?,
+            )?
+            .checked_add(
+                preview
+                    .frames
+                    .iter()
+                    .try_fold(0_usize, |total, frame| total.checked_add(frame.capacity()))?,
+            ),
         PreviewResult::Video(preview) => preview
             .display_name
             .capacity()

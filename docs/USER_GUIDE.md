@@ -61,8 +61,8 @@ Eligible extensions:
 | --- | --- | --- |
 | JPEG | `.jpg`, `.jpeg`, `.jpe`, `.jfif` | Applies supported EXIF orientation |
 | PNG | `.png` | Preserves alpha |
-| GIF | `.gif` | Uses the first composited frame |
-| WebP | `.webp` | Uses a still preview |
+| GIF | `.gif` | Shows the first composited frame, then bounded animation when eligible |
+| WebP | `.webp` | Shows a still frame, then bounded animation when eligible |
 | Bitmap | `.bmp`, `.dib` | Bounded raster decode |
 | Icon | `.ico` | Uses a deterministic first-image policy |
 | TIFF | `.tif`, `.tiff` | Uses a deterministic first-page policy |
@@ -78,11 +78,14 @@ Current image limits:
 - source pixels: 40,000,000;
 - decoded image bytes: 160 MiB;
 - decoder allocation: 256 MiB;
-- displayed preview bitmap: at most 960 x 720 pixels.
+- displayed preview bitmap: at most 960 x 720 pixels;
+- animation decode: at most 480 x 360 pixels, 32 frames, 16 MiB of pixels, and 60 seconds.
 
 Images are never enlarged beyond their decoded size and are fitted without changing aspect ratio.
 The popup follows the displayed image size, up to the selected maximum, with file details beneath
-the image.
+the image. For GIF and WebP, CursorPeek presents the normal still preview first. A separate
+contained worker may replace its pixels with a complete bounded animation only while the same file,
+Explorer item, and hover generation remain active. Static WebP files do not start that worker.
 
 ## Supported video
 
@@ -273,11 +276,13 @@ preserved for forward compatibility.
 
 CursorPeek has no account, telemetry, content upload, update check, or application network
 protocol. It reads the selected local file only after Explorer identity checks succeed. Image and
-text parsing and decoding occur in a separate worker process with strict resource limits,
-authenticated bounded IPC, process mitigations, and kill-on-close Job containment. Video extension
-and container eligibility are checked there, then the coordinator revalidates the exact file
-identity and detected container family and holds a no-write/no-delete lock while Windows Media
-Foundation performs native playback.
+text parsing and decoding occur in contained worker processes with strict resource limits,
+authenticated bounded IPC, process mitigations, and kill-on-close Job containment. An optional
+animation worker reopens only the validated local path and requires the same file identity, size,
+write time, format, and dimensions before returning frames. Video extension and container
+eligibility are checked in a worker, then the coordinator revalidates the exact file identity and
+detected container family and holds a no-write/no-delete lock while Windows Media Foundation
+performs native playback.
 
 The worker runs as the same Windows user. It is not an AppContainer, a different integrity level,
 or a security sandbox. Containment is designed to recover from decoder crashes, hangs, malformed

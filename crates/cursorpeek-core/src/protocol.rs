@@ -8,13 +8,14 @@ use crate::{
     ExplorerWindowId, Generation, LegacyEncoding, PhysicalScreenPoint, PhysicalScreenRect,
     PhysicalScreenSpan,
     payload::{
-        MAX_PREVIEW_PAYLOAD_LEN, MIN_PREVIEW_RESULT_LEN, PayloadError, PreviewResult,
-        decode_result, encode_result,
+        ImageAnimationSource, MAX_IMAGE_ANIMATION_SOURCE_LEN, MAX_PREVIEW_PAYLOAD_LEN,
+        MIN_PREVIEW_RESULT_LEN, PayloadError, PreviewResult, decode_image_animation_source,
+        decode_result, encode_image_animation_source, encode_result,
     },
 };
 
 const MAGIC: [u8; 4] = *b"CPWK";
-const VERSION: u16 = 10;
+const VERSION: u16 = 12;
 const HEADER_LEN: usize = 24;
 const NONCE_LEN: usize = 16;
 const CACHE_ENTRIES_LEN: usize = 2;
@@ -54,6 +55,10 @@ pub enum WorkerMessage {
         explorer_window: Option<ExplorerWindowId>,
         pointer_span: PhysicalScreenSpan,
     },
+    DecodeImageAnimation {
+        generation: Generation,
+        source: ImageAnimationSource,
+    },
     PreviewResult {
         generation: Generation,
         target_bounds: Option<PhysicalScreenRect>,
@@ -67,6 +72,7 @@ impl WorkerMessage {
             Self::Hello { .. } => MessageKind::Hello,
             Self::Ready { .. } => MessageKind::Ready,
             Self::ResolvePoint { .. } => MessageKind::ResolvePoint,
+            Self::DecodeImageAnimation { .. } => MessageKind::DecodeImageAnimation,
             Self::PreviewResult { .. } => MessageKind::PreviewResult,
         }
     }
@@ -74,9 +80,9 @@ impl WorkerMessage {
     fn generation(&self) -> Generation {
         match self {
             Self::Hello { .. } | Self::Ready { .. } => Generation::from_raw(0),
-            Self::ResolvePoint { generation, .. } | Self::PreviewResult { generation, .. } => {
-                *generation
-            }
+            Self::ResolvePoint { generation, .. }
+            | Self::DecodeImageAnimation { generation, .. }
+            | Self::PreviewResult { generation, .. } => *generation,
         }
     }
 }
@@ -87,6 +93,7 @@ enum MessageKind {
     Ready = 2,
     ResolvePoint = 3,
     PreviewResult = 4,
+    DecodeImageAnimation = 5,
 }
 
 impl MessageKind {
@@ -96,6 +103,7 @@ impl MessageKind {
             2 => Ok(Self::Ready),
             3 => Ok(Self::ResolvePoint),
             4 => Ok(Self::PreviewResult),
+            5 => Ok(Self::DecodeImageAnimation),
             _ => Err(ProtocolError::UnknownMessageKind(value)),
         }
     }
@@ -108,6 +116,10 @@ impl MessageKind {
             ),
             Self::Ready => (NONCE_LEN, NONCE_LEN),
             Self::ResolvePoint => (32, 32),
+            Self::DecodeImageAnimation => (
+                crate::payload::IMAGE_ANIMATION_SOURCE_FIXED_LEN,
+                MAX_IMAGE_ANIMATION_SOURCE_LEN,
+            ),
             Self::PreviewResult => (MIN_PREVIEW_RESPONSE_LEN, MAX_PREVIEW_RESPONSE_LEN),
         }
     }
@@ -459,6 +471,9 @@ fn encode_message(message: WorkerMessage) -> Result<EncodedMessage, ProtocolErro
             payload.extend_from_slice(&pointer_span.max_y().to_le_bytes());
             payload
         }
+        WorkerMessage::DecodeImageAnimation { source, .. } => {
+            encode_image_animation_source(&source)?
+        }
         WorkerMessage::PreviewResult {
             target_bounds,
             result,
@@ -541,6 +556,10 @@ fn decode_payload(header: FrameHeader, payload: &[u8]) -> Result<WorkerMessage, 
                 pointer_span,
             })
         }
+        MessageKind::DecodeImageAnimation => Ok(WorkerMessage::DecodeImageAnimation {
+            generation: header.generation,
+            source: decode_image_animation_source(payload)?,
+        }),
         MessageKind::PreviewResult => {
             let (target_bounds, result) = decode_preview_response(payload)?;
             Ok(WorkerMessage::PreviewResult {
@@ -625,11 +644,21 @@ fn validate_target_bounds(
     result: &PreviewResult,
 ) -> Result<(), ProtocolError> {
     match (target_bounds, result) {
-        (Some(_), PreviewResult::Text(_) | PreviewResult::Image(_) | PreviewResult::Video(_))
+        (
+            Some(_),
+            PreviewResult::Text(_)
+            | PreviewResult::Image(_)
+            | PreviewResult::Video(_)
+            | PreviewResult::ImageAnimation(_),
+        )
         | (None, PreviewResult::Status(_)) => Ok(()),
-        (None, PreviewResult::Text(_) | PreviewResult::Image(_) | PreviewResult::Video(_)) => {
-            Err(ProtocolError::MissingTargetBounds)
-        }
+        (
+            None,
+            PreviewResult::Text(_)
+            | PreviewResult::Image(_)
+            | PreviewResult::Video(_)
+            | PreviewResult::ImageAnimation(_),
+        ) => Err(ProtocolError::MissingTargetBounds),
         (Some(_), PreviewResult::Status(_)) => Err(ProtocolError::UnexpectedTargetBounds),
     }
 }
@@ -666,7 +695,10 @@ mod tests {
     use crate::{
         ExplorerWindowId, Generation, LegacyEncoding, PhysicalScreenPoint, PhysicalScreenRect,
         PhysicalScreenSpan,
-        payload::{PayloadError, PreviewResult, ResolverStatus, TextPreview},
+        payload::{
+            ImageAnimationSource, ImageFormat, PayloadError, PreviewResult, ResolverStatus,
+            TextPreview,
+        },
     };
     use std::io::{self, ErrorKind, Read, Write};
 
@@ -680,6 +712,10 @@ mod tests {
             hello(LegacyEncoding::Auto),
             WorkerMessage::Ready { nonce: NONCE },
             request_message(),
+            WorkerMessage::DecodeImageAnimation {
+                generation: Generation::from_raw(0x1112_1314_1516_1718),
+                source: animation_source(),
+            },
             WorkerMessage::PreviewResult {
                 generation: Generation::from_raw(u64::MAX),
                 target_bounds: None,
@@ -706,6 +742,22 @@ mod tests {
             point: PhysicalScreenPoint::new(-2, 0x0102_0304),
             explorer_window: ExplorerWindowId::try_from_raw(0x1112_1314_1516_1718),
             pointer_span: PhysicalScreenSpan::try_new(-10, -20, 30, 0x0102_0304).unwrap(),
+        }
+    }
+
+    fn animation_source() -> ImageAnimationSource {
+        ImageAnimationSource {
+            file_size: 45_678,
+            last_write_time: 133_000_000_000_000_000,
+            volume_serial_number: 0x0123_4567_89ab_cdef,
+            file_id: [
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff,
+            ],
+            format: ImageFormat::Gif,
+            source_width: 3,
+            source_height: 2,
+            path: r"\\?\C:\Images\sample.gif".encode_utf16().collect(),
         }
     }
 

@@ -13,8 +13,11 @@ mod protocol {
 
 use std::{
     error::Error,
+    ffi::OsString,
     fmt,
     io::{Read, Write},
+    os::windows::ffi::{OsStrExt, OsStringExt},
+    path::PathBuf,
 };
 
 use crate::{
@@ -28,7 +31,7 @@ use cache::{PreviewCache, PreviewCacheKey, PreviewProvider};
 #[cfg(test)]
 use cursorpeek_core::PhysicalScreenPoint;
 use cursorpeek_core::{PhysicalScreenRect, PhysicalScreenSpan};
-use image::ImageDecodeResult;
+use image::{ImageAnimationDecodeResult, ImageDecodeResult};
 use protocol::{ProtocolStreamError, WorkerMessage};
 use text::TextDecodeResult;
 
@@ -40,7 +43,10 @@ pub(crate) use manager::{
 };
 #[cfg(test)]
 pub(crate) use payload::ImageFormat;
-pub(crate) use payload::{ImagePreview, PreviewResult, ResolverStatus, TextPreview};
+pub(crate) use payload::{
+    ImageAnimationPreview, ImageAnimationSource, ImagePreview, PreviewResult, ResolverStatus,
+    TextPreview,
+};
 
 pub(crate) fn run_session<R, W>(
     reader: &mut R,
@@ -75,41 +81,56 @@ where
     let mut cache = PreviewCache::with_entry_limit(cache_entries);
 
     loop {
-        let (generation, point, explorer_window, pointer_span) =
-            match protocol::read_message(reader)? {
-                Some(WorkerMessage::ResolvePoint {
-                    generation,
-                    point,
-                    explorer_window,
-                    pointer_span,
-                }) => (generation, point, explorer_window, pointer_span),
-                Some(_) => return Err(WorkerSessionError::ExpectedResolvePoint),
-                None => return Ok(()),
-            };
+        let Some(request) = protocol::read_message(reader)? else {
+            return Ok(());
+        };
         let request_started = diagnostics::counter();
-        diagnostics::record(
-            "worker.process.request",
-            format_args!(
-                "generation={} x={} y={} explorer={}",
-                generation.get(),
-                point.x,
-                point.y,
-                explorer_window.map_or(0, cursorpeek_core::ExplorerWindowId::get)
-            ),
-        );
-        let resolver_started = diagnostics::counter();
-        let outcome = resolver.resolve(point, explorer_window);
-        diagnostics::record(
-            "worker.resolver.completed",
-            format_args!(
-                "generation={} outcome={} elapsed_us={}",
-                generation.get(),
-                resolve_outcome_kind(&outcome),
-                diagnostics::elapsed_us(resolver_started).unwrap_or(0)
-            ),
-        );
-        let (target_bounds, result) =
-            resolver_result_with_cache(outcome, pointer_span, &legacy_encoding, &mut cache);
+        let (generation, target_bounds, result) = match request {
+            WorkerMessage::ResolvePoint {
+                generation,
+                point,
+                explorer_window,
+                pointer_span,
+            } => {
+                diagnostics::record(
+                    "worker.process.request",
+                    format_args!(
+                        "generation={} request=primary x={} y={} explorer={}",
+                        generation.get(),
+                        point.x,
+                        point.y,
+                        explorer_window.map_or(0, cursorpeek_core::ExplorerWindowId::get)
+                    ),
+                );
+                let resolver_started = diagnostics::counter();
+                let outcome = resolver.resolve(point, explorer_window);
+                diagnostics::record(
+                    "worker.resolver.completed",
+                    format_args!(
+                        "generation={} outcome={} elapsed_us={}",
+                        generation.get(),
+                        resolve_outcome_kind(&outcome),
+                        diagnostics::elapsed_us(resolver_started).unwrap_or(0)
+                    ),
+                );
+                let (target_bounds, result) =
+                    resolver_result_with_cache(outcome, pointer_span, &legacy_encoding, &mut cache);
+                (generation, target_bounds, result)
+            }
+            WorkerMessage::DecodeImageAnimation { generation, source } => {
+                diagnostics::record(
+                    "worker.process.request",
+                    format_args!(
+                        "generation={} request=image-animation path_units={}",
+                        generation.get(),
+                        source.path.len()
+                    ),
+                );
+                let result = preview_animation_source_result(&source, &legacy_encoding, &mut cache);
+                (generation, None, result)
+            }
+            _ => return Err(WorkerSessionError::ExpectedRequest),
+        };
         record_preview_result(
             "worker.preview.completed",
             generation,
@@ -192,7 +213,10 @@ fn resolver_result_with_cache(
             (
                 matches!(
                     result,
-                    PreviewResult::Text(_) | PreviewResult::Image(_) | PreviewResult::Video(_)
+                    PreviewResult::Text(_)
+                        | PreviewResult::Image(_)
+                        | PreviewResult::Video(_)
+                        | PreviewResult::ImageAnimation(_)
                 )
                 .then_some(target_bounds),
                 result,
@@ -201,6 +225,77 @@ fn resolver_result_with_cache(
         ResolveOutcome::Unsupported => (None, PreviewResult::Status(ResolverStatus::Unsupported)),
         ResolveOutcome::Ambiguous => (None, PreviewResult::Status(ResolverStatus::Ambiguous)),
         ResolveOutcome::Unavailable => (None, PreviewResult::Status(ResolverStatus::Unavailable)),
+    }
+}
+
+fn preview_animation_source_result(
+    source: &ImageAnimationSource,
+    legacy_encoding: &LegacyEncoding,
+    cache: &mut PreviewCache,
+) -> PreviewResult {
+    let path = PathBuf::from(OsString::from_wide(&source.path));
+    let open_started = diagnostics::counter();
+    let file = match PreviewFile::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.is_unsupported() => {
+            diagnostics::record(
+                "worker.animation.file.open",
+                format_args!(
+                    "outcome=unsupported elapsed_us={}",
+                    diagnostics::elapsed_us(open_started).unwrap_or(0)
+                ),
+            );
+            return PreviewResult::Status(ResolverStatus::Unsupported);
+        }
+        Err(_) => {
+            diagnostics::record(
+                "worker.animation.file.open",
+                format_args!(
+                    "outcome=unavailable elapsed_us={}",
+                    diagnostics::elapsed_us(open_started).unwrap_or(0)
+                ),
+            );
+            return PreviewResult::Status(ResolverStatus::Unavailable);
+        }
+    };
+    let same_source = file.file_size() == source.file_size
+        && file.last_write_time() == source.last_write_time
+        && file.volume_serial_number() == source.volume_serial_number
+        && file.file_id() == source.file_id
+        && file
+            .final_path()
+            .as_os_str()
+            .encode_wide()
+            .eq(source.path.iter().copied());
+    if !same_source {
+        diagnostics::record(
+            "worker.animation.file.open",
+            format_args!("outcome=identity_mismatch"),
+        );
+        return PreviewResult::Status(ResolverStatus::Unavailable);
+    }
+    diagnostics::record(
+        "worker.animation.file.open",
+        format_args!(
+            "outcome=success file_size={} elapsed_us={}",
+            file.file_size(),
+            diagnostics::elapsed_us(open_started).unwrap_or(0)
+        ),
+    );
+
+    let result = preview_animation_file_result(&file, legacy_encoding, cache);
+    match &result {
+        PreviewResult::ImageAnimation(preview)
+            if preview.file_size == source.file_size
+                && preview.last_write_time == source.last_write_time
+                && preview.format == source.format
+                && preview.source_width == source.source_width
+                && preview.source_height == source.source_height =>
+        {
+            result
+        }
+        PreviewResult::Status(_) => result,
+        _ => PreviewResult::Status(ResolverStatus::Unavailable),
     }
 }
 
@@ -249,6 +344,9 @@ fn preview_file_result(
                 preview.display_name = file.display_name();
                 preview.last_write_time = file.last_write_time();
             }
+            PreviewResult::ImageAnimation(preview) => {
+                preview.last_write_time = file.last_write_time();
+            }
             PreviewResult::Status(_) => {}
         }
         return match file.is_unchanged() {
@@ -291,6 +389,83 @@ fn preview_file_result(
             Ok(preview) => PreviewResult::Video(preview),
             Err(_) => PreviewResult::Status(ResolverStatus::Unavailable),
         },
+        PreviewProvider::ImageAnimation => {
+            unreachable!("the primary provider selector never returns an animation upgrade")
+        }
+    };
+    diagnostics::record(
+        "worker.decode",
+        format_args!(
+            "provider={provider:?} kind={} elapsed_us={}",
+            preview_result_kind(&result),
+            diagnostics::elapsed_us(decode_started).unwrap_or(0)
+        ),
+    );
+    let retained = cache.insert(key, result.clone());
+    diagnostics::record(
+        "worker.cache",
+        format_args!(
+            "outcome=insert retained={retained} entries={}",
+            cache.entry_count()
+        ),
+    );
+    result
+}
+
+fn preview_animation_file_result(
+    file: &PreviewFile,
+    legacy_encoding: &LegacyEncoding,
+    cache: &mut PreviewCache,
+) -> PreviewResult {
+    if !matches!(
+        file.final_path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .as_deref(),
+        Some("gif" | "webp")
+    ) {
+        return PreviewResult::Status(ResolverStatus::Unsupported);
+    }
+
+    let provider = PreviewProvider::ImageAnimation;
+    let key = PreviewCacheKey::new(file, provider, legacy_encoding);
+    match file.is_unchanged() {
+        Ok(true) => {}
+        Ok(false) | Err(_) => return PreviewResult::Status(ResolverStatus::Unavailable),
+    }
+    if let Some(mut result) = cache.get(&key) {
+        diagnostics::record(
+            "worker.cache",
+            format_args!(
+                "outcome=hit provider={provider:?} entries={}",
+                cache.entry_count()
+            ),
+        );
+        if let PreviewResult::ImageAnimation(preview) = &mut result {
+            preview.last_write_time = file.last_write_time();
+        }
+        return match file.is_unchanged() {
+            Ok(true) => result,
+            Ok(false) | Err(_) => PreviewResult::Status(ResolverStatus::Unavailable),
+        };
+    }
+
+    diagnostics::record(
+        "worker.cache",
+        format_args!(
+            "outcome=miss provider={provider:?} entries={}",
+            cache.entry_count()
+        ),
+    );
+    let decode_started = diagnostics::counter();
+    let result = match image::decode_animation(file) {
+        Ok(ImageAnimationDecodeResult::Preview(preview)) => PreviewResult::ImageAnimation(preview),
+        Ok(ImageAnimationDecodeResult::Unsupported) => {
+            PreviewResult::Status(ResolverStatus::Unsupported)
+        }
+        Err(error) if error.is_unsupported() => PreviewResult::Status(ResolverStatus::Unsupported),
+        Err(_) => PreviewResult::Status(ResolverStatus::Unavailable),
     };
     diagnostics::record(
         "worker.decode",
@@ -333,6 +508,7 @@ fn preview_result_kind(result: &PreviewResult) -> &'static str {
         PreviewResult::Text(_) => "text",
         PreviewResult::Image(_) => "image",
         PreviewResult::Video(_) => "video",
+        PreviewResult::ImageAnimation(_) => "image-animation",
     }
 }
 
@@ -399,6 +575,25 @@ fn record_preview_result(
                 diagnostics::elapsed_us(started).unwrap_or(0)
             ),
         ),
+        PreviewResult::ImageAnimation(preview) => diagnostics::record(
+            event,
+            format_args!(
+                "generation={} kind=image-animation file_size={} format={:?} source_width={} \
+                 source_height={} decoded_width={} decoded_height={} frames={} decoded_bytes={} \
+                 truncated={} target_bounds={} elapsed_us={elapsed}",
+                generation.get(),
+                preview.file_size,
+                preview.format,
+                preview.source_width,
+                preview.source_height,
+                preview.width,
+                preview.height,
+                preview.frames.len(),
+                preview.frames.iter().map(Vec::len).sum::<usize>(),
+                preview.truncated,
+                target_bounds.is_some()
+            ),
+        ),
     }
 }
 
@@ -426,7 +621,7 @@ pub(crate) enum WorkerSessionError {
     Stream(ProtocolStreamError),
     MissingHello,
     ExpectedHello,
-    ExpectedResolvePoint,
+    ExpectedRequest,
 }
 
 impl fmt::Display for WorkerSessionError {
@@ -435,8 +630,11 @@ impl fmt::Display for WorkerSessionError {
             Self::Stream(error) => write!(formatter, "{error}"),
             Self::MissingHello => write!(formatter, "input closed before the hello frame"),
             Self::ExpectedHello => write!(formatter, "the first frame was not hello"),
-            Self::ExpectedResolvePoint => {
-                write!(formatter, "a post-handshake frame was not resolve-point")
+            Self::ExpectedRequest => {
+                write!(
+                    formatter,
+                    "a post-handshake frame was not a supported preview request"
+                )
             }
         }
     }
@@ -446,7 +644,7 @@ impl Error for WorkerSessionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Stream(error) => Some(error),
-            Self::MissingHello | Self::ExpectedHello | Self::ExpectedResolvePoint => None,
+            Self::MissingHello | Self::ExpectedHello | Self::ExpectedRequest => None,
         }
     }
 }
@@ -460,8 +658,8 @@ impl From<ProtocolStreamError> for WorkerSessionError {
 #[cfg(test)]
 mod tests {
     use super::{
-        WorkerSessionError, cache::PreviewCache, protocol, resolver_result,
-        resolver_result_with_cache, run_session,
+        WorkerSessionError, cache::PreviewCache, preview_animation_source_result, protocol,
+        resolver_result, resolver_result_with_cache, run_session,
     };
     use crate::{
         hover::{Generation, PhysicalScreenPoint},
@@ -746,6 +944,41 @@ mod tests {
     }
 
     #[test]
+    fn animation_upgrade_reopens_the_exact_worker_validated_file_identity() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("manual-tests/images/variants/animated-640x360.webp");
+        let PreviewResult::Image(preview) = resolver_result(
+            ResolveOutcome::Resolved(resolved_target(path)),
+            &LegacyEncoding::Auto,
+        ) else {
+            panic!("the animated WebP should produce a still preview");
+        };
+        let source = preview
+            .animation_source
+            .expect("the still preview should carry an animation source");
+
+        assert!(matches!(
+            preview_animation_source_result(
+                &source,
+                &LegacyEncoding::Auto,
+                &mut PreviewCache::default()
+            ),
+            PreviewResult::ImageAnimation(_)
+        ));
+
+        let mut mismatched = source;
+        mismatched.file_id[0] ^= 0xff;
+        assert_eq!(
+            preview_animation_source_result(
+                &mismatched,
+                &LegacyEncoding::Auto,
+                &mut PreviewCache::default()
+            ),
+            PreviewResult::Status(ResolverStatus::Unavailable)
+        );
+    }
+
+    #[test]
     fn session_echoes_nonce_and_handles_requests_until_clean_eof() {
         let generations = [Generation::from_raw(1), Generation::from_raw(u64::MAX)];
         let mut input = Vec::new();
@@ -844,7 +1077,7 @@ mod tests {
                 &mut output,
                 &mut UnavailableResolver
             ),
-            Err(WorkerSessionError::ExpectedResolvePoint)
+            Err(WorkerSessionError::ExpectedRequest)
         ));
 
         let mut handshake_only = Vec::new();

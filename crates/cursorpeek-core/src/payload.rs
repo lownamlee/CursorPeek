@@ -1,11 +1,14 @@
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, mem::size_of};
 
 pub use crate::layout::{
-    BGRA_BYTES_PER_PIXEL, IMAGE_FIXED_LEN, MAX_PREVIEW_IMAGE_HEIGHT, MAX_PREVIEW_IMAGE_WIDTH,
-    MAX_PREVIEW_PAYLOAD_LEN, MAX_SOURCE_IMAGE_AXIS, MAX_SOURCE_IMAGE_PIXELS,
-    fitted_preview_dimensions,
+    BGRA_BYTES_PER_PIXEL, IMAGE_ANIMATION_FIXED_LEN, IMAGE_FIXED_LEN, MAX_ANIMATED_IMAGE_HEIGHT,
+    MAX_ANIMATED_IMAGE_WIDTH, MAX_IMAGE_ANIMATION_DELAY_MS, MAX_IMAGE_ANIMATION_DURATION_MS,
+    MAX_IMAGE_ANIMATION_FRAMES, MAX_IMAGE_ANIMATION_PAYLOAD_LEN, MAX_PREVIEW_IMAGE_HEIGHT,
+    MAX_PREVIEW_IMAGE_WIDTH, MAX_PREVIEW_PAYLOAD_LEN, MAX_SOURCE_IMAGE_AXIS,
+    MAX_SOURCE_IMAGE_PIXELS, MAX_STILL_IMAGE_PAYLOAD_LEN, MIN_IMAGE_ANIMATION_DELAY_MS,
+    fitted_animation_dimensions, fitted_preview_dimensions,
 };
-use crate::layout::{LayoutError, checked_bgra_layout};
+use crate::layout::{LayoutError, checked_animation_layout, checked_bgra_layout};
 
 pub const MIN_PREVIEW_RESULT_LEN: usize = 8;
 pub const MAX_TEXT_UTF8_LEN: usize = 128 * 1024;
@@ -13,12 +16,17 @@ pub const MAX_TEXT_SCALARS: usize = 32_000;
 pub const MAX_TEXT_LINES: usize = 200;
 pub const MAX_ENCODING_LABEL_LEN: usize = 40;
 pub const MAX_DISPLAY_NAME_UTF8_LEN: usize = 1_024;
-pub const MAX_VIDEO_PATH_UNITS: usize = 32_768;
+pub const MAX_LOCAL_PATH_UNITS: usize = 32_768;
+pub const MAX_VIDEO_PATH_UNITS: usize = MAX_LOCAL_PATH_UNITS;
+pub const IMAGE_ANIMATION_SOURCE_FIXED_LEN: usize = 56;
+pub const MAX_IMAGE_ANIMATION_SOURCE_LEN: usize =
+    IMAGE_ANIMATION_SOURCE_FIXED_LEN + MAX_LOCAL_PATH_UNITS * size_of::<u16>();
 
 const RESULT_STATUS: u32 = 0;
 const RESULT_TEXT: u32 = 1;
 const RESULT_IMAGE: u32 = 2;
 const RESULT_VIDEO: u32 = 3;
+const RESULT_IMAGE_ANIMATION: u32 = 4;
 const STATUS_PAYLOAD_LEN: usize = 8;
 const TEXT_FIXED_LEN: usize = 36;
 const FLAG_LINKED_CONTENT: u32 = 1 << 0;
@@ -26,9 +34,13 @@ const FLAG_TEXT_ENCODING_GUESSED: u32 = 1 << 1;
 const FLAG_TEXT_TRUNCATED: u32 = 1 << 2;
 const TEXT_FLAGS: u32 = FLAG_LINKED_CONTENT | FLAG_TEXT_ENCODING_GUESSED | FLAG_TEXT_TRUNCATED;
 const FLAG_IMAGE_FIRST_FRAME_ONLY: u32 = 1 << 1;
-const IMAGE_FLAGS: u32 = FLAG_LINKED_CONTENT | FLAG_IMAGE_FIRST_FRAME_ONLY;
+const FLAG_IMAGE_ANIMATION_SOURCE: u32 = 1 << 2;
+const IMAGE_FLAGS: u32 =
+    FLAG_LINKED_CONTENT | FLAG_IMAGE_FIRST_FRAME_ONLY | FLAG_IMAGE_ANIMATION_SOURCE;
 const VIDEO_FIXED_LEN: usize = 60;
 const VIDEO_FLAGS: u32 = FLAG_LINKED_CONTENT;
+const FLAG_IMAGE_ANIMATION_TRUNCATED: u32 = 1 << 0;
+const IMAGE_ANIMATION_FLAGS: u32 = FLAG_IMAGE_ANIMATION_TRUNCATED;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResolverStatus {
@@ -122,7 +134,41 @@ pub struct ImagePreview {
     pub source_height: u32,
     pub width: u32,
     pub height: u32,
+    pub animation_source: Option<ImageAnimationSource>,
     pub premultiplied_bgra: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImageAnimationSource {
+    pub file_size: u64,
+    pub last_write_time: i64,
+    pub volume_serial_number: u64,
+    pub file_id: [u8; 16],
+    pub format: ImageFormat,
+    pub source_width: u32,
+    pub source_height: u32,
+    /// Absolute, local, non-NUL-terminated UTF-16 path validated by the primary worker.
+    pub path: Vec<u16>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImageAnimationPreview {
+    pub file_size: u64,
+    pub last_write_time: i64,
+    pub format: ImageFormat,
+    pub source_width: u32,
+    pub source_height: u32,
+    pub width: u32,
+    pub height: u32,
+    pub truncated: bool,
+    pub frame_delays_ms: Vec<u32>,
+    pub frames: Vec<Vec<u8>>,
+}
+
+impl ImageAnimationPreview {
+    pub fn frame(&self, index: usize) -> Option<&[u8]> {
+        self.frames.get(index).map(Vec::as_slice)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -144,13 +190,14 @@ pub enum PreviewResult {
     Text(TextPreview),
     Image(ImagePreview),
     Video(VideoPreview),
+    ImageAnimation(ImageAnimationPreview),
 }
 
 impl PreviewResult {
     pub const fn status(&self) -> Option<ResolverStatus> {
         match self {
             Self::Status(status) => Some(*status),
-            Self::Text(_) | Self::Image(_) | Self::Video(_) => None,
+            Self::Text(_) | Self::Image(_) | Self::Video(_) | Self::ImageAnimation(_) => None,
         }
     }
 }
@@ -203,8 +250,15 @@ pub fn encode_result(result: &PreviewResult) -> Result<Vec<u8>, PayloadError> {
         }
         PreviewResult::Image(preview) => {
             validate_image(preview)?;
+            let animation_source = preview
+                .animation_source
+                .as_ref()
+                .map(encode_image_animation_source)
+                .transpose()?
+                .unwrap_or_default();
             let payload_len = IMAGE_FIXED_LEN
                 .checked_add(preview.display_name.len())
+                .and_then(|length| length.checked_add(animation_source.len()))
                 .and_then(|length| length.checked_add(preview.premultiplied_bgra.len()))
                 .ok_or(PayloadError::LengthOverflow)?;
             ensure_payload_cap(payload_len)?;
@@ -215,6 +269,10 @@ pub fn encode_result(result: &PreviewResult) -> Result<Vec<u8>, PayloadError> {
                 flags(&[
                     (preview.linked_content, FLAG_LINKED_CONTENT),
                     (preview.first_frame_only, FLAG_IMAGE_FIRST_FRAME_ONLY),
+                    (
+                        preview.animation_source.is_some(),
+                        FLAG_IMAGE_ANIMATION_SOURCE,
+                    ),
                 ]),
             );
             push_u64(&mut output, preview.file_size);
@@ -234,7 +292,13 @@ pub fn encode_result(result: &PreviewResult) -> Result<Vec<u8>, PayloadError> {
                 u32::try_from(preview.premultiplied_bgra.len())
                     .expect("the image payload cap fits the wire length"),
             );
+            push_u32(
+                &mut output,
+                u32::try_from(animation_source.len())
+                    .expect("the animation-source cap fits the wire length"),
+            );
             output.extend_from_slice(preview.display_name.as_bytes());
+            output.extend_from_slice(&animation_source);
             output.extend_from_slice(&preview.premultiplied_bgra);
         }
         PreviewResult::Video(preview) => {
@@ -274,6 +338,46 @@ pub fn encode_result(result: &PreviewResult) -> Result<Vec<u8>, PayloadError> {
                 output.extend_from_slice(&unit.to_le_bytes());
             }
         }
+        PreviewResult::ImageAnimation(preview) => {
+            let total_frame_bytes = validate_image_animation(preview)?;
+            let frame_count = u32::try_from(preview.frames.len())
+                .expect("the validated animation frame count fits u32");
+            let delay_bytes = preview
+                .frame_delays_ms
+                .len()
+                .checked_mul(size_of::<u32>())
+                .ok_or(PayloadError::LengthOverflow)?;
+            let payload_len = IMAGE_ANIMATION_FIXED_LEN
+                .checked_add(delay_bytes)
+                .and_then(|length| length.checked_add(total_frame_bytes))
+                .ok_or(PayloadError::LengthOverflow)?;
+            ensure_payload_cap(payload_len)?;
+            output.reserve(payload_len);
+            push_u32(&mut output, RESULT_IMAGE_ANIMATION);
+            push_u32(
+                &mut output,
+                flags(&[(preview.truncated, FLAG_IMAGE_ANIMATION_TRUNCATED)]),
+            );
+            push_u64(&mut output, preview.file_size);
+            push_i64(&mut output, preview.last_write_time);
+            push_u32(&mut output, preview.format as u32);
+            push_u32(&mut output, preview.source_width);
+            push_u32(&mut output, preview.source_height);
+            push_u32(&mut output, preview.width);
+            push_u32(&mut output, preview.height);
+            push_u32(&mut output, frame_count);
+            push_u32(
+                &mut output,
+                u32::try_from(total_frame_bytes)
+                    .expect("the animation payload cap fits the wire length"),
+            );
+            for delay in &preview.frame_delays_ms {
+                push_u32(&mut output, *delay);
+            }
+            for frame in &preview.frames {
+                output.extend_from_slice(frame);
+            }
+        }
     }
     Ok(output)
 }
@@ -290,6 +394,7 @@ pub fn decode_result(bytes: &[u8]) -> Result<PreviewResult, PayloadError> {
         RESULT_TEXT => decode_text(bytes),
         RESULT_IMAGE => decode_image(bytes),
         RESULT_VIDEO => decode_video(bytes),
+        RESULT_IMAGE_ANIMATION => decode_image_animation(bytes),
         kind => Err(PayloadError::UnknownResultKind(kind)),
     }
 }
@@ -416,8 +521,10 @@ fn decode_image(bytes: &[u8]) -> Result<PreviewResult, PayloadError> {
     reject_unknown_flags("image", raw_flags, IMAGE_FLAGS)?;
     let display_name_len = read_u32(bytes, 44) as usize;
     let pixel_len = read_u32(bytes, 48) as usize;
+    let animation_source_len = read_u32(bytes, 52) as usize;
     let expected = IMAGE_FIXED_LEN
         .checked_add(display_name_len)
+        .and_then(|length| length.checked_add(animation_source_len))
         .and_then(|length| length.checked_add(pixel_len))
         .ok_or(PayloadError::LengthOverflow)?;
     require_exact_length("image", bytes.len(), expected)?;
@@ -428,8 +535,16 @@ fn decode_image(bytes: &[u8]) -> Result<PreviewResult, PayloadError> {
     }
 
     let display_name_end = IMAGE_FIXED_LEN + display_name_len;
+    let animation_source_end = display_name_end + animation_source_len;
     let display_name = std::str::from_utf8(&bytes[IMAGE_FIXED_LEN..display_name_end])
         .map_err(|_| PayloadError::InvalidDisplayName)?;
+    let has_animation_source = raw_flags & FLAG_IMAGE_ANIMATION_SOURCE != 0;
+    if has_animation_source != (animation_source_len != 0) {
+        return Err(PayloadError::InvalidImageAnimationSource);
+    }
+    let animation_source = has_animation_source
+        .then(|| decode_image_animation_source(&bytes[display_name_end..animation_source_end]))
+        .transpose()?;
     let preview = ImagePreview {
         file_size: read_u64(bytes, 8),
         last_write_time: read_i64(bytes, 16),
@@ -441,10 +556,74 @@ fn decode_image(bytes: &[u8]) -> Result<PreviewResult, PayloadError> {
         source_height: read_u32(bytes, 32),
         width: read_u32(bytes, 36),
         height: read_u32(bytes, 40),
-        premultiplied_bgra: bytes[display_name_end..].to_vec(),
+        animation_source,
+        premultiplied_bgra: bytes[animation_source_end..].to_vec(),
     };
     validate_image(&preview)?;
     Ok(PreviewResult::Image(preview))
+}
+
+fn decode_image_animation(bytes: &[u8]) -> Result<PreviewResult, PayloadError> {
+    if bytes.len() < IMAGE_ANIMATION_FIXED_LEN {
+        return Err(PayloadError::PayloadLengthMismatch {
+            kind: "image-animation",
+            expected: IMAGE_ANIMATION_FIXED_LEN,
+            actual: bytes.len(),
+        });
+    }
+
+    let raw_flags = read_u32(bytes, 4);
+    reject_unknown_flags("image-animation", raw_flags, IMAGE_ANIMATION_FLAGS)?;
+    let frame_count = read_u32(bytes, 44) as usize;
+    let total_frame_bytes = read_u32(bytes, 48) as usize;
+    let delay_bytes = frame_count
+        .checked_mul(size_of::<u32>())
+        .ok_or(PayloadError::LengthOverflow)?;
+    let expected = IMAGE_ANIMATION_FIXED_LEN
+        .checked_add(delay_bytes)
+        .and_then(|length| length.checked_add(total_frame_bytes))
+        .ok_or(PayloadError::LengthOverflow)?;
+    require_exact_length("image-animation", bytes.len(), expected)?;
+
+    let delays_end = IMAGE_ANIMATION_FIXED_LEN + delay_bytes;
+    let frame_delays_ms = bytes[IMAGE_ANIMATION_FIXED_LEN..delays_end]
+        .chunks_exact(size_of::<u32>())
+        .map(|delay| {
+            u32::from_le_bytes(
+                delay
+                    .try_into()
+                    .expect("the delay table is a whole number of u32 values"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let width = read_u32(bytes, 36);
+    let height = read_u32(bytes, 40);
+    let (_, frame_bytes, checked_total) =
+        checked_animation_layout(width, height, read_u32(bytes, 44)).map_err(layout_error)?;
+    if checked_total != total_frame_bytes {
+        return Err(PayloadError::InvalidAnimationByteLength {
+            expected: checked_total,
+            actual: total_frame_bytes,
+        });
+    }
+    let frames = bytes[delays_end..]
+        .chunks_exact(frame_bytes)
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
+    let preview = ImageAnimationPreview {
+        file_size: read_u64(bytes, 8),
+        last_write_time: read_i64(bytes, 16),
+        format: ImageFormat::from_raw(read_u32(bytes, 24))?,
+        source_width: read_u32(bytes, 28),
+        source_height: read_u32(bytes, 32),
+        width,
+        height,
+        truncated: raw_flags & FLAG_IMAGE_ANIMATION_TRUNCATED != 0,
+        frame_delays_ms,
+        frames,
+    };
+    validate_image_animation(&preview)?;
+    Ok(PreviewResult::ImageAnimation(preview))
 }
 
 fn validate_text(preview: &TextPreview) -> Result<(), PayloadError> {
@@ -546,15 +725,21 @@ fn validate_image(preview: &ImagePreview) -> Result<(), PayloadError> {
             actual_height: preview.height,
         });
     }
+    if let Some(source) = &preview.animation_source {
+        validate_image_animation_source(source)?;
+        if !preview.first_frame_only
+            || !matches!(preview.format, ImageFormat::Gif | ImageFormat::WebP)
+            || source.file_size != preview.file_size
+            || source.last_write_time != preview.last_write_time
+            || source.format != preview.format
+            || source.source_width != preview.source_width
+            || source.source_height != preview.source_height
+        {
+            return Err(PayloadError::InvalidImageAnimationSource);
+        }
+    }
 
-    let (_, expected) =
-        checked_bgra_layout(preview.width, preview.height).map_err(|error| match error {
-            LayoutError::InvalidDimensions { width, height } => {
-                PayloadError::InvalidPreviewDimensions { width, height }
-            }
-            LayoutError::ArithmeticOverflow => PayloadError::LengthOverflow,
-            LayoutError::PayloadTooLarge { actual } => PayloadError::PayloadTooLarge { actual },
-        })?;
+    let (_, expected) = checked_bgra_layout(preview.width, preview.height).map_err(layout_error)?;
     if preview.premultiplied_bgra.len() != expected {
         return Err(PayloadError::InvalidPixelLength {
             expected,
@@ -572,9 +757,197 @@ fn validate_image(preview: &ImagePreview) -> Result<(), PayloadError> {
     ensure_payload_cap(
         IMAGE_FIXED_LEN
             .checked_add(preview.display_name.len())
+            .and_then(|length| {
+                length.checked_add(
+                    preview
+                        .animation_source
+                        .as_ref()
+                        .map_or(0, image_animation_source_wire_len),
+                )
+            })
             .and_then(|length| length.checked_add(expected))
             .ok_or(PayloadError::LengthOverflow)?,
     )
+}
+
+pub fn encode_image_animation_source(
+    source: &ImageAnimationSource,
+) -> Result<Vec<u8>, PayloadError> {
+    validate_image_animation_source(source)?;
+    let path_bytes = source
+        .path
+        .len()
+        .checked_mul(size_of::<u16>())
+        .ok_or(PayloadError::LengthOverflow)?;
+    let length = IMAGE_ANIMATION_SOURCE_FIXED_LEN
+        .checked_add(path_bytes)
+        .ok_or(PayloadError::LengthOverflow)?;
+    let mut output = Vec::with_capacity(length);
+    push_u64(&mut output, source.file_size);
+    push_i64(&mut output, source.last_write_time);
+    push_u64(&mut output, source.volume_serial_number);
+    output.extend_from_slice(&source.file_id);
+    push_u32(&mut output, source.format as u32);
+    push_u32(&mut output, source.source_width);
+    push_u32(&mut output, source.source_height);
+    push_u32(
+        &mut output,
+        u32::try_from(source.path.len()).expect("the local path cap fits the wire length"),
+    );
+    for unit in &source.path {
+        output.extend_from_slice(&unit.to_le_bytes());
+    }
+    debug_assert_eq!(output.len(), length);
+    Ok(output)
+}
+
+pub fn decode_image_animation_source(bytes: &[u8]) -> Result<ImageAnimationSource, PayloadError> {
+    if !(IMAGE_ANIMATION_SOURCE_FIXED_LEN..=MAX_IMAGE_ANIMATION_SOURCE_LEN).contains(&bytes.len()) {
+        return Err(PayloadError::InvalidImageAnimationSource);
+    }
+    let path_units = read_u32(bytes, 52) as usize;
+    let path_bytes = path_units
+        .checked_mul(size_of::<u16>())
+        .ok_or(PayloadError::LengthOverflow)?;
+    let expected = IMAGE_ANIMATION_SOURCE_FIXED_LEN
+        .checked_add(path_bytes)
+        .ok_or(PayloadError::LengthOverflow)?;
+    if bytes.len() != expected {
+        return Err(PayloadError::InvalidImageAnimationSource);
+    }
+    let mut file_id = [0_u8; 16];
+    file_id.copy_from_slice(&bytes[24..40]);
+    let path = bytes[IMAGE_ANIMATION_SOURCE_FIXED_LEN..]
+        .chunks_exact(size_of::<u16>())
+        .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
+        .collect();
+    let source = ImageAnimationSource {
+        file_size: read_u64(bytes, 0),
+        last_write_time: read_i64(bytes, 8),
+        volume_serial_number: read_u64(bytes, 16),
+        file_id,
+        format: ImageFormat::from_raw(read_u32(bytes, 40))?,
+        source_width: read_u32(bytes, 44),
+        source_height: read_u32(bytes, 48),
+        path,
+    };
+    validate_image_animation_source(&source)?;
+    Ok(source)
+}
+
+pub fn validate_image_animation_source(source: &ImageAnimationSource) -> Result<(), PayloadError> {
+    if !matches!(source.format, ImageFormat::Gif | ImageFormat::WebP)
+        || source.path.is_empty()
+        || source.path.len() > MAX_LOCAL_PATH_UNITS
+        || source.path.contains(&0)
+        || String::from_utf16(&source.path).is_err()
+    {
+        return Err(PayloadError::InvalidImageAnimationSource);
+    }
+    validate_source_dimensions(source.source_width, source.source_height)
+}
+
+fn image_animation_source_wire_len(source: &ImageAnimationSource) -> usize {
+    IMAGE_ANIMATION_SOURCE_FIXED_LEN + source.path.len() * size_of::<u16>()
+}
+
+fn validate_image_animation(preview: &ImageAnimationPreview) -> Result<usize, PayloadError> {
+    if !matches!(preview.format, ImageFormat::Gif | ImageFormat::WebP) {
+        return Err(PayloadError::InvalidAnimationFormat(preview.format as u32));
+    }
+    validate_source_dimensions(preview.source_width, preview.source_height)?;
+    let expected_dimensions =
+        fitted_animation_dimensions(preview.source_width, preview.source_height)
+            .ok_or(PayloadError::LengthOverflow)?;
+    if (preview.width, preview.height) != expected_dimensions {
+        return Err(PayloadError::NonFittingAnimationDimensions {
+            expected_width: expected_dimensions.0,
+            expected_height: expected_dimensions.1,
+            actual_width: preview.width,
+            actual_height: preview.height,
+        });
+    }
+    if preview.frames.len() != preview.frame_delays_ms.len() {
+        return Err(PayloadError::AnimationFrameDelayCountMismatch {
+            frames: preview.frames.len(),
+            delays: preview.frame_delays_ms.len(),
+        });
+    }
+
+    let frame_count =
+        u32::try_from(preview.frames.len()).map_err(|_| PayloadError::LengthOverflow)?;
+    let (_, frame_bytes, total_frame_bytes) =
+        checked_animation_layout(preview.width, preview.height, frame_count)
+            .map_err(layout_error)?;
+    let mut total_duration_ms = 0_u32;
+    for (index, (frame, delay)) in preview
+        .frames
+        .iter()
+        .zip(&preview.frame_delays_ms)
+        .enumerate()
+    {
+        if frame.len() != frame_bytes {
+            return Err(PayloadError::InvalidAnimationFrameLength {
+                index,
+                expected: frame_bytes,
+                actual: frame.len(),
+            });
+        }
+        if !(MIN_IMAGE_ANIMATION_DELAY_MS..=MAX_IMAGE_ANIMATION_DELAY_MS).contains(delay) {
+            return Err(PayloadError::InvalidAnimationDelay {
+                index,
+                actual: *delay,
+            });
+        }
+        total_duration_ms = total_duration_ms
+            .checked_add(*delay)
+            .ok_or(PayloadError::LengthOverflow)?;
+        if total_duration_ms > MAX_IMAGE_ANIMATION_DURATION_MS {
+            return Err(PayloadError::AnimationDurationTooLong {
+                actual: total_duration_ms,
+            });
+        }
+        if let Some((pixel_index, _)) = frame
+            .chunks_exact(BGRA_BYTES_PER_PIXEL)
+            .enumerate()
+            .find(|(_, pixel)| pixel[0] > pixel[3] || pixel[1] > pixel[3] || pixel[2] > pixel[3])
+        {
+            return Err(PayloadError::NonPremultipliedAnimationPixel {
+                frame: index,
+                pixel: pixel_index,
+            });
+        }
+    }
+    Ok(total_frame_bytes)
+}
+
+fn validate_source_dimensions(width: u32, height: u32) -> Result<(), PayloadError> {
+    if width == 0 || height == 0 || width > MAX_SOURCE_IMAGE_AXIS || height > MAX_SOURCE_IMAGE_AXIS
+    {
+        return Err(PayloadError::InvalidSourceDimensions { width, height });
+    }
+    let source_pixels = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or(PayloadError::LengthOverflow)?;
+    if source_pixels > MAX_SOURCE_IMAGE_PIXELS {
+        return Err(PayloadError::TooManySourceImagePixels {
+            actual: source_pixels,
+        });
+    }
+    Ok(())
+}
+
+fn layout_error(error: LayoutError) -> PayloadError {
+    match error {
+        LayoutError::InvalidDimensions { width, height } => {
+            PayloadError::InvalidPreviewDimensions { width, height }
+        }
+        LayoutError::InvalidFrameCount { actual } => {
+            PayloadError::InvalidAnimationFrameCount { actual }
+        }
+        LayoutError::ArithmeticOverflow => PayloadError::LengthOverflow,
+        LayoutError::PayloadTooLarge { actual } => PayloadError::PayloadTooLarge { actual },
+    }
 }
 
 fn validate_video(preview: &VideoPreview) -> Result<(), PayloadError> {
@@ -738,6 +1111,7 @@ pub enum PayloadError {
     },
     InvalidDisplayName,
     InvalidVideoPath,
+    InvalidImageAnimationSource,
     InvalidSourceDimensions {
         width: u32,
         height: u32,
@@ -762,6 +1136,40 @@ pub enum PayloadError {
     },
     NonPremultipliedPixel {
         index: usize,
+    },
+    InvalidAnimationFormat(u32),
+    InvalidAnimationFrameCount {
+        actual: u32,
+    },
+    AnimationFrameDelayCountMismatch {
+        frames: usize,
+        delays: usize,
+    },
+    NonFittingAnimationDimensions {
+        expected_width: u32,
+        expected_height: u32,
+        actual_width: u32,
+        actual_height: u32,
+    },
+    InvalidAnimationByteLength {
+        expected: usize,
+        actual: usize,
+    },
+    InvalidAnimationFrameLength {
+        index: usize,
+        expected: usize,
+        actual: usize,
+    },
+    InvalidAnimationDelay {
+        index: usize,
+        actual: u32,
+    },
+    AnimationDurationTooLong {
+        actual: u32,
+    },
+    NonPremultipliedAnimationPixel {
+        frame: usize,
+        pixel: usize,
     },
     PayloadTooLarge {
         actual: usize,
@@ -831,6 +1239,9 @@ impl fmt::Display for PayloadError {
             ),
             Self::InvalidDisplayName => write!(formatter, "invalid preview display name"),
             Self::InvalidVideoPath => write!(formatter, "invalid preview video path"),
+            Self::InvalidImageAnimationSource => {
+                write!(formatter, "invalid image animation source")
+            }
             Self::InvalidSourceDimensions { width, height } => write!(
                 formatter,
                 "invalid source image dimensions {width}x{height}"
@@ -866,6 +1277,55 @@ impl fmt::Display for PayloadError {
                 formatter,
                 "BGRA pixel {index} has a color channel greater than alpha"
             ),
+            Self::InvalidAnimationFormat(format) => {
+                write!(
+                    formatter,
+                    "image format {format} cannot carry an animation upgrade"
+                )
+            }
+            Self::InvalidAnimationFrameCount { actual } => write!(
+                formatter,
+                "animation frame count {actual} is outside 2-{MAX_IMAGE_ANIMATION_FRAMES}"
+            ),
+            Self::AnimationFrameDelayCountMismatch { frames, delays } => write!(
+                formatter,
+                "animation has {frames} frames but {delays} frame delays"
+            ),
+            Self::NonFittingAnimationDimensions {
+                expected_width,
+                expected_height,
+                actual_width,
+                actual_height,
+            } => write!(
+                formatter,
+                "animation dimensions must be the bounded aspect fit \
+                 {expected_width}x{expected_height}, received {actual_width}x{actual_height}"
+            ),
+            Self::InvalidAnimationByteLength { expected, actual } => write!(
+                formatter,
+                "animation frame bytes must total {expected}, received {actual}"
+            ),
+            Self::InvalidAnimationFrameLength {
+                index,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "animation frame {index} must contain {expected} bytes, received {actual}"
+            ),
+            Self::InvalidAnimationDelay { index, actual } => write!(
+                formatter,
+                "animation frame {index} delay {actual} ms is outside \
+                 {MIN_IMAGE_ANIMATION_DELAY_MS}-{MAX_IMAGE_ANIMATION_DELAY_MS} ms"
+            ),
+            Self::AnimationDurationTooLong { actual } => write!(
+                formatter,
+                "animation duration {actual} ms exceeds {MAX_IMAGE_ANIMATION_DURATION_MS} ms"
+            ),
+            Self::NonPremultipliedAnimationPixel { frame, pixel } => write!(
+                formatter,
+                "animation frame {frame} BGRA pixel {pixel} has a color channel greater than alpha"
+            ),
             Self::PayloadTooLarge { actual } => write!(
                 formatter,
                 "preview payload length {actual} exceeds {MAX_PREVIEW_PAYLOAD_LEN} bytes"
@@ -879,11 +1339,13 @@ impl Error for PayloadError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        FLAG_IMAGE_FIRST_FRAME_ONLY, FLAG_TEXT_TRUNCATED, IMAGE_FIXED_LEN, ImageFormat,
-        ImagePreview, MAX_DISPLAY_NAME_UTF8_LEN, MAX_ENCODING_LABEL_LEN, MAX_PREVIEW_IMAGE_WIDTH,
+        FLAG_IMAGE_FIRST_FRAME_ONLY, FLAG_TEXT_TRUNCATED, IMAGE_FIXED_LEN, ImageAnimationPreview,
+        ImageAnimationSource, ImageFormat, ImagePreview, MAX_DISPLAY_NAME_UTF8_LEN,
+        MAX_ENCODING_LABEL_LEN, MAX_IMAGE_ANIMATION_DELAY_MS, MAX_PREVIEW_IMAGE_WIDTH,
         MAX_SOURCE_IMAGE_AXIS, MAX_SOURCE_IMAGE_PIXELS, MAX_TEXT_LINES, MAX_TEXT_SCALARS,
-        MAX_TEXT_UTF8_LEN, PayloadError, PreviewResult, ResolverStatus, TEXT_FIXED_LEN,
-        TextPreview, VideoContainer, VideoPreview, decode_result, encode_result,
+        MAX_TEXT_UTF8_LEN, MIN_IMAGE_ANIMATION_DELAY_MS, PayloadError, PreviewResult,
+        ResolverStatus, TEXT_FIXED_LEN, TextPreview, VideoContainer, VideoPreview,
+        decode_image_animation_source, decode_result, encode_image_animation_source, encode_result,
     };
 
     fn text_preview() -> TextPreview {
@@ -911,7 +1373,39 @@ mod tests {
             source_height: 2,
             width: 3,
             height: 2,
+            animation_source: None,
             premultiplied_bgra: vec![0x7f; 24],
+        }
+    }
+
+    fn image_animation_preview() -> ImageAnimationPreview {
+        ImageAnimationPreview {
+            file_size: 45_678,
+            last_write_time: 133_000_000_000_000_000,
+            format: ImageFormat::Gif,
+            source_width: 3,
+            source_height: 2,
+            width: 3,
+            height: 2,
+            truncated: false,
+            frame_delays_ms: vec![40, 60],
+            frames: vec![vec![0x7f; 24], vec![0x40; 24]],
+        }
+    }
+
+    fn image_animation_source() -> ImageAnimationSource {
+        ImageAnimationSource {
+            file_size: 45_678,
+            last_write_time: 133_000_000_000_000_000,
+            volume_serial_number: 0x0123_4567_89ab_cdef,
+            file_id: [
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff,
+            ],
+            format: ImageFormat::Gif,
+            source_width: 3,
+            source_height: 2,
+            path: r"\\?\C:\Images\sample.gif".encode_utf16().collect(),
         }
     }
 
@@ -963,6 +1457,13 @@ mod tests {
             assert_eq!(decode_result(&encode_result(&result).unwrap()), Ok(result));
         }
 
+        for format in [ImageFormat::Gif, ImageFormat::WebP] {
+            let mut animation = image_animation_preview();
+            animation.format = format;
+            let result = PreviewResult::ImageAnimation(animation);
+            assert_eq!(decode_result(&encode_result(&result).unwrap()), Ok(result));
+        }
+
         for container in [
             VideoContainer::IsoBaseMedia,
             VideoContainer::Avi,
@@ -973,6 +1474,40 @@ mod tests {
             let result = PreviewResult::Video(video);
             assert_eq!(decode_result(&encode_result(&result).unwrap()), Ok(result));
         }
+    }
+
+    #[test]
+    fn animated_image_sources_round_trip_and_must_match_the_still_preview() {
+        let source = image_animation_source();
+        let encoded = encode_image_animation_source(&source).unwrap();
+        assert_eq!(decode_image_animation_source(&encoded), Ok(source.clone()));
+
+        let mut image = image_preview();
+        image.display_name = "sample.gif".to_owned();
+        image.format = ImageFormat::Gif;
+        image.animation_source = Some(source.clone());
+        let result = PreviewResult::Image(image.clone());
+        assert_eq!(
+            decode_result(&encode_result(&result).unwrap()),
+            Ok(result.clone())
+        );
+
+        image
+            .animation_source
+            .as_mut()
+            .expect("the source was attached above")
+            .file_size += 1;
+        assert_eq!(
+            encode_result(&PreviewResult::Image(image)),
+            Err(PayloadError::InvalidImageAnimationSource)
+        );
+
+        let mut invalid = source;
+        invalid.path.push(0);
+        assert_eq!(
+            encode_image_animation_source(&invalid),
+            Err(PayloadError::InvalidImageAnimationSource)
+        );
     }
 
     #[test]
@@ -1126,6 +1661,62 @@ mod tests {
         assert_eq!(
             encode_result(&PreviewResult::Image(preview)),
             Err(PayloadError::NonPremultipliedPixel { index: 0 })
+        );
+    }
+
+    #[test]
+    fn animation_frames_delays_and_formats_are_independently_bounded() {
+        let mut preview = image_animation_preview();
+        preview.format = ImageFormat::Png;
+        assert_eq!(
+            encode_result(&PreviewResult::ImageAnimation(preview)),
+            Err(PayloadError::InvalidAnimationFormat(
+                ImageFormat::Png as u32
+            ))
+        );
+
+        let mut preview = image_animation_preview();
+        preview.frames.pop();
+        assert_eq!(
+            encode_result(&PreviewResult::ImageAnimation(preview)),
+            Err(PayloadError::AnimationFrameDelayCountMismatch {
+                frames: 1,
+                delays: 2,
+            })
+        );
+
+        for invalid in [
+            MIN_IMAGE_ANIMATION_DELAY_MS - 1,
+            MAX_IMAGE_ANIMATION_DELAY_MS + 1,
+        ] {
+            let mut preview = image_animation_preview();
+            preview.frame_delays_ms[0] = invalid;
+            assert_eq!(
+                encode_result(&PreviewResult::ImageAnimation(preview)),
+                Err(PayloadError::InvalidAnimationDelay {
+                    index: 0,
+                    actual: invalid,
+                })
+            );
+        }
+
+        let mut preview = image_animation_preview();
+        preview.frames[1].pop();
+        assert_eq!(
+            encode_result(&PreviewResult::ImageAnimation(preview)),
+            Err(PayloadError::InvalidAnimationFrameLength {
+                index: 1,
+                expected: 24,
+                actual: 23,
+            })
+        );
+
+        let mut preview = image_animation_preview();
+        preview.frames[1][0] = 0x80;
+        preview.frames[1][3] = 0x7f;
+        assert_eq!(
+            encode_result(&PreviewResult::ImageAnimation(preview)),
+            Err(PayloadError::NonPremultipliedAnimationPixel { frame: 1, pixel: 0 })
         );
     }
 

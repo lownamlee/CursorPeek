@@ -37,8 +37,8 @@ contained for failure and resource recovery, not isolated as least privilege.
 |---|---|---|
 | Explorer to resolver worker | HWNDs, UIA elements, rectangles, cached names, Shell views and paths | Exact Explorer process/class/root checks, item shape and bounds, active-view correlation, filesystem-path result, target-context revalidation |
 | Filesystem to preview worker | Path text, links, metadata, attributes, bytes, dimensions and encodings | Drive-absolute input, handle-derived final DOS path, disk/local protocol, no offline/recall attributes, stable handle snapshot, extension plus magic/content checks, bounded reads and checked arithmetic |
-| Coordinator to worker | Pipe frames, generation, Explorer-root identity, point, pointer-travel span, encoding policy and lifecycle | Explicit inherited handles, fixed framing, exact target-root correlation, ordered spans, length limits, ordering, cryptographic session nonce and one active/latest-pending request policy |
-| Worker to coordinator | Status, metadata, text, dimensions and BGRA payload | Nonce handshake, message kind/order, generation, exact payload lengths, UTF-8/scalar/control rules, image-size arithmetic and stale-result rejection |
+| Coordinator to worker | Pipe frames, generation, Explorer-root identity, point, pointer-travel span, encoding policy, or a bounded animation source identity | Explicit inherited handles, fixed framing, exact target-root correlation, ordered spans, local-path and stable-file-identity checks, length limits, ordering, cryptographic session nonce and one active/latest-pending request policy per worker |
+| Worker to coordinator | Status, metadata, text, dimensions, BGRA payload, frame delays and animation pixels | Nonce handshake, message kind/order, generation, exact payload lengths, UTF-8/scalar/control rules, image/frame/duration arithmetic and stale-result rejection |
 | Windows UI to coordinator | Raw Input, hooks, broadcasts, timers and arbitrary window messages | Private message IDs, scalar-only internal messages, handle/context checks, bounded callbacks, panic barriers and generation invalidation |
 | Settings and startup | INI bytes, values, unknown keys, Local AppData and HKCU Run state | UTF-8/size limits, canonical typed values, atomic replacement, quoted exact executable path and per-user registry scope |
 | Build and distribution | Crates, build scripts, workflow actions and generated artifacts | Locked versions, pinned actions/tools, advisory/license/source policy, SBOM, PE import/resource/hardening gates and artifact hashes |
@@ -65,17 +65,22 @@ preview.
 Only an explicit image, video, or text extension or special filename is eligible. Image magic
 remains authoritative. Video also requires a matching bounded ISO Base Media `ftyp`, RIFF/AVI, or
 ASF Header Object signature. Product caps bound file size, read prefixes, dimensions, pixel count,
-decoded bytes, text bytes, scalar count, lines, protocol frames, cache entries, and cache bytes.
-Checked arithmetic precedes allocation and layout.
+decoded bytes, animation frames and duration, text bytes, scalar count, lines, protocol frames,
+cache entries, and cache bytes. Checked arithmetic precedes allocation and layout.
 
-Image/text parsing and decoding occur in the worker. Video container structure, locality, identity,
-and resource eligibility are checked there. Immediately before native Windows Media Foundation
-playback, the UI process repeats those checks and compares the container family, normalized path,
-volume serial, file ID, size, and last-write time with the worker result. It retains a
-no-write/no-delete handle while the path-only media API is active, preventing replacement of the
-validated file. One request runs at a time and only the newest pending request is retained. A
-private Job limits the worker to one process and 384 MiB, kills it when the Job closes, and supports
-forced timeout recovery. The worker retires after idle expiry.
+Image/text parsing and decoding occur in workers. The first image result remains the latency path.
+For an eligible GIF or animated WebP, a separate optional worker reopens the bounded local path and
+requires the same normalized path, volume serial, file ID, size, last-write time, format, and
+dimensions before decoding a complete bounded animation. Its result is accepted only for the
+still-current generation and Explorer target, so slow animation work cannot block the first frame
+or the next normal hover. Video container structure, locality, identity, and resource eligibility
+are checked in a worker. Immediately before native Windows Media Foundation playback, the UI
+process repeats those checks and compares the container family and exact file identity with the
+worker result. It retains a no-write/no-delete handle while the path-only media API is active,
+preventing replacement of the validated file. One request runs at a time and only the newest
+pending request is retained per worker. A private Job limits each worker to one process and 384 MiB,
+kills it when the Job closes, and supports forced timeout recovery. Workers retire after idle
+expiry.
 
 ### Worker spoofing, stale data, and handle inheritance
 

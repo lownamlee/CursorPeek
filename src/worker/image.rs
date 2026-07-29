@@ -1,11 +1,11 @@
-use std::{error::Error, fmt, io::BufReader};
+use std::{error::Error, fmt, io::BufReader, os::windows::ffi::OsStrExt};
 
 #[cfg(test)]
 pub(super) mod corpus;
 
 use crate::preview_file::{PreviewFile, PreviewFileError};
 use ::image::{
-    DynamicImage, ImageDecoder, ImageError, ImageFormat as DecoderFormat, Limits,
+    AnimationDecoder, DynamicImage, ImageDecoder, ImageError, ImageFormat as DecoderFormat, Limits,
     codecs::{
         bmp::BmpDecoder, gif::GifDecoder, ico::IcoDecoder, jpeg::JpegDecoder, png::PngDecoder,
         tiff::TiffDecoder, webp::WebPDecoder,
@@ -17,14 +17,18 @@ use ::image::{
 use cursorpeek_core::sniff::IMAGE_EXTENSIONS;
 pub(super) use cursorpeek_core::sniff::is_image_eligible_path as is_eligible_path;
 use cursorpeek_core::{
-    layout::{LayoutError, checked_bgra_layout as core_checked_bgra_layout},
+    layout::{
+        LayoutError, checked_animation_layout, checked_bgra_layout as core_checked_bgra_layout,
+    },
     sniff::sniff_image_format,
 };
 
 use super::payload::{
-    BGRA_BYTES_PER_PIXEL, ImageFormat, ImagePreview, MAX_PREVIEW_IMAGE_HEIGHT,
-    MAX_PREVIEW_IMAGE_WIDTH, MAX_PREVIEW_PAYLOAD_LEN, MAX_SOURCE_IMAGE_AXIS,
-    MAX_SOURCE_IMAGE_PIXELS, fitted_preview_dimensions,
+    BGRA_BYTES_PER_PIXEL, ImageAnimationPreview, ImageAnimationSource, ImageFormat, ImagePreview,
+    MAX_IMAGE_ANIMATION_DELAY_MS, MAX_IMAGE_ANIMATION_DURATION_MS, MAX_IMAGE_ANIMATION_FRAMES,
+    MAX_PREVIEW_IMAGE_HEIGHT, MAX_PREVIEW_IMAGE_WIDTH, MAX_SOURCE_IMAGE_AXIS,
+    MAX_SOURCE_IMAGE_PIXELS, MAX_STILL_IMAGE_PAYLOAD_LEN, MIN_IMAGE_ANIMATION_DELAY_MS,
+    fitted_animation_dimensions, fitted_preview_dimensions,
 };
 
 const MAGIC_PREFIX_LEN: usize = 16;
@@ -39,6 +43,7 @@ pub(super) struct ValidatedImage {
     pub(super) source_height: u32,
     pub(super) decoded_bytes: u64,
     pub(super) orientation: Orientation,
+    pub(super) animation_candidate: bool,
 }
 
 impl ValidatedImage {
@@ -92,17 +97,14 @@ impl DecodedImage {
             .ok_or(ImageValidationError::ArithmeticOverflow)?;
         let (_, expected_bytes) = checked_bgra_layout(width, height)?;
 
-        let mut rgba = self.pixels.into_rgba8();
-        premultiply_rgba(&mut rgba);
-        let pixels = if (width, height) == (source_width, source_height) {
-            rgba
-        } else {
-            imageops::resize(&rgba, width, height, FilterType::Triangle)
-        };
-        let mut premultiplied_bgra = pixels.into_raw();
-        for pixel in premultiplied_bgra.chunks_exact_mut(BGRA_BYTES_PER_PIXEL) {
-            pixel.swap(0, 2);
-        }
+        let premultiplied_bgra = scaled_premultiplied_bgra(
+            self.pixels.into_rgba8(),
+            source_width,
+            source_height,
+            width,
+            height,
+            FilterType::Triangle,
+        );
         if premultiplied_bgra.len() != expected_bytes {
             return Err(ImageValidationError::PreviewLayoutMismatch {
                 expected_bytes,
@@ -115,6 +117,16 @@ impl DecodedImage {
             ));
         }
 
+        let animation_source = metadata.animation_candidate.then(|| ImageAnimationSource {
+            file_size: file.file_size(),
+            last_write_time: file.last_write_time(),
+            volume_serial_number: file.volume_serial_number(),
+            file_id: file.file_id(),
+            format: metadata.format,
+            source_width,
+            source_height,
+            path: file.final_path().as_os_str().encode_wide().collect(),
+        });
         Ok(ImagePreview {
             file_size: file.file_size(),
             last_write_time: file.last_write_time(),
@@ -129,9 +141,31 @@ impl DecodedImage {
             source_height,
             width,
             height,
+            animation_source,
             premultiplied_bgra,
         })
     }
+}
+
+fn scaled_premultiplied_bgra(
+    mut rgba: ::image::RgbaImage,
+    source_width: u32,
+    source_height: u32,
+    width: u32,
+    height: u32,
+    filter: FilterType,
+) -> Vec<u8> {
+    premultiply_rgba(&mut rgba);
+    let pixels = if (width, height) == (source_width, source_height) {
+        rgba
+    } else {
+        imageops::resize(&rgba, width, height, filter)
+    };
+    let mut premultiplied_bgra = pixels.into_raw();
+    for pixel in premultiplied_bgra.chunks_exact_mut(BGRA_BYTES_PER_PIXEL) {
+        pixel.swap(0, 2);
+    }
+    premultiplied_bgra
 }
 
 fn premultiply_rgba(pixels: &mut ::image::RgbaImage) {
@@ -156,6 +190,12 @@ pub(super) enum ImageDecodeResult {
     Unsupported,
 }
 
+#[derive(Debug)]
+pub(super) enum ImageAnimationDecodeResult {
+    Preview(ImageAnimationPreview),
+    Unsupported,
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ImageValidationResult {
@@ -176,12 +216,22 @@ pub(super) fn validate(file: &PreviewFile) -> Result<ImageValidationResult, Imag
     )
     .map_err(ImageValidationError::Decoder)?;
 
+    let animation_candidate = match format {
+        ImageFormat::Gif => true,
+        ImageFormat::WebP => {
+            let decoder = WebPDecoder::new(BufReader::new(file.duplicate_reader()?))
+                .map_err(ImageValidationError::Decoder)?;
+            decoder.has_animation()
+        }
+        _ => false,
+    };
     let metadata = validated_metadata(
         format,
         source_width,
         source_height,
         decoded_bytes,
         orientation,
+        animation_candidate,
     )?;
     if !file.is_unchanged()? {
         return Err(ImageValidationError::File(
@@ -208,6 +258,193 @@ pub(super) fn decode(file: &PreviewFile) -> Result<ImageDecodeResult, ImageValid
         ));
     }
     Ok(ImageDecodeResult::Decoded(decoded))
+}
+
+pub(super) fn decode_animation(
+    file: &PreviewFile,
+) -> Result<ImageAnimationDecodeResult, ImageValidationError> {
+    let Some((decoder_format, format)) = selected_format(file)? else {
+        return Ok(ImageAnimationDecodeResult::Unsupported);
+    };
+    if !matches!(format, ImageFormat::Gif | ImageFormat::WebP) {
+        return Ok(ImageAnimationDecodeResult::Unsupported);
+    }
+
+    let reader = BufReader::new(file.duplicate_reader()?);
+    let limits = decoder_limits();
+    let preview = match decoder_format {
+        DecoderFormat::Gif => {
+            let mut decoder = GifDecoder::new(reader)?;
+            decoder.set_limits(limits)?;
+            let (width, height) = decoder.dimensions();
+            let metadata = validated_metadata(
+                format,
+                width,
+                height,
+                decoder.total_bytes(),
+                decoder.orientation()?,
+                true,
+            )?;
+            decode_animation_frames(decoder, metadata, file)?
+        }
+        DecoderFormat::WebP => {
+            let mut decoder = WebPDecoder::new(reader)?;
+            if !decoder.has_animation() {
+                return Ok(ImageAnimationDecodeResult::Unsupported);
+            }
+            decoder.set_limits(limits)?;
+            let (width, height) = decoder.dimensions();
+            let metadata = validated_metadata(
+                format,
+                width,
+                height,
+                decoder.total_bytes(),
+                decoder.orientation()?,
+                true,
+            )?;
+            decode_animation_frames(decoder, metadata, file)?
+        }
+        _ => return Ok(ImageAnimationDecodeResult::Unsupported),
+    };
+    if !file.is_unchanged()? {
+        return Err(ImageValidationError::File(
+            PreviewFileError::ChangedDuringRead,
+        ));
+    }
+    Ok(preview)
+}
+
+fn decode_animation_frames<'a>(
+    decoder: impl AnimationDecoder<'a>,
+    metadata: ValidatedImage,
+    file: &PreviewFile,
+) -> Result<ImageAnimationDecodeResult, ImageValidationError> {
+    let (source_width, source_height) = metadata.display_dimensions();
+    let (width, height) = fitted_animation_dimensions(source_width, source_height)
+        .ok_or(ImageValidationError::ArithmeticOverflow)?;
+    let (_, expected_frame_bytes, _) =
+        checked_animation_layout(width, height, 2).map_err(animation_layout_error)?;
+    let mut decoded_frames = decoder.into_frames();
+    let mut frames = Vec::new();
+    let mut frame_delays_ms = Vec::new();
+    let mut duration_ms = 0_u32;
+    let mut truncated = false;
+
+    loop {
+        if frames.len()
+            >= usize::try_from(MAX_IMAGE_ANIMATION_FRAMES)
+                .expect("the animation frame cap fits usize")
+        {
+            truncated = true;
+            break;
+        }
+        let next_count = frames.len() + 1;
+        if next_count >= 2
+            && checked_animation_layout(
+                width,
+                height,
+                u32::try_from(next_count).expect("the animation frame cap fits u32"),
+            )
+            .is_err()
+        {
+            truncated = true;
+            break;
+        }
+
+        let Some(frame) = decoded_frames.next() else {
+            break;
+        };
+        let frame = frame?;
+        let delay_ms = bounded_frame_delay_ms(frame.delay());
+        if duration_ms
+            .checked_add(delay_ms)
+            .is_none_or(|total| total > MAX_IMAGE_ANIMATION_DURATION_MS)
+        {
+            truncated = true;
+            break;
+        }
+
+        let mut pixels = DynamicImage::ImageRgba8(frame.into_buffer());
+        if (pixels.width(), pixels.height()) != (metadata.source_width, metadata.source_height) {
+            return Err(ImageValidationError::DecodedLayoutMismatch {
+                expected_width: metadata.source_width,
+                expected_height: metadata.source_height,
+                expected_bytes: metadata.decoded_bytes,
+                actual_width: pixels.width(),
+                actual_height: pixels.height(),
+                actual_bytes: pixels.as_bytes().len(),
+            });
+        }
+        pixels.apply_orientation(metadata.orientation);
+        if (pixels.width(), pixels.height()) != (source_width, source_height) {
+            return Err(ImageValidationError::DecodedLayoutMismatch {
+                expected_width: source_width,
+                expected_height: source_height,
+                expected_bytes: metadata.decoded_bytes,
+                actual_width: pixels.width(),
+                actual_height: pixels.height(),
+                actual_bytes: pixels.as_bytes().len(),
+            });
+        }
+        let frame = scaled_premultiplied_bgra(
+            pixels.into_rgba8(),
+            source_width,
+            source_height,
+            width,
+            height,
+            FilterType::Nearest,
+        );
+        if frame.len() != expected_frame_bytes {
+            return Err(ImageValidationError::PreviewLayoutMismatch {
+                expected_bytes: expected_frame_bytes,
+                actual_bytes: frame.len(),
+            });
+        }
+        duration_ms = duration_ms
+            .checked_add(delay_ms)
+            .ok_or(ImageValidationError::ArithmeticOverflow)?;
+        frame_delays_ms.push(delay_ms);
+        frames.push(frame);
+    }
+
+    if frames.len() < 2 {
+        return Ok(ImageAnimationDecodeResult::Unsupported);
+    }
+    Ok(ImageAnimationDecodeResult::Preview(ImageAnimationPreview {
+        file_size: file.file_size(),
+        last_write_time: file.last_write_time(),
+        format: metadata.format,
+        source_width,
+        source_height,
+        width,
+        height,
+        truncated,
+        frame_delays_ms,
+        frames,
+    }))
+}
+
+fn bounded_frame_delay_ms(delay: ::image::Delay) -> u32 {
+    let (numerator, denominator) = delay.numer_denom_ms();
+    let rounded = numerator
+        .saturating_add(denominator / 2)
+        .checked_div(denominator)
+        .unwrap_or(MAX_IMAGE_ANIMATION_DELAY_MS);
+    rounded.clamp(MIN_IMAGE_ANIMATION_DELAY_MS, MAX_IMAGE_ANIMATION_DELAY_MS)
+}
+
+fn animation_layout_error(error: LayoutError) -> ImageValidationError {
+    match error {
+        LayoutError::InvalidDimensions { width, height } => {
+            ImageValidationError::InvalidPreviewDimensions { width, height }
+        }
+        LayoutError::InvalidFrameCount { .. } | LayoutError::ArithmeticOverflow => {
+            ImageValidationError::ArithmeticOverflow
+        }
+        LayoutError::PayloadTooLarge { actual } => {
+            ImageValidationError::PreviewPayloadTooLarge { actual }
+        }
+    }
 }
 
 fn selected_format(
@@ -279,22 +516,31 @@ where
     R: std::io::BufRead + std::io::Seek,
 {
     match decoder_format {
-        DecoderFormat::Jpeg => decode_with_decoder(JpegDecoder::new(reader)?, format, limits),
+        DecoderFormat::Jpeg => {
+            decode_with_decoder(JpegDecoder::new(reader)?, format, limits, false)
+        }
         // ImageDecoder reads the PNG default image rather than iterating APNG frames.
         DecoderFormat::Png => decode_with_decoder(
             PngDecoder::with_limits(reader, limits.clone())?,
             format,
             limits,
+            false,
         ),
         // The still-image decoder produces the first GIF composited on its logical canvas.
-        DecoderFormat::Gif => decode_with_decoder(GifDecoder::new(reader)?, format, limits),
+        DecoderFormat::Gif => decode_with_decoder(GifDecoder::new(reader)?, format, limits, true),
         // The image-webp still-image contract returns the first animation frame.
-        DecoderFormat::WebP => decode_with_decoder(WebPDecoder::new(reader)?, format, limits),
-        DecoderFormat::Bmp => decode_with_decoder(BmpDecoder::new(reader)?, format, limits),
+        DecoderFormat::WebP => {
+            let decoder = WebPDecoder::new(reader)?;
+            let animation_candidate = decoder.has_animation();
+            decode_with_decoder(decoder, format, limits, animation_candidate)
+        }
+        DecoderFormat::Bmp => decode_with_decoder(BmpDecoder::new(reader)?, format, limits, false),
         // IcoDecoder selects the entry with the highest (color depth, pixel area).
-        DecoderFormat::Ico => decode_with_decoder(IcoDecoder::new(reader)?, format, limits),
+        DecoderFormat::Ico => decode_with_decoder(IcoDecoder::new(reader)?, format, limits, false),
         // TiffDecoder starts at the first image file directory and never advances pages here.
-        DecoderFormat::Tiff => decode_with_decoder(TiffDecoder::new(reader)?, format, limits),
+        DecoderFormat::Tiff => {
+            decode_with_decoder(TiffDecoder::new(reader)?, format, limits, false)
+        }
         _ => unreachable!("unsupported formats are rejected before decoder construction"),
     }
 }
@@ -303,6 +549,7 @@ fn decode_with_decoder(
     mut decoder: impl ImageDecoder,
     format: ImageFormat,
     limits: Limits,
+    animation_candidate: bool,
 ) -> Result<DecodedImage, ImageValidationError> {
     decoder.set_limits(limits)?;
     let (source_width, source_height) = decoder.dimensions();
@@ -314,6 +561,7 @@ fn decode_with_decoder(
         source_height,
         decoded_bytes,
         orientation,
+        animation_candidate,
     )?;
     let mut pixels = DynamicImage::from_decoder(decoder)?;
     let actual_width = pixels.width();
@@ -354,6 +602,7 @@ fn validated_metadata(
     source_height: u32,
     decoded_bytes: u64,
     orientation: Orientation,
+    animation_candidate: bool,
 ) -> Result<ValidatedImage, ImageValidationError> {
     validate_source_layout(source_width, source_height, decoded_bytes)?;
     checked_bgra_layout(
@@ -366,6 +615,7 @@ fn validated_metadata(
         source_height,
         decoded_bytes,
         orientation,
+        animation_candidate,
     })
 }
 
@@ -408,6 +658,7 @@ pub(super) fn checked_bgra_layout(
         LayoutError::InvalidDimensions { width, height } => {
             ImageValidationError::InvalidPreviewDimensions { width, height }
         }
+        LayoutError::InvalidFrameCount { .. } => ImageValidationError::ArithmeticOverflow,
         LayoutError::ArithmeticOverflow => ImageValidationError::ArithmeticOverflow,
         LayoutError::PayloadTooLarge { actual } => {
             ImageValidationError::PreviewPayloadTooLarge { actual }
@@ -517,7 +768,8 @@ impl fmt::Display for ImageValidationError {
             }
             Self::PreviewPayloadTooLarge { actual } => write!(
                 formatter,
-                "preview payload requires {actual} bytes; the limit is {MAX_PREVIEW_PAYLOAD_LEN}"
+                "preview payload requires {actual} bytes; the limit is \
+                 {MAX_STILL_IMAGE_PAYLOAD_LEN}"
             ),
             Self::ArithmeticOverflow => write!(formatter, "image size arithmetic overflowed"),
         }
@@ -549,10 +801,10 @@ impl From<ImageError> for ImageValidationError {
 #[cfg(test)]
 mod tests {
     use super::{
-        IMAGE_EXTENSIONS, ImageDecodeResult, ImageValidationError, ImageValidationResult,
-        MAX_DECODED_IMAGE_BYTES, MAX_DECODER_ALLOC_BYTES, MAX_IMAGE_FILE_BYTES,
-        checked_bgra_layout, decode, decoder_limits, fitted_preview_dimensions, is_eligible_path,
-        validate, validate_source_layout,
+        IMAGE_EXTENSIONS, ImageAnimationDecodeResult, ImageDecodeResult, ImageValidationError,
+        ImageValidationResult, MAX_DECODED_IMAGE_BYTES, MAX_DECODER_ALLOC_BYTES,
+        MAX_IMAGE_FILE_BYTES, checked_bgra_layout, decode, decode_animation, decoder_limits,
+        fitted_preview_dimensions, is_eligible_path, validate, validate_source_layout,
     };
     use crate::{
         preview_file::PreviewFile,
@@ -938,6 +1190,78 @@ mod tests {
             assert!(pixel.0[1] < 40);
             assert!(pixel.0[2] < 50);
         }
+        let preview = decoded.into_preview(&file).unwrap();
+        let source = preview
+            .animation_source
+            .expect("GIF still previews should carry a validated animation source");
+        assert_eq!(source.volume_serial_number, file.volume_serial_number());
+        assert_eq!(source.file_id, file.file_id());
+        assert_eq!(source.format, ImageFormat::Gif);
+        assert_eq!((source.source_width, source.source_height), (2, 1));
+    }
+
+    #[test]
+    fn animated_gif_and_webp_produce_bounded_composited_upgrades() {
+        let root = TestDirectory::new("animated-upgrades");
+        let gif_path = root.path().join("animated.gif");
+        fs::write(&gif_path, two_frame_gif()).unwrap();
+        let gif = PreviewFile::open(&gif_path).unwrap();
+        let ImageAnimationDecodeResult::Preview(gif_preview) =
+            decode_animation(&gif).expect("the animated GIF should decode")
+        else {
+            panic!("the animated GIF should produce an upgrade");
+        };
+        assert_eq!(gif_preview.format, ImageFormat::Gif);
+        assert_eq!((gif_preview.width, gif_preview.height), (2, 1));
+        assert_eq!(gif_preview.frames.len(), 2);
+        assert_eq!(gif_preview.frames.len(), gif_preview.frame_delays_ms.len());
+        assert_ne!(gif_preview.frames[0], gif_preview.frames[1]);
+        assert!(gif_preview.frame_delays_ms.iter().all(|delay| *delay >= 20));
+
+        let webp_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("manual-tests/images/variants/animated-640x360.webp");
+        let webp = PreviewFile::open(&webp_path).expect("the retained WebP fixture should open");
+        let ImageAnimationDecodeResult::Preview(webp_preview) =
+            decode_animation(&webp).expect("the animated WebP should decode")
+        else {
+            panic!("the animated WebP should produce an upgrade");
+        };
+        assert_eq!(webp_preview.format, ImageFormat::WebP);
+        assert_eq!(
+            (webp_preview.source_width, webp_preview.source_height),
+            (640, 360)
+        );
+        assert_eq!((webp_preview.width, webp_preview.height), (480, 270));
+        assert!(webp_preview.frames.len() >= 2);
+        assert_eq!(
+            webp_preview.frames.len(),
+            webp_preview.frame_delays_ms.len()
+        );
+        assert!(webp_preview.frames.iter().all(|frame| {
+            frame.len() == usize::try_from(webp_preview.width * webp_preview.height * 4).unwrap()
+        }));
+    }
+
+    #[test]
+    fn static_webp_has_no_animation_upgrade() {
+        let root = TestDirectory::new("static-webp-upgrade");
+        let path = root.path().join("static.webp");
+        fs::write(&path, encoded(DecoderFormat::WebP)).unwrap();
+        let file = PreviewFile::open(&path).unwrap();
+        assert!(matches!(
+            decode_animation(&file).unwrap(),
+            ImageAnimationDecodeResult::Unsupported
+        ));
+        let ImageDecodeResult::Decoded(decoded) = decode(&file).unwrap() else {
+            panic!("the static WebP should still decode");
+        };
+        assert!(
+            decoded
+                .into_preview(&file)
+                .unwrap()
+                .animation_source
+                .is_none()
+        );
     }
 
     #[test]

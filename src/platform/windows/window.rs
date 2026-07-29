@@ -28,8 +28,8 @@ use crate::hover::{
 use crate::preview::{PreviewPlacement, PreviewSize};
 use crate::settings::{SettingsDocument, SettingsFile, Theme};
 use crate::worker::{
-    CompletionNotifier, PendingWorkerPoll, PendingWorkerResolution, PreviewResult, ResolverStatus,
-    WorkerManager, WorkerManagerError,
+    CompletionNotifier, ImageAnimationSource, PendingWorkerPoll, PendingWorkerResolution,
+    PreviewResult, ResolverStatus, WorkerManager, WorkerManagerError,
 };
 use cursorpeek_core::{ExplorerWindowId, PhysicalScreenRect, PhysicalScreenSpan};
 
@@ -145,6 +145,13 @@ struct PendingWorkerRequest {
     explorer_window: ExplorerWindowId,
     point: PhysicalScreenPoint,
     phase: WorkerRequestPhase,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingImageAnimationRequest {
+    generation: Generation,
+    explorer_window: ExplorerWindowId,
+    target_bounds: PhysicalScreenRect,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -273,6 +280,9 @@ pub(crate) struct MessageWindow {
     worker_manager: Option<WorkerManager>,
     pending_worker_resolution: Option<PendingWorkerResolution>,
     pending_worker_request: Option<PendingWorkerRequest>,
+    image_animation_worker_manager: Option<WorkerManager>,
+    pending_image_animation_resolution: Option<PendingWorkerResolution>,
+    pending_image_animation_request: Option<PendingImageAnimationRequest>,
     preview_readiness: PreviewReadiness,
     active_preview: Option<ActivePreview>,
     preview_event_hooks: Option<PreviewEventHooks>,
@@ -348,6 +358,9 @@ impl MessageWindow {
             worker_manager: None,
             pending_worker_resolution: None,
             pending_worker_request: None,
+            image_animation_worker_manager: None,
+            pending_image_animation_resolution: None,
+            pending_image_animation_request: None,
             preview_readiness: PreviewReadiness::default(),
             active_preview: None,
             preview_event_hooks: Some(PreviewEventHooks::register()?),
@@ -422,10 +435,22 @@ impl MessageWindow {
         drop(self.preview_window.take());
         drop(self.tray_icon.take());
 
-        if let Some(manager) = self.worker_manager.take() {
-            manager.shutdown()?;
+        let primary = self
+            .worker_manager
+            .take()
+            .map_or(Ok(()), WorkerManager::shutdown);
+        let animation = self
+            .image_animation_worker_manager
+            .take()
+            .map_or(Ok(()), WorkerManager::shutdown);
+        match (primary, animation) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(operation), Err(shutdown)) => Err(WorkerManagerError::ShutdownAfterFailure {
+                operation: Box::new(operation),
+                shutdown: Box::new(shutdown),
+            }),
         }
-        Ok(())
     }
 
     pub(crate) fn run_input_diagnostics(
@@ -970,6 +995,8 @@ impl MessageWindow {
     fn invalidate_worker_delivery(&mut self) {
         drop(self.pending_worker_resolution.take());
         self.pending_worker_request = None;
+        drop(self.pending_image_animation_resolution.take());
+        self.pending_image_animation_request = None;
         self.preview_readiness.invalidate();
         self.hide_product_preview();
     }
@@ -1124,6 +1151,11 @@ impl MessageWindow {
     }
 
     fn handle_worker_result(&mut self) {
+        self.handle_primary_worker_result();
+        self.handle_image_animation_result();
+    }
+
+    fn handle_primary_worker_result(&mut self) {
         let Some(pending) = self.pending_worker_resolution.as_mut() else {
             return;
         };
@@ -1195,6 +1227,71 @@ impl MessageWindow {
                         self.hover_state.finish_resolution(generation);
                         self.preview_readiness.invalidate();
                         self.hide_product_preview();
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_image_animation_result(&mut self) {
+        let Some(pending) = self.pending_image_animation_resolution.as_mut() else {
+            return;
+        };
+
+        match pending.poll() {
+            PendingWorkerPoll::Pending => {}
+            PendingWorkerPoll::Ready(result) => {
+                self.pending_image_animation_resolution = None;
+                let request = self.pending_image_animation_request.take();
+                match result {
+                    Ok(resolution) => {
+                        let generation = resolution.generation();
+                        let session = resolution.session_id();
+                        let (target_bounds, result) = resolution.into_parts();
+                        let request_matches = request.is_some_and(|request| {
+                            request.generation == generation
+                                && self.active_preview.is_some_and(|active| {
+                                    active.generation == request.generation
+                                        && active.explorer_window == request.explorer_window
+                                        && active.target_bounds == request.target_bounds
+                                })
+                        });
+                        let accepted = request_matches
+                            && target_bounds.is_none()
+                            && match result {
+                                PreviewResult::ImageAnimation(animation) => {
+                                    self.preview_window.as_ref().is_some_and(|preview| {
+                                        preview.attach_image_animation(animation).unwrap_or(false)
+                                    })
+                                }
+                                PreviewResult::Status(_) => false,
+                                PreviewResult::Text(_)
+                                | PreviewResult::Image(_)
+                                | PreviewResult::Video(_) => {
+                                    unreachable!(
+                                        "the manager rejects non-animation upgrade results"
+                                    )
+                                }
+                            };
+                        diagnostics::record(
+                            "worker.animation.completed",
+                            format_args!(
+                                "generation={} session={} outcome={}",
+                                generation.get(),
+                                session,
+                                if accepted { "attached" } else { "ignored" }
+                            ),
+                        );
+                    }
+                    Err(error) => {
+                        diagnostics::record(
+                            "worker.animation.completed",
+                            format_args!(
+                                "generation={} outcome=error category={}",
+                                request.map_or(0, |request| request.generation.get()),
+                                error.category()
+                            ),
+                        );
                     }
                 }
             }
@@ -1280,6 +1377,87 @@ impl MessageWindow {
         }
     }
 
+    fn submit_image_animation_upgrade(
+        &mut self,
+        generation: Generation,
+        anchor: PhysicalScreenPoint,
+        explorer_window: ExplorerWindowId,
+        target_bounds: PhysicalScreenRect,
+        source: ImageAnimationSource,
+    ) {
+        let settings = self
+            .settings_document
+            .as_ref()
+            .expect("animation upgrades require loaded settings")
+            .settings();
+        let legacy_encoding = settings.legacy_encoding().clone();
+        let cache_entries = settings.cache_entries();
+
+        if self.image_animation_worker_manager.is_none() {
+            match WorkerManager::start(legacy_encoding, cache_entries) {
+                Ok(manager) => self.image_animation_worker_manager = Some(manager),
+                Err(error) => {
+                    diagnostics::record(
+                        "worker.animation.submit",
+                        format_args!(
+                            "generation={} outcome=manager_error category={}",
+                            generation.get(),
+                            error.category()
+                        ),
+                    );
+                    return;
+                }
+            }
+        }
+        let manager = self
+            .image_animation_worker_manager
+            .as_mut()
+            .expect("the animation manager was created above");
+        if let Err(error) = manager.restart_if_stopped() {
+            diagnostics::record(
+                "worker.animation.submit",
+                format_args!(
+                    "generation={} outcome=restart_error category={}",
+                    generation.get(),
+                    error.category()
+                ),
+            );
+            return;
+        }
+        let notifier = worker_result_notifier(self.hwnd);
+        match manager.submit_image_animation_with_notifier(
+            generation,
+            anchor,
+            explorer_window,
+            PhysicalScreenSpan::from_point(anchor),
+            source,
+            notifier,
+        ) {
+            Ok(pending) => {
+                self.pending_image_animation_resolution = Some(pending);
+                self.pending_image_animation_request = Some(PendingImageAnimationRequest {
+                    generation,
+                    explorer_window,
+                    target_bounds,
+                });
+                diagnostics::record(
+                    "worker.animation.submit",
+                    format_args!("generation={} outcome=queued", generation.get()),
+                );
+            }
+            Err(error) => {
+                diagnostics::record(
+                    "worker.animation.submit",
+                    format_args!(
+                        "generation={} outcome=error category={}",
+                        generation.get(),
+                        error.category()
+                    ),
+                );
+            }
+        }
+    }
+
     fn set_worker_recovering(&mut self, recovering: bool) {
         if self.worker_recovering == recovering {
             return;
@@ -1297,7 +1475,7 @@ impl MessageWindow {
         anchor: PhysicalScreenPoint,
         explorer_window: ExplorerWindowId,
         target_bounds: PhysicalScreenRect,
-        result: PreviewResult,
+        mut result: PreviewResult,
     ) {
         let show_started = diagnostics::counter();
         let generation_value = generation.get();
@@ -1338,6 +1516,14 @@ impl MessageWindow {
             return;
         }
 
+        let animation_source = match &mut result {
+            PreviewResult::Image(image) => image.animation_source.take(),
+            PreviewResult::Status(_)
+            | PreviewResult::Text(_)
+            | PreviewResult::Video(_)
+            | PreviewResult::ImageAnimation(_) => None,
+        };
+
         if self.preview_window.is_none() {
             let theme = self
                 .settings_document
@@ -1369,6 +1555,9 @@ impl MessageWindow {
                 }
                 preview.show_video_at(anchor, self.preview_size, video, settings.video_audio())
             }
+            PreviewResult::ImageAnimation(_) => {
+                unreachable!("animation upgrades are never primary preview results")
+            }
             PreviewResult::Status(_) => unreachable!("statuses returned before window creation"),
         };
         match shown {
@@ -1398,6 +1587,16 @@ impl MessageWindow {
                     .is_err()
                 {
                     self.hide_product_preview();
+                    return;
+                }
+                if let Some(source) = animation_source {
+                    self.submit_image_animation_upgrade(
+                        generation,
+                        anchor,
+                        explorer_window,
+                        target_bounds,
+                        source,
+                    );
                 }
             }
             Err(_) => {
@@ -1516,6 +1715,10 @@ impl MessageWindow {
                     self.set_worker_recovering(true);
                 }
             }
+            let _ = self
+                .image_animation_worker_manager
+                .as_ref()
+                .map(WorkerManager::request_session_recycle);
         }
         Ok(())
     }
@@ -1913,6 +2116,7 @@ fn preview_result_kind(result: &PreviewResult) -> &'static str {
         PreviewResult::Text(_) => "text",
         PreviewResult::Image(_) => "image",
         PreviewResult::Video(_) => "video",
+        PreviewResult::ImageAnimation(_) => "image-animation",
     }
 }
 
@@ -2139,6 +2343,8 @@ impl Drop for MessageWindow {
         let _ = self.preview_guard_timer.stop();
         drop(self.pending_worker_resolution.take());
         drop(self.worker_manager.take());
+        drop(self.pending_image_animation_resolution.take());
+        drop(self.image_animation_worker_manager.take());
         drop(self.preview_event_hooks.take());
         drop(self.raw_input.take());
 
