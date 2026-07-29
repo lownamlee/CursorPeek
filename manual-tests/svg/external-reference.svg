@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="640" height="360">
+  <rect width="640" height="360" fill="#172554"/>
+  <image x="80" y="60" width="160" height="160" xlink:href="https://example.invalid/cursorpeek-fixture.png"/>
+  <text x="80" y="280" fill="#f8fafc" font-family="Segoe UI, sans-serif" font-size="24">
+    External references must remain inert source text
+  </text>
+</svg>

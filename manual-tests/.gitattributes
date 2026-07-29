@@ -1,0 +1,12 @@
+# Preserve test payloads byte-for-byte across Windows and Unix checkouts.
+images/** -text -diff
+videos/** -text -diff
+text/** -text
+text/encodings/** -diff
+text/scenarios/mixed-newlines.txt -diff
+
+# Keep documentation, generators, and inspectable SVG sources as LF text.
+.gitattributes text eol=lf
+README.md text eol=lf
+generators/** text eol=lf
+svg/** text eol=lf

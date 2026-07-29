@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180" viewBox="0 0 320 180">
+  <rect width="320" height="180" rx="20" fill="#0f172a"/>
+  <circle cx="72" cy="90" r="38" fill="#34d399"/>
+  <text x="128" y="98" fill="#f8fafc" font-size="24">SVG source fixture</text>
+</svg>

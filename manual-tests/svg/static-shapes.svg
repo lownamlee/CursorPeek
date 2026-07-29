@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360" viewBox="0 0 640 360">
+  <rect width="640" height="360" rx="32" fill="#0f172a"/>
+  <circle cx="140" cy="180" r="84" fill="#34d399"/>
+  <path d="M260 110h280v24H260zm0 58h220v18H260zm0 46h250v18H260z" fill="#94a3b8"/>
+  <text x="260" y="286" fill="#f8fafc" font-family="Segoe UI, sans-serif" font-size="30">
+    CursorPeek SVG source fixture
+  </text>
+</svg>

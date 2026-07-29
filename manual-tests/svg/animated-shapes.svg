@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360" viewBox="0 0 640 360">
+  <rect width="640" height="360" fill="#111827"/>
+  <circle cx="90" cy="180" r="48" fill="#60a5fa">
+    <animate attributeName="cx" values="90;550;90" dur="2.4s" repeatCount="indefinite"/>
+    <animate attributeName="fill" values="#60a5fa;#f97316;#34d399;#60a5fa" dur="2.4s" repeatCount="indefinite"/>
+  </circle>
+  <text x="320" y="320" text-anchor="middle" fill="#f8fafc" font-family="Segoe UI, sans-serif" font-size="26">
+    Animated SVG markup — previewed as inert source text
+  </text>
+</svg>
