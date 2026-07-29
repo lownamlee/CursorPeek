@@ -1,10 +1,8 @@
 use super::{TextDecodeResult, decode};
 use crate::{
+    preview_file::PreviewFile,
     settings::LegacyEncoding,
-    worker::{
-        file::PreviewFile,
-        payload::{MAX_TEXT_LINES, MAX_TEXT_SCALARS, TextPreview},
-    },
+    worker::payload::{MAX_TEXT_LINES, MAX_TEXT_SCALARS, TextPreview},
 };
 use encoding_rs::{SHIFT_JIS, WINDOWS_1252};
 use std::{

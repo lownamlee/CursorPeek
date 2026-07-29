@@ -1,7 +1,7 @@
 use super::{ImageDecodeResult, ImageValidationError, decode};
-use crate::worker::{
-    file::PreviewFile,
-    payload::{ImageFormat, ImagePreview},
+use crate::{
+    preview_file::PreviewFile,
+    worker::payload::{ImageFormat, ImagePreview},
 };
 use image::{DynamicImage, GrayImage, ImageFormat as DecoderFormat, Luma, Rgba, RgbaImage};
 use std::{

@@ -3,6 +3,7 @@ use std::{error::Error, fmt, io::BufReader};
 #[cfg(test)]
 pub(super) mod corpus;
 
+use crate::preview_file::{PreviewFile, PreviewFileError};
 use ::image::{
     DynamicImage, ImageDecoder, ImageError, ImageFormat as DecoderFormat, Limits,
     codecs::{
@@ -20,13 +21,10 @@ use cursorpeek_core::{
     sniff::sniff_image_format,
 };
 
-use super::{
-    file::{PreviewFile, PreviewFileError},
-    payload::{
-        BGRA_BYTES_PER_PIXEL, ImageFormat, ImagePreview, MAX_PREVIEW_IMAGE_HEIGHT,
-        MAX_PREVIEW_IMAGE_WIDTH, MAX_PREVIEW_PAYLOAD_LEN, MAX_SOURCE_IMAGE_AXIS,
-        MAX_SOURCE_IMAGE_PIXELS, fitted_preview_dimensions,
-    },
+use super::payload::{
+    BGRA_BYTES_PER_PIXEL, ImageFormat, ImagePreview, MAX_PREVIEW_IMAGE_HEIGHT,
+    MAX_PREVIEW_IMAGE_WIDTH, MAX_PREVIEW_PAYLOAD_LEN, MAX_SOURCE_IMAGE_AXIS,
+    MAX_SOURCE_IMAGE_PIXELS, fitted_preview_dimensions,
 };
 
 const MAGIC_PREFIX_LEN: usize = 16;
@@ -556,9 +554,9 @@ mod tests {
         checked_bgra_layout, decode, decoder_limits, fitted_preview_dimensions, is_eligible_path,
         validate, validate_source_layout,
     };
-    use crate::worker::{
-        file::PreviewFile,
-        payload::{
+    use crate::{
+        preview_file::PreviewFile,
+        worker::payload::{
             ImageFormat, MAX_PREVIEW_IMAGE_HEIGHT, MAX_PREVIEW_IMAGE_WIDTH, MAX_SOURCE_IMAGE_AXIS,
             MAX_SOURCE_IMAGE_PIXELS,
         },

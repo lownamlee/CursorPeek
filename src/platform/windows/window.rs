@@ -1357,6 +1357,18 @@ impl MessageWindow {
         let shown = match result {
             PreviewResult::Text(text) => preview.show_text_at(anchor, self.preview_size, &text),
             PreviewResult::Image(image) => preview.show_image_at(anchor, self.preview_size, image),
+            PreviewResult::Video(video) => {
+                let settings = self
+                    .settings_document
+                    .as_ref()
+                    .expect("video preview requires loaded settings")
+                    .settings();
+                if !settings.video_previews() {
+                    self.hide_product_preview();
+                    return;
+                }
+                preview.show_video_at(anchor, self.preview_size, video, settings.video_audio())
+            }
             PreviewResult::Status(_) => unreachable!("statuses returned before window creation"),
         };
         match shown {
@@ -1587,6 +1599,14 @@ impl MessageWindow {
                 self.toggle_start_with_windows();
                 Ok(false)
             }
+            Some(TrayCommand::ToggleVideoPreviews) => {
+                self.toggle_video_previews();
+                Ok(false)
+            }
+            Some(TrayCommand::ToggleVideoAudio) => {
+                self.toggle_video_audio();
+                Ok(false)
+            }
             Some(TrayCommand::About) => {
                 self.tray_icon
                     .as_ref()
@@ -1611,6 +1631,8 @@ impl MessageWindow {
             preview_height: settings.preview_height(),
             theme: settings.theme(),
             start_with_windows: settings.start_with_windows(),
+            video_previews: settings.video_previews(),
+            video_audio: settings.video_audio(),
         }
     }
 
@@ -1723,6 +1745,34 @@ impl MessageWindow {
         }
 
         self.settings_document = Some(updated);
+    }
+
+    fn toggle_video_previews(&mut self) {
+        let mut updated = self
+            .settings_document
+            .as_ref()
+            .expect("a settings command requires the loaded document")
+            .clone();
+        let enabled = !updated.settings().video_previews();
+        updated.set_video_previews(enabled);
+        if self.save_settings(&updated) {
+            self.settings_document = Some(updated);
+            self.cancel_dwell();
+        }
+    }
+
+    fn toggle_video_audio(&mut self) {
+        let mut updated = self
+            .settings_document
+            .as_ref()
+            .expect("a settings command requires the loaded document")
+            .clone();
+        let enabled = !updated.settings().video_audio();
+        updated.set_video_audio(enabled);
+        if self.save_settings(&updated) {
+            self.settings_document = Some(updated);
+            self.cancel_dwell();
+        }
     }
 
     fn save_settings(&self, updated: &SettingsDocument) -> bool {
@@ -1862,6 +1912,7 @@ fn preview_result_kind(result: &PreviewResult) -> &'static str {
         PreviewResult::Status(_) => "status",
         PreviewResult::Text(_) => "text",
         PreviewResult::Image(_) => "image",
+        PreviewResult::Video(_) => "video",
     }
 }
 

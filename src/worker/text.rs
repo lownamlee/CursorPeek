@@ -6,14 +6,14 @@ use cursorpeek_core::sniff::{TextByteKind, classify_text_prefix as classify_pref
 use encoding_rs::{DecoderResult, Encoding, UTF_8, UTF_16BE, UTF_16LE, X_USER_DEFINED};
 use windows::Win32::Globalization::GetACP;
 
-use crate::settings::LegacyEncoding;
+use crate::{
+    preview_file::{PreviewFile, PreviewFileError},
+    settings::LegacyEncoding,
+};
 
-use super::{
-    file::{PreviewFile, PreviewFileError},
-    payload::{
-        MAX_TEXT_LINES, MAX_TEXT_SCALARS, MAX_TEXT_UTF8_LEN, TextPreview,
-        is_noncanonical_text_line_break, is_unsafe_text_control,
-    },
+use super::payload::{
+    MAX_TEXT_LINES, MAX_TEXT_SCALARS, MAX_TEXT_UTF8_LEN, TextPreview,
+    is_noncanonical_text_line_break, is_unsafe_text_control,
 };
 
 const TEXT_SNIFF_LIMIT: usize = 64 * 1024;
@@ -360,10 +360,10 @@ mod tests {
         decode_unicode_bytes, is_eligible_path, legacy_encoding_for_code_page,
         sanitize_and_truncate, sanitize_and_truncate_with_limits,
     };
-    use crate::settings::LegacyEncoding;
-    use crate::worker::{
-        file::PreviewFile,
-        payload::{MAX_TEXT_LINES, MAX_TEXT_SCALARS},
+    use crate::{
+        preview_file::PreviewFile,
+        settings::LegacyEncoding,
+        worker::payload::{MAX_TEXT_LINES, MAX_TEXT_SCALARS},
     };
     use encoding_rs::{SHIFT_JIS, WINDOWS_1252};
     use std::{

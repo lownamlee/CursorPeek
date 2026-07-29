@@ -18,8 +18,13 @@ locality, format, or resource checks cannot be satisfied safely.
 ## Content and presentation
 
 - Only the formats and exact filenames listed in the
-  [user guide](USER_GUIDE.md) are eligible. PDF, Office documents, archives,
-  audio, video, font, executable, and folder previews are not included.
+  [user guide](USER_GUIDE.md) are eligible. PDF, Office documents, archives, standalone audio,
+  unlisted media containers, font, executable, and folder previews are not included.
+- Video codec availability follows the Windows Media Foundation components installed on the
+  system. A listed container extension and valid container header do not guarantee that every
+  embedded stream is decodable. Native decoding currently runs in the coordinator rather than the
+  contained image/text worker. Video controls and scrubbing are not shown; the hover preview loops
+  until dismissed.
 - Animated GIF files use the first composited frame. WebP uses a still preview, ICO uses a
   deterministic first image, and TIFF uses a deterministic first page.
 - Text is inert plain text. CursorPeek does not render Markdown or HTML, apply syntax highlighting,

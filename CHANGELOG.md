@@ -19,6 +19,16 @@ This file records user-visible changes to CursorPeek. Release dates are added on
   `.ppk`, `.asc`) and extensionless OpenSSH key files.
 - Recognize more exact filenames, including `AUTHORS`, `CONTRIBUTING`, `CHANGELOG`, `CODEOWNERS`,
   `VERSION`, `Rakefile`, `Procfile`, `Justfile`, `Jenkinsfile`, `.gitmodules`, and `.nvmrc`.
+- Preview header-verified MPEG-4/QuickTime/3GPP (`.mp4`, `.m4v`, `.mov`, `.mp4v`, `.3g2`, `.3gp`,
+  `.3gp2`, `.3gpp`), AVI (`.avi`), and ASF (`.asf`, `.wmv`) video containers through native
+  Windows playback.
+
+### Changed
+
+- Reveal video as soon as its verified player and preview surface are ready instead of waiting on a
+  fixed 400 ms preroll.
+- Retain one balanced Media Foundation platform session across hover players instead of restarting
+  the platform for every video.
 
 ### Security
 

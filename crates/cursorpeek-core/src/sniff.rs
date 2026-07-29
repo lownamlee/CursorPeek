@@ -2,12 +2,23 @@ use std::path::Path;
 
 use image::ImageFormat as DecoderFormat;
 
-use crate::payload::ImageFormat;
+use crate::payload::{ImageFormat, VideoContainer};
 
 const NULL_PATTERN_SAMPLE_LIMIT: usize = 4 * 1024;
 
 pub const IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "jpe", "jfif", "png", "gif", "webp", "bmp", "dib", "ico", "tif", "tiff",
+];
+pub const VIDEO_EXTENSIONS: &[&str] = &[
+    "mp4", "m4v", "mov", "mp4v", "3g2", "3gp", "3gp2", "3gpp", "avi", "asf", "wmv",
+];
+
+const ISO_BASE_MEDIA_VIDEO_EXTENSIONS: &[&str] =
+    &["mp4", "m4v", "mov", "mp4v", "3g2", "3gp", "3gp2", "3gpp"];
+const AVI_VIDEO_EXTENSIONS: &[&str] = &["avi"];
+const ASF_VIDEO_EXTENSIONS: &[&str] = &["asf", "wmv"];
+const ASF_HEADER_OBJECT: [u8; 16] = [
+    0x30, 0x26, 0xb2, 0x75, 0x8e, 0x66, 0xcf, 0x11, 0xa6, 0xd9, 0x00, 0xaa, 0x00, 0x62, 0xce, 0x6c,
 ];
 
 // Every entry is previewed as inert plain text. Nothing here is parsed, rendered, executed, or
@@ -232,6 +243,99 @@ pub fn is_image_eligible_path(path: &Path) -> bool {
         })
 }
 
+pub fn is_video_eligible_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            VIDEO_EXTENSIONS
+                .iter()
+                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+        })
+}
+
+pub fn sniff_video_container(path: &Path, prefix: &[u8]) -> Option<VideoContainer> {
+    let extension = path.extension()?.to_str()?;
+    if extension_in(extension, ISO_BASE_MEDIA_VIDEO_EXTENSIONS)
+        && has_iso_base_media_file_type(prefix)
+    {
+        Some(VideoContainer::IsoBaseMedia)
+    } else if extension_in(extension, AVI_VIDEO_EXTENSIONS) && is_avi_prefix(prefix) {
+        Some(VideoContainer::Avi)
+    } else if extension_in(extension, ASF_VIDEO_EXTENSIONS) && is_asf_prefix(prefix) {
+        Some(VideoContainer::Asf)
+    } else {
+        None
+    }
+}
+
+fn extension_in(extension: &str, candidates: &[&str]) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+}
+
+fn has_iso_base_media_file_type(prefix: &[u8]) -> bool {
+    let mut offset = 0_usize;
+    while prefix.len().saturating_sub(offset) >= 8 {
+        let size = u32::from_be_bytes(
+            prefix[offset..offset + 4]
+                .try_into()
+                .expect("the remaining-length check guarantees four bytes"),
+        );
+        let kind = &prefix[offset + 4..offset + 8];
+        let header_len = if size == 1 { 16 } else { 8 };
+        if kind == b"ftyp" {
+            return size == 1
+                && prefix.get(offset + 8..offset + 16).is_some_and(|bytes| {
+                    u64::from_be_bytes(
+                        bytes
+                            .try_into()
+                            .expect("the exact slice contains eight bytes"),
+                    ) >= 16
+                })
+                || size >= 8;
+        }
+        let box_len = match size {
+            0 => return false,
+            1 => {
+                let Some(bytes) = prefix.get(offset + 8..offset + 16) else {
+                    return false;
+                };
+                let Ok(length) = usize::try_from(u64::from_be_bytes(
+                    bytes
+                        .try_into()
+                        .expect("the exact slice contains eight bytes"),
+                )) else {
+                    return false;
+                };
+                length
+            }
+            value => {
+                let Ok(length) = usize::try_from(value) else {
+                    return false;
+                };
+                length
+            }
+        };
+        if box_len < header_len {
+            return false;
+        }
+        let Some(next_offset) = offset.checked_add(box_len) else {
+            return false;
+        };
+        offset = next_offset;
+    }
+    false
+}
+
+fn is_avi_prefix(prefix: &[u8]) -> bool {
+    prefix.len() >= 12 && &prefix[..4] == b"RIFF" && &prefix[8..12] == b"AVI "
+}
+
+fn is_asf_prefix(prefix: &[u8]) -> bool {
+    prefix.starts_with(&ASF_HEADER_OBJECT)
+}
+
 pub fn sniff_image_format(prefix: &[u8]) -> Option<SniffedImageFormat> {
     let decoder = image::guess_format(prefix).ok()?;
     let preview = match decoder {
@@ -371,10 +475,11 @@ mod tests {
     use image::ImageFormat as DecoderFormat;
 
     use super::{
-        IMAGE_EXTENSIONS, TEXT_EXTENSIONS, TEXT_NAMES, TextByteKind, classify_text_prefix,
-        is_image_eligible_path, is_text_eligible_path, sniff_image_format,
+        IMAGE_EXTENSIONS, TEXT_EXTENSIONS, TEXT_NAMES, TextByteKind, VIDEO_EXTENSIONS,
+        classify_text_prefix, is_image_eligible_path, is_text_eligible_path,
+        is_video_eligible_path, sniff_image_format, sniff_video_container,
     };
-    use crate::payload::ImageFormat;
+    use crate::payload::{ImageFormat, VideoContainer};
 
     #[test]
     fn eligible_paths_are_ascii_case_insensitive() {
@@ -393,6 +498,60 @@ mod tests {
                 extension.to_ascii_uppercase()
             ))));
         }
+        for extension in VIDEO_EXTENSIONS {
+            assert!(is_video_eligible_path(Path::new(&format!(
+                r"C:\preview.{}",
+                extension.to_ascii_uppercase()
+            ))));
+        }
+        assert!(!is_video_eligible_path(Path::new(r"C:\preview.mkv")));
+    }
+
+    #[test]
+    fn video_sniff_requires_matching_extension_and_container_header() {
+        let iso = b"\0\0\0\x18ftypisom\0\0\0\0isommp42";
+        let iso_after_free = b"\0\0\0\x08free\0\0\0\x18ftypisom\0\0\0\0isommp42";
+        let avi = b"RIFF\x20\0\0\0AVI LIST";
+        let asf = [
+            0x30, 0x26, 0xb2, 0x75, 0x8e, 0x66, 0xcf, 0x11, 0xa6, 0xd9, 0x00, 0xaa, 0x00, 0x62,
+            0xce, 0x6c,
+        ];
+
+        for extension in ["mp4", "m4v", "mov", "mp4v", "3g2", "3gp", "3gp2", "3gpp"] {
+            assert_eq!(
+                sniff_video_container(Path::new(&format!("sample.{extension}")), iso),
+                Some(VideoContainer::IsoBaseMedia)
+            );
+        }
+        assert_eq!(
+            sniff_video_container(Path::new("sample.mov"), iso_after_free),
+            Some(VideoContainer::IsoBaseMedia)
+        );
+        assert_eq!(
+            sniff_video_container(Path::new("sample.avi"), avi),
+            Some(VideoContainer::Avi)
+        );
+        for extension in ["asf", "wmv"] {
+            assert_eq!(
+                sniff_video_container(Path::new(&format!("sample.{extension}")), &asf),
+                Some(VideoContainer::Asf)
+            );
+        }
+
+        assert_eq!(sniff_video_container(Path::new("sample.avi"), iso), None);
+        assert_eq!(sniff_video_container(Path::new("sample.mp4"), avi), None);
+        assert_eq!(
+            sniff_video_container(Path::new("sample.mov"), b"\0\0\0\x18moovisom"),
+            None
+        );
+        assert_eq!(
+            sniff_video_container(Path::new("sample.mp4"), b"\0\0\0\x04ftypisom"),
+            None
+        );
+        assert_eq!(
+            sniff_video_container(Path::new("sample.wmv"), b"short"),
+            None
+        );
     }
 
     #[test]

@@ -41,6 +41,10 @@ Right-click the CursorPeek icon:
   - Use system colors
   - Light
   - Dark
+- **Settings > Video**
+  - **Play video previews** enables or disables native video playback on hover. Enabled by default.
+  - **Play sound** enables video audio. Disabled by default. Hiding the preview stops audio
+    immediately.
 - **Settings > Start with Windows** — adds or removes the current executable from the current
   user’s startup list.
 - **About CursorPeek** — shows the product version.
@@ -79,6 +83,32 @@ Current image limits:
 Images are never enlarged beyond their decoded size and are fitted without changing aspect ratio.
 The popup follows the displayed image size, up to the selected maximum, with file details beneath
 the image.
+
+## Supported video
+
+CursorPeek plays these local video container families with Windows Media Foundation:
+
+| Container family | Eligible extensions |
+| --- | --- |
+| MPEG-4, QuickTime, and 3GPP | `.mp4`, `.m4v`, `.mov`, `.mp4v`, `.3g2`, `.3gp`, `.3gp2`, `.3gpp` |
+| AVI | `.avi` |
+| ASF | `.asf`, `.wmv` |
+
+Playback appears as soon as the verified native player and preview surface are ready. It loops
+while the pointer remains on the same Explorer item and stops as soon as the preview is dismissed.
+Audio is muted unless **Settings > Video > Play sound** is selected.
+
+The popup follows the video's native aspect ratio up to the selected maximum size. The footer shows
+the filename, file size, native video dimensions, and modified time.
+
+An eligible extension is not sufficient by itself. The worker also requires the matching bounded
+container signature: an ISO Base Media `ftyp` box, RIFF/AVI header, or ASF Header Object. The main
+process then requires the same container family, revalidates the exact file, and holds it against
+writes or replacement for the playback lifetime.
+
+Video files are limited to 4 GiB. A recognized container does not guarantee that Windows has a
+decoder for every video stream inside it. Unsupported codecs, audio-only files, and malformed
+containers fail without opening another application.
 
 ## Supported text
 
@@ -215,6 +245,8 @@ cache_entries=128
 theme=system
 legacy_encoding=auto
 start_with_windows=false
+video_previews=true
+video_audio=false
 ```
 
 | Key | Accepted value |
@@ -226,6 +258,8 @@ start_with_windows=false
 | `theme` | `system`, `light`, or `dark` |
 | `legacy_encoding` | `auto`, `system`, `off`, or a supported legacy label such as `windows-1252` or `shift_jis` |
 | `start_with_windows` | `true` or `false` |
+| `video_previews` | `true` or `false`; controls native video playback |
+| `video_audio` | `true` or `false`; controls video sound and defaults to `false` |
 
 The tray exposes safe presets rather than every numeric value. To use another accepted value,
 including a different cache capacity, exit CursorPeek, edit `config.ini` as UTF-8, and restart it.
@@ -238,9 +272,12 @@ preserved for forward compatibility.
 ## Privacy and containment
 
 CursorPeek has no account, telemetry, content upload, update check, or application network
-protocol. It reads the selected local file only after Explorer identity checks succeed. Parsing
-and decoding occur in a separate worker process with strict resource limits, authenticated bounded
-IPC, process mitigations, and kill-on-close Job containment.
+protocol. It reads the selected local file only after Explorer identity checks succeed. Image and
+text parsing and decoding occur in a separate worker process with strict resource limits,
+authenticated bounded IPC, process mitigations, and kill-on-close Job containment. Video extension
+and container eligibility are checked there, then the coordinator revalidates the exact file
+identity and detected container family and holds a no-write/no-delete lock while Windows Media
+Foundation performs native playback.
 
 The worker runs as the same Windows user. It is not an AppContainer, a different integrity level,
 or a security sandbox. Containment is designed to recover from decoder crashes, hangs, malformed

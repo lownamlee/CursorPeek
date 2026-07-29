@@ -145,6 +145,7 @@ settings, and uninstall details.
 | Type | Supported extensions or filenames |
 | --- | --- |
 | **Images** | `.jpg`, `.jpeg`, `.jpe`, `.jfif`, `.png`, `.gif`, `.webp`, `.bmp`, `.dib`, `.ico`, `.tif`, `.tiff` |
+| **Video** | `.mp4`, `.m4v`, `.mov`, `.mp4v`, `.3g2`, `.3gp`, `.3gp2`, `.3gpp`, `.avi`, `.asf`, `.wmv` (native Windows playback) |
 | **Text, logs, and markup** | `.txt`, `.text`, `.log`, `.md`, `.markdown`, `.mdx`, `.rst`, `.adoc`, `.tex`, `.svg` |
 | **Data and configuration** | `.csv`, `.tsv`, `.json`, `.jsonc`, `.json5`, `.jsonl`, `.ndjson`, `.xml`, `.plist`, `.yaml`, `.yml`, `.toml`, `.ini`, `.cfg`, `.conf`, `.config`, `.properties`, `.hcl`, `.tf`, `.tfvars`, `.proto`, `.graphql` |
 | **C and C++** | `.c`, `.h`, `.cc`, `.cpp`, `.cxx`, `.hh`, `.hpp`, `.hxx`, `.ipp`, `.inl` |
@@ -156,9 +157,10 @@ settings, and uninstall details.
 | **Patches, registry, and other data** | `.diff`, `.patch`, `.reg`, `.po`, `.srt`, `.vtt`, `.ics` |
 | **Exact filenames** | `README`, `LICENSE`, `COPYING`, `NOTICE`, `AUTHORS`, `CONTRIBUTING`, `CHANGELOG`, `CODEOWNERS`, `VERSION`, `Makefile`, `Dockerfile`, `Gemfile`, `Rakefile`, `Procfile`, `Justfile`, `Jenkinsfile`, `.env`, `.editorconfig`, `.gitattributes`, `.gitignore`, `.gitmodules`, `.dockerignore`, `.npmrc`, `.nvmrc`, `.prettierrc`, `.prettierignore`, `.eslintrc`, `.eslintignore`, `id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519`, `known_hosts`, `authorized_keys` |
 
-Matching is case-insensitive. Images and text are validated before previewing. Everything outside
-the **Images** row is shown as inert source text — `.svg` is not rasterized, and markup, projects,
-and patches are not rendered. See the [format reference](docs/USER_GUIDE.md#supported-images) and
+Matching is case-insensitive. Images, video, and text are validated before previewing. Everything
+outside the **Images** and **Video** rows is shown as inert source text — `.svg` is not rasterized,
+and markup, projects, and patches are not rendered. See the
+[format reference](docs/USER_GUIDE.md#supported-images) and
 [known limitations](docs/KNOWN_LIMITATIONS.md) for behavior and limits.
 
 > [!WARNING]
@@ -168,7 +170,9 @@ and patches are not rendered. See the [format reference](docs/USER_GUIDE.md#supp
 ## ⚙️ Settings
 
 Right-click the tray icon to pause previews or change the dwell delay, maximum preview size, theme,
-and startup behavior. See [settings and configuration](docs/USER_GUIDE.md#tray-menu).
+video playback, sound, and Windows startup behavior. Video previews are enabled by default and
+sound is opt-in. See
+[settings and configuration](docs/USER_GUIDE.md#tray-menu).
 
 <p align="center">
   <img

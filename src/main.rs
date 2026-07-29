@@ -10,8 +10,10 @@ mod hover;
 mod mode;
 mod platform;
 mod preview;
+mod preview_file;
 mod resolver;
 mod settings;
+mod video;
 mod worker;
 
 use std::{

@@ -9,12 +9,13 @@ use std::{
 };
 
 use crate::{
+    diagnostics,
     hover::PhysicalScreenPoint,
     preview::{PreviewPlacement, PreviewSize, ScreenRect, place_preview, place_preview_pixels},
     settings::Theme,
     worker::{ImagePreview, TextPreview},
 };
-use cursorpeek_core::{ExplorerWindowId, layout::fit_dimensions};
+use cursorpeek_core::{ExplorerWindowId, layout::fit_dimensions, payload::VideoPreview};
 
 use super::explorer::is_explorer_infotip_window;
 
@@ -54,6 +55,11 @@ use windows::{
                 RedrawWindow,
             },
         },
+        Media::MediaFoundation::{
+            IMFPMediaPlayer, IMFPMediaPlayerCallback, IMFPMediaPlayerCallback_Impl,
+            MF_MT_FRAME_SIZE, MF_VERSION, MFP_EVENT_HEADER, MFP_EVENT_TYPE_PLAYBACK_ENDED,
+            MFP_OPTION_NONE, MFPCreateMediaPlayer, MFSTARTUP_FULL, MFShutdown, MFStartup,
+        },
         System::{
             LibraryLoader::GetModuleHandleW,
             Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTimeEx},
@@ -64,19 +70,20 @@ use windows::{
             WindowsAndMessaging::{
                 CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GW_HWNDPREV,
                 GWLP_USERDATA, GetClientRect, GetWindow, GetWindowLongPtrW, GetWindowRect,
-                HWND_TOPMOST, IsWindowVisible, MA_NOACTIVATEANDEAT, NONCLIENTMETRICSW,
+                HWND_TOPMOST, IsWindowVisible, KillTimer, MA_NOACTIVATEANDEAT, NONCLIENTMETRICSW,
                 PostMessageW, RegisterClassW, SPI_GETHIGHCONTRAST, SPI_GETNONCLIENTMETRICS,
                 SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
                 SWP_NOZORDER, SWP_SHOWWINDOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW,
-                SetWindowLongPtrW, SetWindowPos, SetWindowTextW, SystemParametersInfoW,
+                SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, SystemParametersInfoW,
                 UnregisterClassW, WINDOW_EX_STYLE, WM_APP, WM_DISPLAYCHANGE, WM_DPICHANGED,
                 WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
-                WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOLORCHANGE, WM_THEMECHANGED, WNDCLASSW,
-                WS_BORDER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+                WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOLORCHANGE, WM_THEMECHANGED, WM_TIMER, WNDCLASSW,
+                WS_BORDER, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+                WS_VISIBLE,
             },
         },
     },
-    core::{Error, HRESULT, PCWSTR, Result, w},
+    core::{Error, HRESULT, PCWSTR, Result, implement, w},
 };
 use windows_numerics::Vector2;
 
@@ -92,12 +99,17 @@ const IMAGE_MARGIN: f32 = 4.0;
 const IMAGE_METADATA_HEIGHT: f32 = 56.0;
 const IMAGE_MINIMUM_WIDTH: f32 = 158.0;
 const SYSTEM_APPEARANCE_CHANGED_MESSAGE: u32 = WM_APP + 20;
+const VIDEO_AUDIO_FADE_TIMER_ID: usize = 2;
+const VIDEO_AUDIO_FADE_INTERVAL_MS: u32 = 20;
+const VIDEO_AUDIO_FADE_STEPS: u8 = 8;
 const MAX_Z_ORDER_SCAN: usize = 64;
 
 pub(crate) struct PreviewWindow {
     hwnd: HWND,
     state: Box<RefCell<PreviewWindowState>>,
     theme_observer: Option<ThemeObserver>,
+    video_player: RefCell<Option<VideoPlayer>>,
+    media_foundation: RefCell<Option<MediaFoundationSession>>,
     _class: RegisteredPreviewClass,
     _thread_affinity: PhantomData<Rc<()>>,
 }
@@ -134,11 +146,36 @@ impl PreviewWindow {
             )?
         };
         let theme_observer = ThemeObserver::new(hwnd);
+        let media_foundation_started = diagnostics::counter();
+        let media_foundation = match MediaFoundationSession::start() {
+            Ok(session) => {
+                diagnostics::record(
+                    "video.platform.ready",
+                    format_args!(
+                        "elapsed_us={}",
+                        diagnostics::elapsed_us(media_foundation_started).unwrap_or(0)
+                    ),
+                );
+                Some(session)
+            }
+            Err(error) => {
+                diagnostics::record(
+                    "video.platform.deferred",
+                    format_args!(
+                        "elapsed_us={} error={error}",
+                        diagnostics::elapsed_us(media_foundation_started).unwrap_or(0)
+                    ),
+                );
+                None
+            }
+        };
 
         Ok(Self {
             hwnd,
             state,
             theme_observer,
+            video_player: RefCell::new(None),
+            media_foundation: RefCell::new(media_foundation),
             _class: class,
             _thread_affinity: PhantomData,
         })
@@ -160,6 +197,7 @@ impl PreviewWindow {
         size: PreviewSize,
         preview: &TextPreview,
     ) -> Result<PreviewPlacement> {
+        self.stop_video();
         self.show(
             anchor,
             size,
@@ -173,11 +211,150 @@ impl PreviewWindow {
         size: PreviewSize,
         preview: ImagePreview,
     ) -> Result<PreviewPlacement> {
+        self.stop_video();
         self.show(
             anchor,
             size,
             Some(RetainedContent::Image(ImageContent::from_preview(preview))),
         )
+    }
+
+    pub(crate) fn show_video_at(
+        &self,
+        anchor: PhysicalScreenPoint,
+        size: PreviewSize,
+        preview: VideoPreview,
+        play_audio: bool,
+    ) -> Result<PreviewPlacement> {
+        let total_started = diagnostics::counter();
+        self.stop_video();
+        self.ensure_media_foundation()?;
+        let lock_started = diagnostics::counter();
+        let file_lock = crate::video::lock_for_playback(&preview).map_err(|error| {
+            diagnostics::record(
+                "video.lock.failed",
+                format_args!(
+                    "elapsed_us={} error={error}",
+                    diagnostics::elapsed_us(lock_started).unwrap_or(0)
+                ),
+            );
+            Error::from_hresult(E_INVALIDARG)
+        })?;
+        diagnostics::record(
+            "video.lock.ready",
+            format_args!(
+                "elapsed_us={}",
+                diagnostics::elapsed_us(lock_started).unwrap_or(0)
+            ),
+        );
+        let player_started = diagnostics::counter();
+        match VideoPlayer::create(self.hwnd, &preview.path, file_lock) {
+            Ok(player) => {
+                let (native_width, native_height) = player.native_size();
+                diagnostics::record(
+                    "video.player.ready",
+                    format_args!(
+                        "elapsed_us={} width={native_width} height={native_height}",
+                        diagnostics::elapsed_us(player_started).unwrap_or(0)
+                    ),
+                );
+                let setup = (|| {
+                    let content = VideoContent::from_preview(&preview, native_width, native_height);
+                    let window_started = diagnostics::counter();
+                    let placement = self.show_with_visibility(
+                        anchor,
+                        size,
+                        Some(RetainedContent::Video(content)),
+                        true,
+                    )?;
+                    diagnostics::record(
+                        "video.window.ready",
+                        format_args!(
+                            "elapsed_us={} visible={}",
+                            diagnostics::elapsed_us(window_started).unwrap_or(0),
+                            true
+                        ),
+                    );
+                    let surface_started = diagnostics::counter();
+                    self.state
+                        .borrow_mut()
+                        .attach_video_surface(player.video_window.hwnd)?;
+                    diagnostics::record(
+                        "video.surface.ready",
+                        format_args!(
+                            "elapsed_us={}",
+                            diagnostics::elapsed_us(surface_started).unwrap_or(0)
+                        ),
+                    );
+                    if play_audio {
+                        self.state
+                            .borrow_mut()
+                            .begin_audio_fade(player.player.clone())?;
+                        self.start_audio_fade_timer()?;
+                    }
+                    self.video_player.replace(Some(player));
+                    diagnostics::record(
+                        "video.visible.actual",
+                        format_args!(
+                            "mode=immediate elapsed_us={}",
+                            diagnostics::elapsed_us(total_started).unwrap_or(0)
+                        ),
+                    );
+                    Ok(placement)
+                })();
+                if setup.is_err() {
+                    let _ = self.hide();
+                }
+                setup
+            }
+            Err(error) => {
+                diagnostics::record(
+                    "video.player.failed",
+                    format_args!(
+                        "elapsed_us={} error={error}",
+                        diagnostics::elapsed_us(player_started).unwrap_or(0)
+                    ),
+                );
+                let _ = self.hide();
+                Err(error)
+            }
+        }
+    }
+
+    fn stop_video(&self) {
+        // SAFETY: Killing an absent timer is benign; this HWND remains live for the UI-thread call.
+        let _ = unsafe { KillTimer(Some(self.hwnd), VIDEO_AUDIO_FADE_TIMER_ID) };
+        let mut state = self.state.borrow_mut();
+        state.cancel_audio_fade();
+        state.detach_video_surface();
+        drop(state);
+        self.video_player.borrow_mut().take();
+    }
+
+    fn ensure_media_foundation(&self) -> Result<()> {
+        if self.media_foundation.borrow().is_some() {
+            return Ok(());
+        }
+        self.media_foundation
+            .borrow_mut()
+            .replace(MediaFoundationSession::start()?);
+        Ok(())
+    }
+
+    fn start_audio_fade_timer(&self) -> Result<()> {
+        // SAFETY: This live preview HWND owns the fixed private timer identifier.
+        if unsafe {
+            SetTimer(
+                Some(self.hwnd),
+                VIDEO_AUDIO_FADE_TIMER_ID,
+                VIDEO_AUDIO_FADE_INTERVAL_MS,
+                None,
+            )
+        } == 0
+        {
+            return Err(Error::from_thread());
+        }
+        Ok(())
     }
 
     fn show(
@@ -186,6 +363,21 @@ impl PreviewWindow {
         size: PreviewSize,
         content: Option<RetainedContent>,
     ) -> Result<PreviewPlacement> {
+        self.show_with_visibility(anchor, size, content, true)
+    }
+
+    fn show_with_visibility(
+        &self,
+        anchor: PhysicalScreenPoint,
+        size: PreviewSize,
+        content: Option<RetainedContent>,
+        visible: bool,
+    ) -> Result<PreviewPlacement> {
+        let visibility = if visible {
+            SWP_SHOWWINDOW
+        } else {
+            Default::default()
+        };
         // SAFETY: The hidden top-level HWND is owned by this UI thread. Moving the one-pixel setup
         // window first associates it with the anchor monitor without activating or showing it.
         unsafe {
@@ -266,7 +458,7 @@ impl PreviewWindow {
                 placement.y,
                 placement.width,
                 placement.height,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                SWP_NOACTIVATE | visibility,
             )?;
         }
 
@@ -304,6 +496,7 @@ impl PreviewWindow {
     }
 
     pub(crate) fn hide(&self) -> Result<()> {
+        self.stop_video();
         // SAFETY: The live HWND belongs to this UI thread. The flags hide it without changing
         // position, size, Z order, or activation.
         unsafe {
@@ -436,6 +629,200 @@ impl PreviewWindow {
     }
 }
 
+#[implement(IMFPMediaPlayerCallback)]
+struct VideoPlayerCallback;
+
+impl IMFPMediaPlayerCallback_Impl for VideoPlayerCallback_Impl {
+    fn OnMediaPlayerEvent(&self, event: *const MFP_EVENT_HEADER) {
+        if event.is_null() {
+            return;
+        }
+        // SAFETY: MFPlay invokes the callback with one synchronous event header that remains live
+        // for this method. The embedded player is borrowed and cloned before the callback returns.
+        let header = unsafe { &*event };
+        if header.hrEvent.is_err() || header.eEventType != MFP_EVENT_TYPE_PLAYBACK_ENDED {
+            return;
+        }
+        if let Some(player) = header.pMediaPlayer.as_ref() {
+            // Stop resets the current media item to its beginning. Replaying here creates the
+            // short hover loop without queuing work onto the no-activate UI window.
+            // SAFETY: The callback header holds a live MFPlay interface for this callback.
+            let _ = unsafe { player.Stop() };
+            // SAFETY: The same live interface remains valid after the synchronous stop call.
+            let _ = unsafe { player.Play() };
+        }
+    }
+}
+
+struct VideoPlayer {
+    player: IMFPMediaPlayer,
+    video_window: VideoChildWindow,
+    native_width: u32,
+    native_height: u32,
+    _file_lock: crate::video::PlaybackFileLock,
+}
+
+impl VideoPlayer {
+    fn create(hwnd: HWND, path: &[u16], file_lock: crate::video::PlaybackFileLock) -> Result<Self> {
+        let terminated = media_foundation_path(path)?;
+        let video_window = VideoChildWindow::create(hwnd)?;
+        let callback: IMFPMediaPlayerCallback = VideoPlayerCallback.into();
+        let mut player = None;
+        // SAFETY: The callback, dedicated live child HWND, and output storage remain valid for the
+        // synchronous call. MFPlay retains its own callback reference.
+        unsafe {
+            MFPCreateMediaPlayer(
+                PCWSTR::null(),
+                false,
+                MFP_OPTION_NONE,
+                &callback,
+                Some(video_window.hwnd),
+                Some(&mut player),
+            )?;
+        }
+        let player = player.ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
+        let mut owner = Self {
+            player,
+            video_window,
+            native_width: 0,
+            native_height: 0,
+            _file_lock: file_lock,
+        };
+        let mut item = None;
+        // SAFETY: The ordinary absolute path is terminated and stays live for synchronous item
+        // creation. The output receives one owned MFPlay media-item interface.
+        unsafe {
+            owner.player.CreateMediaItemFromURL(
+                PCWSTR(terminated.as_ptr()),
+                true,
+                0,
+                Some(&mut item),
+            )?;
+        }
+        let item = item.ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
+        // SAFETY: Synchronous media-item creation completed and the returned interface is live.
+        let stream_count = unsafe { item.GetNumberOfStreams()? };
+        let mut frame_size = None;
+        for stream in 0..stream_count {
+            // SAFETY: The synchronous media item owns `stream_count` streams and returns an owned
+            // PROPVARIANT. Non-video streams simply do not expose MF_MT_FRAME_SIZE.
+            let Ok(value) = (unsafe { item.GetStreamAttribute(stream, &MF_MT_FRAME_SIZE) }) else {
+                continue;
+            };
+            if let Ok(packed) = u64::try_from(&value) {
+                frame_size = Some(packed);
+                break;
+            }
+        }
+        let packed = frame_size.ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
+        owner.native_width =
+            u32::try_from(packed >> 32).map_err(|_| Error::from_hresult(E_INVALIDARG))?;
+        owner.native_height =
+            u32::try_from(packed & u64::from(u32::MAX)).expect("the low half fits u32");
+        if owner.native_width == 0 || owner.native_height == 0 {
+            return Err(Error::from_hresult(E_INVALIDARG));
+        }
+        // SAFETY: Both interfaces are live and owned through this synchronous setup sequence.
+        unsafe { owner.player.SetMediaItem(&item)? };
+        // Keep the audio path unmuted from the outset, but silent at zero volume. Toggling MFPlay
+        // mute after playback starts can open the audio endpoint abruptly and produce a click.
+        // SAFETY: MFPlay returned this live player interface on the current COM-initialized thread.
+        unsafe {
+            owner.player.SetVolume(0.0)?;
+            owner.player.SetMute(false)?;
+        }
+        // SAFETY: The media item, video child, and player remain live in `owner`.
+        unsafe { owner.player.Play()? };
+        Ok(owner)
+    }
+
+    const fn native_size(&self) -> (u32, u32) {
+        (self.native_width, self.native_height)
+    }
+}
+
+struct VideoChildWindow {
+    hwnd: HWND,
+}
+
+impl VideoChildWindow {
+    fn create(parent: HWND) -> Result<Self> {
+        // SAFETY: STATIC is a system class. The dedicated child has no borrowed creation data and
+        // remains owned by this RAII wrapper inside the live preview parent.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_NOACTIVATE,
+                w!("STATIC"),
+                w!(""),
+                WS_CHILD | WS_VISIBLE,
+                0,
+                0,
+                1,
+                1,
+                Some(parent),
+                None,
+                None,
+                None,
+            )?
+        };
+        Ok(Self { hwnd })
+    }
+}
+
+impl Drop for VideoChildWindow {
+    fn drop(&mut self) {
+        // SAFETY: This wrapper owns the dedicated child and destroys it once while its parent lives.
+        let _ = unsafe { DestroyWindow(self.hwnd) };
+    }
+}
+
+fn media_foundation_path(path: &[u16]) -> Result<Vec<u16>> {
+    if path.is_empty() || path.contains(&0) {
+        return Err(Error::from_hresult(E_INVALIDARG));
+    }
+    // GetFinalPathNameByHandleW deliberately gives the worker a canonical `\\?\C:\...` path.
+    // MFPlay accepts ordinary absolute DOS paths but rejects that extended-length spelling for
+    // some media sources, so remove only the verified drive-path prefix at this API boundary.
+    let extended_prefix = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    let path = path.strip_prefix(&extended_prefix).unwrap_or(path);
+    if path.len() < 3
+        || !u8::try_from(path[0]).is_ok_and(|unit| unit.is_ascii_alphabetic())
+        || path[1] != b':' as u16
+        || path[2] != b'\\' as u16
+    {
+        return Err(Error::from_hresult(E_INVALIDARG));
+    }
+    let mut terminated = Vec::with_capacity(path.len() + 1);
+    terminated.extend_from_slice(path);
+    terminated.push(0);
+    Ok(terminated)
+}
+
+struct MediaFoundationSession;
+
+impl MediaFoundationSession {
+    fn start() -> Result<Self> {
+        // SAFETY: Startup and shutdown are balanced by this thread-affine playback owner.
+        unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL)? };
+        Ok(Self)
+    }
+}
+
+impl Drop for MediaFoundationSession {
+    fn drop(&mut self) {
+        // SAFETY: This balances this owner's successful MFStartup after the player was shut down.
+        let _ = unsafe { MFShutdown() };
+    }
+}
+
+impl Drop for VideoPlayer {
+    fn drop(&mut self) {
+        // Shutdown synchronously stops rendering and audio before the hover window is hidden.
+        // SAFETY: This owner shuts down its live player once before Media Foundation shutdown.
+        let _ = unsafe { self.player.Shutdown() };
+    }
+}
+
 impl Drop for PreviewWindow {
     fn drop(&mut self) {
         let _ = self.hide();
@@ -496,9 +883,12 @@ struct PreviewWindowState {
     layouts: Option<ContentLayouts>,
     device: Option<DeviceResources>,
     image_bitmap: Option<ID2D1Bitmap>,
+    video_surface: Option<HWND>,
     pixel_size: D2D_SIZE_U,
     dpi: u32,
     last_paint_error: Option<HRESULT>,
+    audio_fade_player: Option<IMFPMediaPlayer>,
+    audio_fade_step: u8,
     #[cfg(test)]
     force_recreate_target: bool,
 }
@@ -527,9 +917,12 @@ impl PreviewWindowState {
             layouts: None,
             device: None,
             image_bitmap: None,
+            video_surface: None,
             pixel_size: D2D_SIZE_U::default(),
             dpi: 96,
             last_paint_error: None,
+            audio_fade_player: None,
+            audio_fade_step: 0,
             #[cfg(test)]
             force_recreate_target: false,
         })
@@ -543,8 +936,96 @@ impl PreviewWindowState {
         self.content = content;
         self.layouts = None;
         self.image_bitmap = None;
+        self.video_surface = None;
         self.last_paint_error = None;
         Ok(())
+    }
+
+    fn begin_audio_fade(&mut self, player: IMFPMediaPlayer) -> Result<()> {
+        // Playback already owns an open, unmuted audio path at zero volume. Only changing volume
+        // here avoids the endpoint transition that can produce a click on some audio drivers.
+        // SAFETY: The retained player belongs to the live video preview on this UI thread.
+        unsafe { player.SetVolume(0.0)? };
+        self.audio_fade_player = Some(player);
+        self.audio_fade_step = 0;
+        Ok(())
+    }
+
+    fn advance_audio_fade(&mut self) -> bool {
+        let Some(player) = self.audio_fade_player.as_ref() else {
+            return true;
+        };
+        self.audio_fade_step = self.audio_fade_step.saturating_add(1);
+        let volume = f32::from(self.audio_fade_step) / f32::from(VIDEO_AUDIO_FADE_STEPS);
+        // SAFETY: The retained player belongs to the live video preview on this UI thread.
+        if unsafe { player.SetVolume(volume.min(1.0)) }.is_err()
+            || self.audio_fade_step >= VIDEO_AUDIO_FADE_STEPS
+        {
+            self.cancel_audio_fade();
+            return true;
+        }
+        false
+    }
+
+    fn cancel_audio_fade(&mut self) {
+        self.audio_fade_player = None;
+        self.audio_fade_step = 0;
+    }
+
+    fn attach_video_surface(&mut self, surface: HWND) -> Result<()> {
+        if !matches!(self.content, Some(RetainedContent::Video(_))) {
+            return Err(Error::from_hresult(E_INVALIDARG));
+        }
+        self.video_surface = Some(surface);
+        if let Err(error) = self.position_video_surface() {
+            self.video_surface = None;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn detach_video_surface(&mut self) {
+        self.video_surface = None;
+    }
+
+    fn position_video_surface(&self) -> Result<()> {
+        let Some(surface) = self.video_surface else {
+            return Ok(());
+        };
+        if self.pixel_size.width == 0 || self.pixel_size.height == 0 {
+            return Ok(());
+        }
+        let Some(RetainedContent::Video(content)) = self.content.as_ref() else {
+            return Err(Error::from_hresult(E_INVALIDARG));
+        };
+        let destination = video_destination_pixel_rect(
+            content.native_width,
+            content.native_height,
+            self.pixel_size,
+            self.dpi,
+        )
+        .ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
+        let width = destination
+            .right
+            .checked_sub(destination.left)
+            .ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
+        let height = destination
+            .bottom
+            .checked_sub(destination.top)
+            .ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
+        // SAFETY: The retained child HWND is owned by the active video player and remains live
+        // while attached. The checked destination stays inside the current preview client area.
+        unsafe {
+            SetWindowPos(
+                surface,
+                None,
+                destination.left,
+                destination.top,
+                width,
+                height,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            )
+        }
     }
 
     fn content_client_pixel_size(&self, maximum: PreviewSize) -> Result<D2D_SIZE_U> {
@@ -564,6 +1045,13 @@ impl PreviewWindowState {
                 image_client_pixel_size(&content.preview, maximum, self.dpi)
                     .ok_or_else(Error::from_thread)
             }
+            RetainedContent::Video(content) => video_client_pixel_size(
+                content.native_width,
+                content.native_height,
+                maximum,
+                self.dpi,
+            )
+            .ok_or_else(Error::from_thread),
         }
     }
 
@@ -613,6 +1101,7 @@ impl PreviewWindowState {
         {
             self.layouts = Some(self.create_layouts()?);
         }
+        self.position_video_surface()?;
         Ok(())
     }
 
@@ -661,25 +1150,43 @@ impl PreviewWindowState {
                 })
             }
             RetainedContent::Image(content) => {
-                let layout_width = (width - IMAGE_MARGIN * 2.0).max(1.0);
-                let metadata_origin_y =
-                    (height - IMAGE_MARGIN - IMAGE_METADATA_HEIGHT).max(IMAGE_MARGIN);
-                // SAFETY: The bounded UTF-16 metadata remains alive in content for this
-                // synchronous call. The returned layout owns its DirectWrite state.
-                let metadata = unsafe {
-                    self.dwrite_factory.CreateTextLayout(
-                        &content.metadata,
-                        &self.formats.metadata,
-                        layout_width,
-                        IMAGE_METADATA_HEIGHT,
-                    )?
-                };
+                let (metadata, metadata_origin_y) =
+                    self.create_media_metadata_layout(&content.metadata, width, height)?;
                 Ok(ContentLayouts::Image {
                     metadata,
                     metadata_origin_y,
                 })
             }
+            RetainedContent::Video(content) => {
+                let (metadata, metadata_origin_y) =
+                    self.create_media_metadata_layout(&content.metadata, width, height)?;
+                Ok(ContentLayouts::Video {
+                    metadata,
+                    metadata_origin_y,
+                })
+            }
         }
+    }
+
+    fn create_media_metadata_layout(
+        &self,
+        metadata: &[u16],
+        width: f32,
+        height: f32,
+    ) -> Result<(IDWriteTextLayout, f32)> {
+        let layout_width = (width - IMAGE_MARGIN * 2.0).max(1.0);
+        let metadata_origin_y = (height - IMAGE_MARGIN - IMAGE_METADATA_HEIGHT).max(IMAGE_MARGIN);
+        // SAFETY: The bounded UTF-16 metadata and retained format remain live for this synchronous
+        // call. The returned layout owns its DirectWrite state.
+        let layout = unsafe {
+            self.dwrite_factory.CreateTextLayout(
+                metadata,
+                &self.formats.metadata,
+                layout_width,
+                IMAGE_METADATA_HEIGHT,
+            )?
+        };
+        Ok((layout, metadata_origin_y))
     }
 
     fn render_with_recovery(&mut self, hwnd: HWND) -> Result<()> {
@@ -760,6 +1267,10 @@ impl PreviewWindowState {
                         );
                     }
                     ContentLayouts::Image {
+                        metadata,
+                        metadata_origin_y,
+                    }
+                    | ContentLayouts::Video {
                         metadata,
                         metadata_origin_y,
                     } => {
@@ -865,6 +1376,7 @@ impl TextContent {
 enum RetainedContent {
     Text(TextContent),
     Image(ImageContent),
+    Video(VideoContent),
 }
 
 impl RetainedContent {
@@ -872,6 +1384,7 @@ impl RetainedContent {
         match self {
             Self::Text(_) => w!("CursorPeek text preview"),
             Self::Image(_) => w!("CursorPeek image preview"),
+            Self::Video(_) => w!("CursorPeek video preview"),
         }
     }
 }
@@ -890,6 +1403,24 @@ impl ImageContent {
     }
 }
 
+struct VideoContent {
+    metadata: Vec<u16>,
+    native_width: u32,
+    native_height: u32,
+}
+
+impl VideoContent {
+    fn from_preview(preview: &VideoPreview, native_width: u32, native_height: u32) -> Self {
+        Self {
+            metadata: video_preview_metadata(preview, native_width, native_height)
+                .encode_utf16()
+                .collect(),
+            native_width,
+            native_height,
+        }
+    }
+}
+
 enum ContentLayouts {
     Text {
         body: Option<IDWriteTextLayout>,
@@ -897,6 +1428,10 @@ enum ContentLayouts {
         metadata_origin_y: f32,
     },
     Image {
+        metadata: IDWriteTextLayout,
+        metadata_origin_y: f32,
+    },
+    Video {
         metadata: IDWriteTextLayout,
         metadata_origin_y: f32,
     },
@@ -1136,6 +1671,21 @@ fn image_preview_metadata(preview: &ImagePreview) -> String {
     format!("{}\n{details}\n{modified}", preview.display_name)
 }
 
+fn video_preview_metadata(preview: &VideoPreview, native_width: u32, native_height: u32) -> String {
+    let mut details = format!(
+        "{}    ({} \u{d7} {})",
+        format_file_size(preview.file_size),
+        native_width,
+        native_height,
+    );
+    if preview.linked_content {
+        details.push_str("  \u{b7}  linked");
+    }
+    let modified = format_last_write_time(preview.last_write_time)
+        .unwrap_or_else(|| "Modified time unavailable".to_owned());
+    format!("{}\n{details}\n{modified}", preview.display_name)
+}
+
 fn format_last_write_time(value: i64) -> Option<String> {
     let value = u64::try_from(value).ok()?;
     let file_time = FILETIME {
@@ -1301,7 +1851,27 @@ fn image_client_pixel_size(
     if dpi == 0 || checked_image_layout(preview).is_none() {
         return None;
     }
+    media_client_pixel_size(preview.width, preview.height, maximum, dpi)
+}
 
+fn video_client_pixel_size(
+    native_width: u32,
+    native_height: u32,
+    maximum: PreviewSize,
+    dpi: u32,
+) -> Option<D2D_SIZE_U> {
+    media_client_pixel_size(native_width, native_height, maximum, dpi)
+}
+
+fn media_client_pixel_size(
+    content_width: u32,
+    content_height: u32,
+    maximum: PreviewSize,
+    dpi: u32,
+) -> Option<D2D_SIZE_U> {
+    if dpi == 0 || content_width == 0 || content_height == 0 {
+        return None;
+    }
     let max_width = dips_to_pixels(maximum.width() as f32, dpi)?;
     let max_height = dips_to_pixels(maximum.height() as f32, dpi)?;
     let margin = dips_to_pixels(IMAGE_MARGIN, dpi)?;
@@ -1310,18 +1880,18 @@ fn image_client_pixel_size(
     let vertical_chrome = horizontal_chrome.checked_add(metadata_height)?;
     let available_width = max_width.checked_sub(horizontal_chrome)?;
     let available_height = max_height.checked_sub(vertical_chrome)?;
-    let (image_width, image_height) = fit_dimensions(
-        preview.width,
-        preview.height,
+    let (rendered_width, rendered_height) = fit_dimensions(
+        content_width,
+        content_height,
         available_width,
         available_height,
     )?;
     let minimum_width = dips_to_pixels(IMAGE_MINIMUM_WIDTH, dpi)?.min(available_width);
-    let content_width = image_width.max(minimum_width);
+    let client_content_width = rendered_width.max(minimum_width);
 
     Some(D2D_SIZE_U {
-        width: content_width.checked_add(horizontal_chrome)?,
-        height: image_height.checked_add(vertical_chrome)?,
+        width: client_content_width.checked_add(horizontal_chrome)?,
+        height: rendered_height.checked_add(vertical_chrome)?,
     })
 }
 
@@ -1382,6 +1952,39 @@ fn image_destination_rect(
         top,
         right: left + rendered_width,
         bottom: top + rendered_height,
+    })
+}
+
+fn video_destination_pixel_rect(
+    native_width: u32,
+    native_height: u32,
+    pixel_size: D2D_SIZE_U,
+    dpi: u32,
+) -> Option<RECT> {
+    if dpi == 0 || native_width == 0 || native_height == 0 {
+        return None;
+    }
+    let margin = dips_to_pixels(IMAGE_MARGIN, dpi)?;
+    let metadata_height = dips_to_pixels(IMAGE_METADATA_HEIGHT, dpi)?;
+    let horizontal_chrome = margin.checked_mul(2)?;
+    let vertical_chrome = horizontal_chrome.checked_add(metadata_height)?;
+    let available_width = pixel_size.width.checked_sub(horizontal_chrome)?;
+    let available_height = pixel_size.height.checked_sub(vertical_chrome)?;
+    let (rendered_width, rendered_height) = fit_dimensions(
+        native_width,
+        native_height,
+        available_width,
+        available_height,
+    )?;
+    let left = margin.checked_add(available_width.checked_sub(rendered_width)? / 2)?;
+    let top = margin;
+    let right = left.checked_add(rendered_width)?;
+    let bottom = top.checked_add(rendered_height)?;
+    Some(RECT {
+        left: i32::try_from(left).ok()?,
+        top: i32::try_from(top).ok()?,
+        right: i32::try_from(right).ok()?,
+        bottom: i32::try_from(bottom).ok()?,
     })
 }
 
@@ -1553,6 +2156,16 @@ fn dispatch_preview_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
         return LRESULT(1);
     }
 
+    if message == WM_TIMER && wparam.0 == VIDEO_AUDIO_FADE_TIMER_ID {
+        let finished =
+            preview_state(hwnd).is_none_or(|state| state.borrow_mut().advance_audio_fade());
+        if finished {
+            // SAFETY: Killing an absent timer is benign for this live preview HWND.
+            let _ = unsafe { KillTimer(Some(hwnd), VIDEO_AUDIO_FADE_TIMER_ID) };
+        }
+        return LRESULT(0);
+    }
+
     if message == WM_DPICHANGED {
         let result = (|| {
             let dpi = u32::from((wparam.0 & 0xffff) as u16);
@@ -1678,10 +2291,12 @@ fn preview_state(hwnd: HWND) -> Option<&'static RefCell<PreviewWindowState>> {
 mod tests {
     use super::{
         ContentLayouts, D2D_SIZE_U, MAX_Z_ORDER_SCAN, PreviewColors, PreviewWindow,
-        PreviewWindowState, RetainedContent, TextContent, adjusted_window_pixel_size,
-        checked_image_layout, checked_window_rect, client_pixel_size, color_from_colorref,
-        format_file_size, image_client_pixel_size, image_destination_rect, image_preview_metadata,
-        rectangles_overlap, system_dark_mode, system_message_font, text_preview_metadata,
+        PreviewWindowState, RetainedContent, TextContent, VideoChildWindow,
+        adjusted_window_pixel_size, checked_image_layout, checked_window_rect, client_pixel_size,
+        color_from_colorref, format_file_size, image_client_pixel_size, image_destination_rect,
+        image_preview_metadata, media_foundation_path, rectangles_overlap, system_dark_mode,
+        system_message_font, text_preview_metadata, video_client_pixel_size,
+        video_destination_pixel_rect, video_preview_metadata,
     };
     use crate::{
         hover::PhysicalScreenPoint,
@@ -1690,13 +2305,15 @@ mod tests {
         settings::Theme,
         worker::{ImageFormat, ImagePreview, TextPreview, image_corpus_previews},
     };
-    use std::thread;
+    use cursorpeek_core::payload::{VideoContainer, VideoPreview};
+    use std::{env, path::PathBuf, thread};
     use windows::Win32::{
         Foundation::{HWND, LPARAM, RECT, WPARAM},
         Graphics::DirectWrite::DWRITE_TEXT_METRICS,
         UI::WindowsAndMessaging::{
-            GW_HWNDPREV, GetForegroundWindow, GetWindow, GetWindowRect, IsWindow, SWP_NOACTIVATE,
-            SWP_NOMOVE, SWP_NOSIZE, SendMessageW, SetWindowPos, WM_DPICHANGED,
+            GW_HWNDPREV, GetForegroundWindow, GetWindow, GetWindowRect, GetWindowTextLengthW,
+            IsWindow, IsWindowVisible, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SendMessageW,
+            SetWindowPos, WM_DPICHANGED,
         },
     };
 
@@ -1746,6 +2363,22 @@ mod tests {
         }
     }
 
+    fn video_preview() -> VideoPreview {
+        VideoPreview {
+            file_size: 7_340_032,
+            last_write_time: 133_000_000_000_000_000,
+            volume_serial_number: 0x0123_4567_89ab_cdef,
+            file_id: [
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff,
+            ],
+            container: VideoContainer::IsoBaseMedia,
+            linked_content: true,
+            display_name: "sample.mp4".to_owned(),
+            path: r"\\?\C:\Videos\sample.mp4".encode_utf16().collect(),
+        }
+    }
+
     #[test]
     fn preview_window_lifecycle_and_mouse_activation_policy_are_sound() {
         thread::spawn(|| {
@@ -1766,6 +2399,20 @@ mod tests {
         })
         .join()
         .expect("the preview-window test thread should not panic");
+    }
+
+    #[test]
+    fn video_surface_starts_without_a_visible_caption() {
+        thread::spawn(|| {
+            let preview = PreviewWindow::create().expect("the preview window should be created");
+            let surface = VideoChildWindow::create(preview.handle())
+                .expect("the video surface should be created");
+
+            // SAFETY: surface.hwnd belongs to the live child window on this test thread.
+            assert_eq!(unsafe { GetWindowTextLengthW(surface.hwnd) }, 0);
+        })
+        .join()
+        .expect("the video-surface test thread should not panic");
     }
 
     #[test]
@@ -2273,6 +2920,43 @@ mod tests {
     }
 
     #[test]
+    fn video_metadata_and_surface_follow_the_image_footer_contract() {
+        let preview = video_preview();
+        let metadata = video_preview_metadata(&preview, 1_920, 1_080);
+        let lines: Vec<_> = metadata.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "sample.mp4");
+        assert_eq!(lines[1], "7.0 MiB    (1920 × 1080)  ·  linked");
+        assert!(!lines[2].is_empty());
+
+        let maximum = PreviewSize::new(640, 480);
+        assert_eq!(
+            video_client_pixel_size(1_920, 1_080, maximum, 96),
+            Some(D2D_SIZE_U {
+                width: 640,
+                height: 420,
+            })
+        );
+        assert_eq!(
+            video_destination_pixel_rect(
+                1_920,
+                1_080,
+                D2D_SIZE_U {
+                    width: 640,
+                    height: 420,
+                },
+                96,
+            ),
+            Some(RECT {
+                left: 4,
+                top: 4,
+                right: 636,
+                bottom: 360,
+            })
+        );
+    }
+
+    #[test]
     fn image_window_uses_natural_pixels_until_the_selected_maximum() {
         let preview = |width: u32, height: u32| ImagePreview {
             file_size: 1,
@@ -2378,5 +3062,76 @@ mod tests {
         assert!((color.g - 0x22 as f32 / 255.0).abs() < f32::EPSILON);
         assert!((color.b - 0x33 as f32 / 255.0).abs() < f32::EPSILON);
         assert_eq!(color.a, 1.0);
+    }
+
+    #[test]
+    #[ignore = "requires CURSORPEEK_TEST_VIDEO pointing to a local playable supported video"]
+    fn native_video_player_shows_immediately_and_stops_with_the_preview() {
+        let path = PathBuf::from(
+            env::var_os("CURSORPEEK_TEST_VIDEO")
+                .expect("CURSORPEEK_TEST_VIDEO must point to a local playable supported video"),
+        );
+        let _apartment = ComApartment::initialize(ApartmentKind::SingleThreaded)
+            .expect("the test thread should initialize COM");
+        let window = PreviewWindow::create().expect("the preview window should be created");
+        let preview = crate::video::preview_path(&path)
+            .expect("the worker should validate the local video fixture");
+        window
+            .show_video_at(
+                PhysicalScreenPoint::new(100, 100),
+                PreviewSize::new(480, 360),
+                preview.clone(),
+                false,
+            )
+            .expect("MFPlay should accept and start the local video");
+        // SAFETY: Native playback reveals the live preview before returning.
+        assert!(unsafe { IsWindowVisible(window.handle()).as_bool() });
+        let video_surface = window
+            .video_player
+            .borrow()
+            .as_ref()
+            .expect("the player should be retained while visible")
+            .video_window
+            .hwnd;
+        window.hide().expect("hiding should stop native playback");
+        // SAFETY: The captured HWND belonged to the video child and should now be stale.
+        assert!(!unsafe { IsWindow(Some(video_surface)).as_bool() });
+        window
+            .show_image_at(
+                PhysicalScreenPoint::new(100, 100),
+                PreviewSize::new(480, 360),
+                image_preview(),
+            )
+            .expect("an image should render after the video surface is destroyed");
+        window.hide().expect("the image preview should hide");
+        window
+            .show_video_at(
+                PhysicalScreenPoint::new(100, 100),
+                PreviewSize::new(480, 360),
+                preview,
+                false,
+            )
+            .expect("the same video should start again");
+        // SAFETY: Native playback reveals the live preview before returning.
+        assert!(unsafe { IsWindowVisible(window.handle()).as_bool() });
+        window.hide().expect("the repeated preview should hide");
+    }
+
+    #[test]
+    fn media_foundation_receives_an_ordinary_absolute_dos_path() {
+        let converted = media_foundation_path(
+            &r"\\?\C:\Video\sample.mp4"
+                .encode_utf16()
+                .collect::<Vec<_>>(),
+        )
+        .expect("the worker's canonical drive path should convert");
+        assert_eq!(
+            String::from_utf16(&converted).unwrap(),
+            "C:\\Video\\sample.mp4\0"
+        );
+        assert!(
+            media_foundation_path(&r"\\server\share\a.mp4".encode_utf16().collect::<Vec<_>>())
+                .is_err()
+        );
     }
 }

@@ -1,5 +1,4 @@
 mod cache;
-mod file;
 mod image;
 mod manager;
 mod text;
@@ -20,14 +19,15 @@ use std::{
 
 use crate::{
     diagnostics,
+    preview_file::PreviewFile,
     resolver::{PointResolver, ResolveOutcome},
     settings::LegacyEncoding,
+    video,
 };
 use cache::{PreviewCache, PreviewCacheKey, PreviewProvider};
 #[cfg(test)]
 use cursorpeek_core::PhysicalScreenPoint;
 use cursorpeek_core::{PhysicalScreenRect, PhysicalScreenSpan};
-use file::PreviewFile;
 use image::ImageDecodeResult;
 use protocol::{ProtocolStreamError, WorkerMessage};
 use text::TextDecodeResult;
@@ -190,8 +190,11 @@ fn resolver_result_with_cache(
                 }
             };
             (
-                matches!(result, PreviewResult::Text(_) | PreviewResult::Image(_))
-                    .then_some(target_bounds),
+                matches!(
+                    result,
+                    PreviewResult::Text(_) | PreviewResult::Image(_) | PreviewResult::Video(_)
+                )
+                .then_some(target_bounds),
                 result,
             )
         }
@@ -242,6 +245,10 @@ fn preview_file_result(
                 preview.display_name = file.display_name();
                 preview.last_write_time = file.last_write_time();
             }
+            PreviewResult::Video(preview) => {
+                preview.display_name = file.display_name();
+                preview.last_write_time = file.last_write_time();
+            }
             PreviewResult::Status(_) => {}
         }
         return match file.is_unchanged() {
@@ -278,6 +285,10 @@ fn preview_file_result(
             Err(error) if error.is_unsupported() => {
                 PreviewResult::Status(ResolverStatus::Unsupported)
             }
+            Err(_) => PreviewResult::Status(ResolverStatus::Unavailable),
+        },
+        PreviewProvider::Video => match video::preview(file) {
+            Ok(preview) => PreviewResult::Video(preview),
             Err(_) => PreviewResult::Status(ResolverStatus::Unavailable),
         },
     };
@@ -321,6 +332,7 @@ fn preview_result_kind(result: &PreviewResult) -> &'static str {
         },
         PreviewResult::Text(_) => "text",
         PreviewResult::Image(_) => "image",
+        PreviewResult::Video(_) => "video",
     }
 }
 
@@ -374,6 +386,17 @@ fn record_preview_result(
                 preview.first_frame_only,
                 preview.linked_content,
                 target_bounds.is_some()
+            ),
+        ),
+        PreviewResult::Video(preview) => diagnostics::record(
+            event,
+            format_args!(
+                "generation={} outcome=video target={} container={:?} file_size={} elapsed_us={}",
+                generation.get(),
+                target_bounds.is_some(),
+                preview.container,
+                preview.file_size,
+                diagnostics::elapsed_us(started).unwrap_or(0)
             ),
         ),
     }
@@ -437,13 +460,16 @@ impl From<ProtocolStreamError> for WorkerSessionError {
 #[cfg(test)]
 mod tests {
     use super::{
-        WorkerSessionError, cache::PreviewCache, file::PreviewFile, protocol, resolver_result,
+        WorkerSessionError, cache::PreviewCache, protocol, resolver_result,
         resolver_result_with_cache, run_session,
     };
-    use crate::hover::{Generation, PhysicalScreenPoint};
-    use crate::resolver::{PointResolver, ResolveOutcome, ResolvedTarget};
-    use crate::settings::LegacyEncoding;
-    use crate::worker::payload::{PreviewResult, ResolverStatus};
+    use crate::{
+        hover::{Generation, PhysicalScreenPoint},
+        preview_file::PreviewFile,
+        resolver::{PointResolver, ResolveOutcome, ResolvedTarget},
+        settings::LegacyEncoding,
+        worker::payload::{PreviewResult, ResolverStatus},
+    };
     use ::image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
     use cursorpeek_core::{ExplorerWindowId, PhysicalScreenRect, PhysicalScreenSpan};
     use protocol::{SessionNonce, WorkerMessage};

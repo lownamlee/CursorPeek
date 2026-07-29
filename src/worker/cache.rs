@@ -1,14 +1,13 @@
 use std::{collections::VecDeque, mem::size_of, path::Path};
 
-use crate::settings::LegacyEncoding;
+use crate::{
+    preview_file::{PreviewFile, PreviewFileIdentity},
+    settings::LegacyEncoding,
+    video,
+};
 use cursorpeek_core::protocol::DEFAULT_PREVIEW_CACHE_ENTRIES;
 
-use super::{
-    file::{PreviewFile, PreviewFileIdentity},
-    image,
-    payload::PreviewResult,
-    text,
-};
+use super::{image, payload::PreviewResult, text};
 
 // The cache exists only for one contained worker session. The count cap follows QTTabBar's proven
 // browsing working set, while the independent byte cap prevents 128 maximum-size decoded images
@@ -18,11 +17,13 @@ const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 // relevant value if a future long-lived worker can switch implementation rules in-process.
 const TEXT_PROVIDER_VERSION: u32 = 2;
 const IMAGE_PROVIDER_VERSION: u32 = 2;
+const VIDEO_PROVIDER_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PreviewProvider {
     Text,
     Image,
+    Video,
 }
 
 impl PreviewProvider {
@@ -31,6 +32,8 @@ impl PreviewProvider {
             Some(Self::Text)
         } else if image::is_eligible_path(path) {
             Some(Self::Image)
+        } else if video::is_eligible_path(path) {
+            Some(Self::Video)
         } else {
             None
         }
@@ -45,6 +48,9 @@ impl PreviewProvider {
             Self::Image => PreviewProviderKey::Image {
                 version: IMAGE_PROVIDER_VERSION,
             },
+            Self::Video => PreviewProviderKey::Video {
+                version: VIDEO_PROVIDER_VERSION,
+            },
         }
     }
 }
@@ -58,6 +64,9 @@ enum PreviewProviderKey {
     Image {
         version: u32,
     },
+    Video {
+        version: u32,
+    },
 }
 
 impl PreviewProviderKey {
@@ -67,7 +76,7 @@ impl PreviewProviderKey {
                 legacy_encoding: LegacyEncoding::Label(label),
                 ..
             } => label.capacity(),
-            Self::Text { .. } | Self::Image { .. } => 0,
+            Self::Text { .. } | Self::Image { .. } | Self::Video { .. } => 0,
         }
     }
 }
@@ -122,6 +131,10 @@ fn result_heap_bytes(result: &PreviewResult) -> Option<usize> {
             .display_name
             .capacity()
             .checked_add(preview.premultiplied_bgra.capacity()),
+        PreviewResult::Video(preview) => preview
+            .display_name
+            .capacity()
+            .checked_add(preview.path.capacity().checked_mul(size_of::<u16>())?),
     }
 }
 
@@ -231,11 +244,9 @@ mod tests {
         PreviewProviderKey, TEXT_PROVIDER_VERSION,
     };
     use crate::{
+        preview_file::PreviewFile,
         settings::LegacyEncoding,
-        worker::{
-            file::PreviewFile,
-            payload::{PreviewResult, ResolverStatus, TextPreview},
-        },
+        worker::payload::{PreviewResult, ResolverStatus, TextPreview},
     };
     use cursorpeek_core::protocol::DEFAULT_PREVIEW_CACHE_ENTRIES;
     use std::{

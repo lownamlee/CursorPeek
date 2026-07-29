@@ -14,7 +14,7 @@ use crate::{
 };
 
 const MAGIC: [u8; 4] = *b"CPWK";
-const VERSION: u16 = 9;
+const VERSION: u16 = 10;
 const HEADER_LEN: usize = 24;
 const NONCE_LEN: usize = 16;
 const CACHE_ENTRIES_LEN: usize = 2;
@@ -625,9 +625,9 @@ fn validate_target_bounds(
     result: &PreviewResult,
 ) -> Result<(), ProtocolError> {
     match (target_bounds, result) {
-        (Some(_), PreviewResult::Text(_) | PreviewResult::Image(_))
+        (Some(_), PreviewResult::Text(_) | PreviewResult::Image(_) | PreviewResult::Video(_))
         | (None, PreviewResult::Status(_)) => Ok(()),
-        (None, PreviewResult::Text(_) | PreviewResult::Image(_)) => {
+        (None, PreviewResult::Text(_) | PreviewResult::Image(_) | PreviewResult::Video(_)) => {
             Err(ProtocolError::MissingTargetBounds)
         }
         (Some(_), PreviewResult::Status(_)) => Err(ProtocolError::UnexpectedTargetBounds),

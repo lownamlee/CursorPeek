@@ -24,7 +24,7 @@ use windows::{
             FILE_ATTRIBUTE_RECALL_ON_OPEN, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO,
             FILE_FLAG_OPEN_NO_RECALL, FILE_FLAG_SEQUENTIAL_SCAN, FILE_ID_INFO,
             FILE_NAME_NORMALIZED, FILE_NAME_OPENED, FILE_REMOTE_PROTOCOL_INFO, FILE_SHARE_DELETE,
-            FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_TYPE_DISK,
+            FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_TYPE_DISK,
             FileAttributeTagInfo, FileBasicInfo, FileIdInfo, FileRemoteProtocolInfo,
             FileStandardInfo, GetFileInformationByHandleEx, GetFileType, GetFinalPathNameByHandleW,
             OPEN_EXISTING,
@@ -33,7 +33,7 @@ use windows::{
     core::{Error as WindowsError, HRESULT, PCWSTR},
 };
 
-use super::payload::is_unsafe_display_name_scalar;
+use cursorpeek_core::payload::is_unsafe_display_name_scalar;
 
 const MAX_PATH_UNITS: usize = 32_768;
 const INITIAL_FINAL_PATH_UNITS: usize = 260;
@@ -72,18 +72,29 @@ pub(super) struct PreviewFile {
 
 impl PreviewFile {
     pub(super) fn open(path: &Path) -> Result<Self, PreviewFileError> {
+        Self::open_with_share_mode(path, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+    }
+
+    pub(super) fn open_locked_for_playback(path: &Path) -> Result<Self, PreviewFileError> {
+        Self::open_with_share_mode(path, FILE_SHARE_READ)
+    }
+
+    fn open_with_share_mode(
+        path: &Path,
+        share_mode: FILE_SHARE_MODE,
+    ) -> Result<Self, PreviewFileError> {
         let path_units = null_terminated_path(path)?;
         if !is_local_drive_path(&path_units[..path_units.len() - 1]) {
             return Err(PreviewFileError::UnsupportedInputPath);
         }
         // SAFETY: `path_units` is a live null-terminated UTF-16 path. The call opens only an
         // existing object, receives no inheritable security attributes or template handle, and
-        // explicitly permits ordinary rename/replace activity while this read handle is live.
+        // applies the caller's explicit sharing policy for normal decode or locked playback.
         let raw_handle = unsafe {
             CreateFileW(
                 PCWSTR(path_units.as_ptr()),
                 GENERIC_READ.0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                share_mode,
                 None,
                 OPEN_EXISTING,
                 FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_NO_RECALL,
@@ -129,6 +140,14 @@ impl PreviewFile {
 
     pub(super) const fn last_write_time(&self) -> i64 {
         self.snapshot.last_write_time
+    }
+
+    pub(super) const fn volume_serial_number(&self) -> u64 {
+        self.snapshot.identity.volume_serial_number
+    }
+
+    pub(super) const fn file_id(&self) -> [u8; 16] {
+        self.snapshot.identity.file_id
     }
 
     pub(super) fn display_name(&self) -> String {
@@ -491,7 +510,7 @@ fn structure_size<T>() -> u32 {
 }
 
 #[derive(Debug)]
-pub(super) enum PreviewFileError {
+pub(crate) enum PreviewFileError {
     Windows {
         operation: &'static str,
         source: WindowsError,

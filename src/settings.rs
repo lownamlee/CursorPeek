@@ -98,6 +98,8 @@ pub(crate) struct AppSettings {
     theme: Theme,
     legacy_encoding: LegacyEncoding,
     start_with_windows: bool,
+    video_previews: bool,
+    video_audio: bool,
 }
 
 impl Default for AppSettings {
@@ -110,6 +112,8 @@ impl Default for AppSettings {
             theme: Theme::System,
             legacy_encoding: LegacyEncoding::Auto,
             start_with_windows: false,
+            video_previews: true,
+            video_audio: false,
         }
     }
 }
@@ -145,6 +149,14 @@ impl AppSettings {
 
     pub(crate) const fn start_with_windows(&self) -> bool {
         self.start_with_windows
+    }
+
+    pub(crate) const fn video_previews(&self) -> bool {
+        self.video_previews
+    }
+
+    pub(crate) const fn video_audio(&self) -> bool {
+        self.video_audio
     }
 
     fn validate(&self) -> Result<(), SettingsParseError> {
@@ -211,6 +223,14 @@ impl SettingsDocument {
 
     pub(crate) fn set_start_with_windows(&mut self, start_with_windows: bool) {
         self.settings.start_with_windows = start_with_windows;
+    }
+
+    pub(crate) fn set_video_previews(&mut self, enabled: bool) {
+        self.settings.video_previews = enabled;
+    }
+
+    pub(crate) fn set_video_audio(&mut self, enabled: bool) {
+        self.settings.video_audio = enabled;
     }
 
     pub(crate) fn set_theme(&mut self, theme: Theme) {
@@ -297,16 +317,21 @@ impl SettingsDocument {
                         })?;
                 }
                 "start_with_windows" => {
-                    document.settings.start_with_windows = match value {
-                        "true" => true,
-                        "false" => false,
-                        _ => {
-                            return Err(SettingsParseError::new(
-                                line_number,
-                                INVALID_START_WITH_WINDOWS,
-                            ));
-                        }
-                    };
+                    document.settings.start_with_windows =
+                        parse_boolean(value, line_number, INVALID_START_WITH_WINDOWS)?;
+                }
+                "video_previews" => {
+                    document.settings.video_previews =
+                        parse_boolean(value, line_number, INVALID_VIDEO_PREVIEWS)?;
+                }
+                "video_audio" => {
+                    document.settings.video_audio =
+                        parse_boolean(value, line_number, INVALID_VIDEO_AUDIO)?;
+                }
+                "video_smooth_start" => {
+                    // Versions that exposed the fixed preroll wrote this key. Validate and
+                    // intentionally discard it so the next save removes the obsolete delay.
+                    let _ = parse_boolean(value, line_number, INVALID_VIDEO_SMOOTH_START)?;
                 }
                 _ => {
                     if document.unknown.len() == MAX_UNKNOWN_SETTINGS {
@@ -366,7 +391,10 @@ impl SettingsDocument {
             self.settings.start_with_windows
         )
         .expect("writing to a String cannot fail");
-
+        writeln!(output, "video_previews={}", self.settings.video_previews)
+            .expect("writing to a String cannot fail");
+        writeln!(output, "video_audio={}", self.settings.video_audio)
+            .expect("writing to a String cannot fail");
         if !self.unknown.is_empty() {
             output.push_str("\n# Preserved settings not understood by this version\n");
             for setting in &self.unknown {
@@ -390,6 +418,9 @@ const KNOWN_KEYS: &[&str] = &[
     "theme",
     "legacy_encoding",
     "start_with_windows",
+    "video_previews",
+    "video_audio",
+    "video_smooth_start",
 ];
 
 const LINE_TOO_LONG: &str = "line exceeds 1024 bytes";
@@ -405,6 +436,22 @@ const INVALID_THEME: &str = "invalid `theme` value: expected `system`, `light`, 
 const INVALID_LEGACY_ENCODING: &str = "invalid `legacy_encoding` value: expected `auto`, `system`, `off`, or a supported legacy encoding label";
 const INVALID_START_WITH_WINDOWS: &str =
     "invalid `start_with_windows` value: expected `true` or `false`";
+const INVALID_VIDEO_PREVIEWS: &str = "invalid `video_previews` value: expected `true` or `false`";
+const INVALID_VIDEO_AUDIO: &str = "invalid `video_audio` value: expected `true` or `false`";
+const INVALID_VIDEO_SMOOTH_START: &str =
+    "invalid `video_smooth_start` value: expected `true` or `false`";
+
+fn parse_boolean(
+    value: &str,
+    line_number: usize,
+    message: &'static str,
+) -> Result<bool, SettingsParseError> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(SettingsParseError::new(line_number, message)),
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SettingsFile {
@@ -921,7 +968,9 @@ mod tests {
              cache_entries=128\n\
              theme=system\n\
              legacy_encoding=auto\n\
-             start_with_windows=false\n"
+             start_with_windows=false\n\
+             video_previews=true\n\
+             video_audio=false\n"
         );
         assert_eq!(
             SettingsDocument::parse(text).expect("canonical defaults should parse"),
@@ -939,7 +988,10 @@ mod tests {
              cache_entries=512\n\
              theme=dark\n\
                      legacy_encoding=Windows-1252\n\
-                     start_with_windows=true\n\
+	                     start_with_windows=true\n\
+	                     video_previews=false\n\
+	                     video_audio=true\n\
+	                     video_smooth_start=false\n\
                      future.setting = 保留\n";
         let document = SettingsDocument::parse(input).expect("valid settings should parse");
 
@@ -953,10 +1005,13 @@ mod tests {
             LegacyEncoding::Label("windows-1252".to_owned())
         );
         assert!(document.settings.start_with_windows);
+        assert!(!document.settings.video_previews);
+        assert!(document.settings.video_audio);
 
         let encoded = document.encode().expect("valid settings should encode");
         let encoded = std::str::from_utf8(&encoded).expect("settings are UTF-8");
         assert!(encoded.contains("legacy_encoding=windows-1252\n"));
+        assert!(!encoded.contains("video_smooth_start"));
         assert!(encoded.contains("future.setting=保留\n"));
         assert_eq!(
             SettingsDocument::parse(encoded).expect("saved settings should parse"),
@@ -983,6 +1038,8 @@ mod tests {
             .expect("the tray size preset should be valid");
         document.set_start_with_windows(true);
         document.set_theme(Theme::Dark);
+        document.set_video_previews(false);
+        document.set_video_audio(true);
         assert_eq!(document.settings().dwell_delay_ms(), 700);
         assert_eq!(
             (
@@ -993,6 +1050,8 @@ mod tests {
         );
         assert!(document.settings().start_with_windows());
         assert_eq!(document.settings().theme(), Theme::Dark);
+        assert!(!document.settings().video_previews());
+        assert!(document.settings().video_audio());
         assert!(
             std::str::from_utf8(&document.encode().unwrap())
                 .unwrap()
@@ -1020,6 +1079,9 @@ mod tests {
             ("legacy_encoding=x-user-defined\n", "supported legacy"),
             ("legacy_encoding=not-a-codepage\n", "supported legacy"),
             ("start_with_windows=1\n", "true"),
+            ("video_previews=1\n", "true"),
+            ("video_audio=yes\n", "true"),
+            ("video_smooth_start=fast\n", "true"),
             ("theme=dark\ntheme=light\n", "duplicate"),
             ("missing separator\n", "key=value"),
             ("9invalid=value\n", "invalid key"),

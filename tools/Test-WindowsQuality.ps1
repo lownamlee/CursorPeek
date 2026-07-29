@@ -129,9 +129,12 @@ $approvedSystemImports = @(
     'D2D1.DLL'
     'DWRITE.DLL'
     'KERNEL32.DLL'
+    'MFPLAT.DLL'
+    'MFPLAY.DLL'
     'NTDLL.DLL'
     'OLE32.DLL'
     'OLEAUT32.DLL'
+    'PROPSYS.DLL'
     'SHELL32.DLL'
     'USER32.DLL'
 )
