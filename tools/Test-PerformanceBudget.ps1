@@ -16,7 +16,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$maximumExecutableBytes = 2 * 1024 * 1024
+$maximumExecutableBytes = 4 * 1024 * 1024
 $maximumStartupP95Microseconds = 750000L
 $maximumWorkerP95Milliseconds = 1500L
 $maximumIdleUiTaskMicroseconds = 16000L

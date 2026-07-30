@@ -204,6 +204,25 @@ Write-Seed layout extremes (
 )
 Write-Seed layout truncated ([byte[]] @(0x80, 0x07, 0))
 
+Write-Seed svg static-shapes (
+    [System.Text.Encoding]::UTF8.GetBytes(
+        "<svg viewBox='0 0 16 16'><rect width='16' height='16' fill='#3178c6'/></svg>"
+    )
+)
+Write-Seed svg animated-transform (
+    [System.Text.Encoding]::UTF8.GetBytes(
+        "<svg viewBox='0 0 40 10'><rect width='10' height='10'>" +
+        "<animateTransform attributeName='transform' type='translate' from='0 0' to='30 0' " +
+        "dur='1s' repeatCount='indefinite'/></rect></svg>"
+    )
+)
+Write-Seed svg active-content (
+    [System.Text.Encoding]::UTF8.GetBytes(
+        "<svg><script>fetch('https://example.invalid')</script></svg>"
+    )
+)
+Write-Seed svg malformed ([System.Text.Encoding]::UTF8.GetBytes("<svg><path d='M 0"))
+
 $files = Get-ChildItem -LiteralPath $corpusRoot -File -Recurse | Sort-Object FullName
 foreach ($file in $files) {
     $relative = $file.FullName.Substring($corpusRoot.Length).TrimStart(

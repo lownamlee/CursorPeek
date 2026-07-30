@@ -62,24 +62,29 @@ preview.
 
 ### Malformed content and resource exhaustion
 
-Only an explicit image, video, or text extension or special filename is eligible. Image magic
-remains authoritative. Video also requires a matching bounded ISO Base Media `ftyp`, RIFF/AVI, or
-ASF Header Object signature. Product caps bound file size, read prefixes, dimensions, pixel count,
-decoded bytes, animation frames and duration, text bytes, scalar count, lines, protocol frames,
-cache entries, and cache bytes. Checked arithmetic precedes allocation and layout.
+Only an explicit raster image, SVG, video, or text extension or special filename is eligible.
+Raster image magic remains authoritative. Video also requires a matching bounded ISO Base Media
+`ftyp`, RIFF/AVI, or ASF Header Object signature. Product caps bound file size, read prefixes,
+dimensions, pixel count, decoded bytes, SVG source and render complexity, animation frames and
+duration, text bytes, scalar count, lines, protocol frames, cache entries, and cache bytes. Checked
+arithmetic precedes allocation and layout.
 
-Image/text parsing and decoding occur in workers. The first image result remains the latency path.
-For an eligible GIF or animated WebP, a separate optional worker reopens the bounded local path and
-requires the same normalized path, volume serial, file ID, size, last-write time, format, and
-dimensions before decoding a complete bounded animation. Its result is accepted only for the
-still-current generation and Explorer target, so slow animation work cannot block the first frame
-or the next normal hover. Video container structure, locality, identity, and resource eligibility
-are checked in a worker. Immediately before native Windows Media Foundation playback, the UI
-process repeats those checks and compares the container family and exact file identity with the
-worker result. It retains a no-write/no-delete handle while the path-only media API is active,
+Raster, SVG, and text parsing and decoding occur in workers. The first visual result remains the
+latency path. SVG uses a static Rust renderer with external resource resolution and system-font
+features disabled; malformed SVG never falls through to a markup-text preview. For an eligible
+GIF, animated WebP, or supported declarative SVG animation, a separate optional worker reopens the
+bounded local path and requires the same normalized path, volume serial, file ID, size,
+last-write time, format, and dimensions before decoding a complete bounded animation. Its result
+is accepted only for the still-current generation and Explorer target, so slow animation work
+cannot block the first frame or the next normal hover. The SVG animation path has no script engine,
+network access, filesystem resource resolver, or wall-clock input and rejects active content,
+entities, and external references. Video container structure, locality, identity, and resource
+eligibility are checked in a worker. Immediately before native Windows Media Foundation playback,
+the UI process repeats those checks and compares the container family and exact file identity with
+the worker result. It retains a no-write/no-delete handle while the path-only media API is active,
 preventing replacement of the validated file. One request runs at a time and only the newest
-pending request is retained per worker. A private Job limits each worker to one process and 384 MiB,
-kills it when the Job closes, and supports forced timeout recovery. Workers retire after idle
+pending request is retained per worker. A private Job limits each worker to one process and 384
+MiB, kills it when the Job closes, and supports forced timeout recovery. Workers retire after idle
 expiry.
 
 ### Worker spoofing, stale data, and handle inheritance

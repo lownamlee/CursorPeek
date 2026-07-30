@@ -18,6 +18,7 @@ cargo fuzz run protocol -- -max_len=4194328 -timeout=5 -rss_limit_mb=768
 cargo fuzz run payload -- -max_len=4194304 -timeout=5 -rss_limit_mb=768
 cargo fuzz run content_sniff -- -max_len=65537 -timeout=5 -rss_limit_mb=768
 cargo fuzz run layout -- -max_len=16 -timeout=5 -rss_limit_mb=768
+cargo fuzz run svg -- -max_len=65536 -timeout=5 -rss_limit_mb=768
 ```
 
 The directories under `corpus` are versioned regression seeds. Generated crashes live under

@@ -10,7 +10,7 @@ param(
 
     [Parameter()]
     [ValidateRange(1, [long]::MaxValue)]
-    [long] $MaximumBytes = 3MB
+    [long] $MaximumBytes = 4MB
 )
 
 Set-StrictMode -Version Latest

@@ -75,6 +75,7 @@ pub enum ImageFormat {
     Bmp = 4,
     Ico = 5,
     Tiff = 6,
+    Svg = 7,
 }
 
 impl ImageFormat {
@@ -87,6 +88,7 @@ impl ImageFormat {
             4 => Ok(Self::Bmp),
             5 => Ok(Self::Ico),
             6 => Ok(Self::Tiff),
+            7 => Ok(Self::Svg),
             _ => Err(PayloadError::UnknownImageFormat(value)),
         }
     }
@@ -728,7 +730,10 @@ fn validate_image(preview: &ImagePreview) -> Result<(), PayloadError> {
     if let Some(source) = &preview.animation_source {
         validate_image_animation_source(source)?;
         if !preview.first_frame_only
-            || !matches!(preview.format, ImageFormat::Gif | ImageFormat::WebP)
+            || !matches!(
+                preview.format,
+                ImageFormat::Gif | ImageFormat::WebP | ImageFormat::Svg
+            )
             || source.file_size != preview.file_size
             || source.last_write_time != preview.last_write_time
             || source.format != preview.format
@@ -836,8 +841,10 @@ pub fn decode_image_animation_source(bytes: &[u8]) -> Result<ImageAnimationSourc
 }
 
 pub fn validate_image_animation_source(source: &ImageAnimationSource) -> Result<(), PayloadError> {
-    if !matches!(source.format, ImageFormat::Gif | ImageFormat::WebP)
-        || source.path.is_empty()
+    if !matches!(
+        source.format,
+        ImageFormat::Gif | ImageFormat::WebP | ImageFormat::Svg
+    ) || source.path.is_empty()
         || source.path.len() > MAX_LOCAL_PATH_UNITS
         || source.path.contains(&0)
         || String::from_utf16(&source.path).is_err()
@@ -852,7 +859,10 @@ fn image_animation_source_wire_len(source: &ImageAnimationSource) -> usize {
 }
 
 fn validate_image_animation(preview: &ImageAnimationPreview) -> Result<usize, PayloadError> {
-    if !matches!(preview.format, ImageFormat::Gif | ImageFormat::WebP) {
+    if !matches!(
+        preview.format,
+        ImageFormat::Gif | ImageFormat::WebP | ImageFormat::Svg
+    ) {
         return Err(PayloadError::InvalidAnimationFormat(preview.format as u32));
     }
     validate_source_dimensions(preview.source_width, preview.source_height)?;
@@ -1450,6 +1460,7 @@ mod tests {
             ImageFormat::Bmp,
             ImageFormat::Ico,
             ImageFormat::Tiff,
+            ImageFormat::Svg,
         ] {
             let mut image = image_preview();
             image.format = format;
@@ -1457,7 +1468,7 @@ mod tests {
             assert_eq!(decode_result(&encode_result(&result).unwrap()), Ok(result));
         }
 
-        for format in [ImageFormat::Gif, ImageFormat::WebP] {
+        for format in [ImageFormat::Gif, ImageFormat::WebP, ImageFormat::Svg] {
             let mut animation = image_animation_preview();
             animation.format = format;
             let result = PreviewResult::ImageAnimation(animation);

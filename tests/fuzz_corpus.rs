@@ -1,7 +1,9 @@
 use std::{fs, path::Path};
 
 use cursorpeek_core::{
-    harness::{exercise_content_sniff, exercise_layout, exercise_payload, exercise_protocol},
+    harness::{
+        exercise_content_sniff, exercise_layout, exercise_payload, exercise_protocol, exercise_svg,
+    },
     layout::MAX_PREVIEW_PAYLOAD_LEN,
 };
 
@@ -13,6 +15,7 @@ fn retained_fuzz_corpus_replays_on_the_stable_windows_build() {
     replay("payload", MAX_PREVIEW_PAYLOAD_LEN, exercise_payload);
     replay("content_sniff", 64 * 1024 + 1, exercise_content_sniff);
     replay("layout", 16, exercise_layout);
+    replay("svg", 64 * 1024, exercise_svg);
 }
 
 fn replay(target: &str, maximum_bytes: usize, exercise: fn(&[u8])) {

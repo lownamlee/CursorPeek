@@ -28,10 +28,12 @@ locality, format, or resource checks cannot be satisfied safely.
 - GIF and WebP animate only when the entire bounded upgrade fits the documented frame, pixel,
   duration, and payload limits. Otherwise the already-visible first frame remains. ICO uses a
   deterministic first image, and TIFF uses a deterministic first page.
+- SVG always uses a bounded static renderer first. A contained second-stage renderer animates a
+  supported subset of SMIL `<animate>`, `<animateTransform>`, and `<set>` documents. CSS keyframes,
+  script, external resources, embedded fonts/images, and unsupported SVG features do not animate;
+  the static visual remains. Compressed `.svgz` does not preview.
 - Text is inert plain text. CursorPeek does not render Markdown or HTML, apply syntax highlighting,
   follow links, execute scripts, or provide an editor.
-- `.svg` previews as markup source text. CursorPeek does not rasterize vector graphics, and
-  gzip-compressed `.svgz` does not preview at all.
 - Project, patch, registry, property-list, subtitle, and certificate types preview as source text
   only. Nothing is parsed or interpreted, and binary variants of those names — `bplist00` property
   lists, DER-encoded `.cer`, `.pfx`/`.p12`/`.jks` containers — fail the content check.

@@ -66,6 +66,7 @@ Eligible extensions:
 | Bitmap | `.bmp`, `.dib` | Bounded raster decode |
 | Icon | `.ico` | Uses a deterministic first-image policy |
 | TIFF | `.tif`, `.tiff` | Uses a deterministic first-page policy |
+| SVG | `.svg` | Shows a contained static render, then bounded SMIL animation when eligible |
 
 An eligible extension is only the first check. CursorPeek also validates the file signature and
 image layout. A renamed or malformed file does not become a valid image because its extension is
@@ -79,13 +80,21 @@ Current image limits:
 - decoded image bytes: 160 MiB;
 - decoder allocation: 256 MiB;
 - displayed preview bitmap: at most 960 x 720 pixels;
-- animation decode: at most 480 x 360 pixels, 32 frames, 16 MiB of pixels, and 60 seconds.
+- animation decode: at most 480 x 360 pixels, 32 frames, 16 MiB of pixels, and 60 seconds;
+- SVG source: at most 4 MiB; animated SVG: at most 480 x 360 pixels, 12 frames, and a
+  four-second sampled loop.
 
 Images are never enlarged beyond their decoded size and are fitted without changing aspect ratio.
 The popup follows the displayed image size, up to the selected maximum, with file details beneath
-the image. For GIF and WebP, CursorPeek presents the normal still preview first. A separate
+the image. For GIF, WebP, and SVG, CursorPeek presents a normal still preview first. A separate
 contained worker may replace its pixels with a complete bounded animation only while the same file,
-Explorer item, and hover generation remain active. Static WebP files do not start that worker.
+Explorer item, and hover generation remain active. Static WebP and SVG files do not start that
+worker.
+
+SVG rendering never executes script or loads external files, fonts, stylesheets, or images. The
+animation upgrade supports a bounded subset of declarative SMIL through `<animate>`,
+`<animateTransform>`, and `<set>`. Unsupported animation features, including CSS keyframe
+animation, keep the already-visible static preview. Compressed `.svgz` is not eligible.
 
 ## Supported video
 
@@ -118,7 +127,7 @@ containers fail without opening another application.
 Eligible extensions:
 
 ```text
-txt text log md markdown mdx rst adoc tex svg
+txt text log md markdown mdx rst adoc tex
 csv tsv json jsonc json5 jsonl ndjson xml plist yaml yml toml ini cfg conf config
 properties hcl tf tfvars proto graphql
 rs c h cc cpp cxx hh hpp hxx ipp inl cs vb fs java kt kts scala groovy go swift
@@ -147,11 +156,6 @@ apply, the default `auto` policy may select a supported legacy encoding. Guessed
 identified in the preview. Invalid sequences, binary-looking content, and unsupported encodings
 fail closed.
 
-`.svg` belongs to this text group, not to the image group. CursorPeek shows the SVG markup as
-source text and never rasterizes it, so no vector renderer runs, no font is resolved, and no
-referenced script, image, or stylesheet is fetched. Compressed `.svgz` is gzip rather than markup
-and is not eligible.
-
 An eligible extension never implies a parser. Project, patch, registry, subtitle, property-list,
 and certificate files are read as bytes and decoded as text; nothing in them is interpreted. Binary
 variants of these names — a `bplist00` property list, a DER-encoded `.cer`, a `.pfx` container —
@@ -159,7 +163,7 @@ fail the content check and show nothing.
 
 Text is normalized and displayed as inert plain text:
 
-- HTML, SVG, and Markdown are not rendered;
+- HTML and Markdown are not rendered;
 - scripts and terminal escape sequences are not executed;
 - unsafe control and bidirectional formatting characters are neutralized;
 - tabs are retained and hard line endings are normalized;

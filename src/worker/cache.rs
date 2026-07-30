@@ -7,7 +7,7 @@ use crate::{
 };
 use cursorpeek_core::protocol::DEFAULT_PREVIEW_CACHE_ENTRIES;
 
-use super::{image, payload::PreviewResult, text};
+use super::{image, payload::PreviewResult, svg, text};
 
 // The cache exists only for one contained worker session. The count cap follows QTTabBar's proven
 // browsing working set, while the independent byte cap prevents 128 maximum-size decoded images
@@ -18,10 +18,12 @@ const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const TEXT_PROVIDER_VERSION: u32 = 2;
 const IMAGE_PROVIDER_VERSION: u32 = 2;
 const IMAGE_ANIMATION_PROVIDER_VERSION: u32 = 1;
+const SVG_PROVIDER_VERSION: u32 = 1;
 const VIDEO_PROVIDER_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PreviewProvider {
+    Svg,
     Text,
     Image,
     ImageAnimation,
@@ -30,7 +32,9 @@ pub(super) enum PreviewProvider {
 
 impl PreviewProvider {
     pub(super) fn for_path(path: &Path) -> Option<Self> {
-        if text::is_eligible_path(path) {
+        if svg::is_eligible_path(path) {
+            Some(Self::Svg)
+        } else if text::is_eligible_path(path) {
             Some(Self::Text)
         } else if image::is_eligible_path(path) {
             Some(Self::Image)
@@ -43,6 +47,9 @@ impl PreviewProvider {
 
     fn cache_key(self, legacy_encoding: &LegacyEncoding) -> PreviewProviderKey {
         match self {
+            Self::Svg => PreviewProviderKey::Svg {
+                version: SVG_PROVIDER_VERSION,
+            },
             Self::Text => PreviewProviderKey::Text {
                 version: TEXT_PROVIDER_VERSION,
                 legacy_encoding: legacy_encoding.clone(),
@@ -62,6 +69,9 @@ impl PreviewProvider {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum PreviewProviderKey {
+    Svg {
+        version: u32,
+    },
     Text {
         version: u32,
         legacy_encoding: LegacyEncoding,
@@ -84,7 +94,8 @@ impl PreviewProviderKey {
                 legacy_encoding: LegacyEncoding::Label(label),
                 ..
             } => label.capacity(),
-            Self::Text { .. }
+            Self::Svg { .. }
+            | Self::Text { .. }
             | Self::Image { .. }
             | Self::ImageAnimation { .. }
             | Self::Video { .. } => 0,
@@ -330,11 +341,11 @@ mod tests {
     }
 
     #[test]
-    fn svg_selects_the_text_provider_instead_of_the_raster_image_decoder() {
+    fn svg_selects_only_the_contained_vector_provider() {
         for path in [r"C:\logo.svg", r"C:\logo.SVG"] {
             assert_eq!(
                 PreviewProvider::for_path(Path::new(path)),
-                Some(PreviewProvider::Text)
+                Some(PreviewProvider::Svg)
             );
         }
         assert_eq!(PreviewProvider::for_path(Path::new(r"C:\logo.svgz")), None);

@@ -644,22 +644,14 @@ fn validate_target_bounds(
     result: &PreviewResult,
 ) -> Result<(), ProtocolError> {
     match (target_bounds, result) {
-        (
-            Some(_),
-            PreviewResult::Text(_)
-            | PreviewResult::Image(_)
-            | PreviewResult::Video(_)
-            | PreviewResult::ImageAnimation(_),
-        )
-        | (None, PreviewResult::Status(_)) => Ok(()),
-        (
-            None,
-            PreviewResult::Text(_)
-            | PreviewResult::Image(_)
-            | PreviewResult::Video(_)
-            | PreviewResult::ImageAnimation(_),
-        ) => Err(ProtocolError::MissingTargetBounds),
-        (Some(_), PreviewResult::Status(_)) => Err(ProtocolError::UnexpectedTargetBounds),
+        (Some(_), PreviewResult::Text(_) | PreviewResult::Image(_) | PreviewResult::Video(_))
+        | (None, PreviewResult::Status(_) | PreviewResult::ImageAnimation(_)) => Ok(()),
+        (None, PreviewResult::Text(_) | PreviewResult::Image(_) | PreviewResult::Video(_)) => {
+            Err(ProtocolError::MissingTargetBounds)
+        }
+        (Some(_), PreviewResult::Status(_) | PreviewResult::ImageAnimation(_)) => {
+            Err(ProtocolError::UnexpectedTargetBounds)
+        }
     }
 }
 
@@ -696,8 +688,8 @@ mod tests {
         ExplorerWindowId, Generation, LegacyEncoding, PhysicalScreenPoint, PhysicalScreenRect,
         PhysicalScreenSpan,
         payload::{
-            ImageAnimationSource, ImageFormat, PayloadError, PreviewResult, ResolverStatus,
-            TextPreview,
+            ImageAnimationPreview, ImageAnimationSource, ImageFormat, PayloadError, PreviewResult,
+            ResolverStatus, TextPreview,
         },
     };
     use std::io::{self, ErrorKind, Read, Write};
@@ -767,6 +759,33 @@ mod tests {
             let encoded = encode_message(message.clone()).unwrap();
             assert_eq!(decode_frame(encoded.as_bytes()), Ok(message));
         }
+    }
+
+    #[test]
+    fn animation_upgrade_round_trips_without_target_bounds() {
+        let animation = ImageAnimationPreview {
+            file_size: 128,
+            last_write_time: 133_000_000_000_000_000,
+            format: ImageFormat::Gif,
+            source_width: 2,
+            source_height: 1,
+            width: 2,
+            height: 1,
+            truncated: false,
+            frame_delays_ms: vec![40, 60],
+            frames: vec![
+                vec![0, 0, 255, 255, 0, 0, 255, 255],
+                vec![0, 255, 0, 255, 0, 255, 0, 255],
+            ],
+        };
+        let message = WorkerMessage::PreviewResult {
+            generation: Generation::from_raw(42),
+            target_bounds: None,
+            result: PreviewResult::ImageAnimation(animation),
+        };
+
+        let encoded = encode_message(message.clone()).unwrap();
+        assert_eq!(decode_frame(encoded.as_bytes()), Ok(message));
     }
 
     #[test]

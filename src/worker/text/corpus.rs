@@ -120,15 +120,6 @@ fn corpus_cases() -> Vec<CorpusCase> {
         "safe prefix before escape \u{001b}[31mred\nbidi marker \u{202e}neutralized";
     let hostile_expected =
         "safe prefix before escape \u{fffd}[31mred\nbidi marker \u{fffd}neutralized";
-    let svg_markup = concat!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 16 16\">\n",
-        "  <title>badge · 徽章</title>\n",
-        "  <script>alert(1)</script>\n",
-        "  <image href=\"https://example.invalid/pixel.png\"/>\n",
-        "  <rect width=\"16\" height=\"16\" onload=\"alert(2)\"/>\n",
-        "</svg>\n"
-    );
     let line_limit_source = (0..=MAX_TEXT_LINES)
         .map(|line| format!("line-{line}"))
         .collect::<Vec<_>>()
@@ -224,17 +215,6 @@ fn corpus_cases() -> Vec<CorpusCase> {
             LegacyEncoding::Auto,
             "UTF-8",
             hostile_expected,
-            false,
-            false,
-        ),
-        // SVG markup is retained verbatim: no element, attribute, or external reference in it is
-        // parsed, resolved, or executed on the way to the preview.
-        preview(
-            "svg-inert-markup",
-            svg_markup.as_bytes().to_vec(),
-            LegacyEncoding::Auto,
-            "UTF-8",
-            svg_markup,
             false,
             false,
         ),

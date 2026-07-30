@@ -53,7 +53,7 @@ jobs:
             - name: Build every fuzz target
               working-directory: fuzz
               run: |
-                  for target in protocol payload content_sniff layout; do
+                  for target in protocol payload content_sniff layout svg; do
                     cargo fuzz build "$target"
                   done
 
@@ -68,6 +68,8 @@ jobs:
                     -runs=10000 -seed=424242 -max_len=65537 -timeout=5 -rss_limit_mb=768
                   cargo fuzz run layout -- \
                     -runs=10000 -seed=424242 -max_len=16 -timeout=5 -rss_limit_mb=768
+                  cargo fuzz run svg -- \
+                    -runs=10000 -seed=424242 -max_len=65536 -timeout=5 -rss_limit_mb=768
 
             - name: Upload fuzz artifacts
               if: failure()

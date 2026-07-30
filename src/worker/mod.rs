@@ -1,6 +1,7 @@
 mod cache;
 mod image;
 mod manager;
+mod svg;
 mod text;
 
 mod payload {
@@ -33,6 +34,7 @@ use cursorpeek_core::PhysicalScreenPoint;
 use cursorpeek_core::{PhysicalScreenRect, PhysicalScreenSpan};
 use image::{ImageAnimationDecodeResult, ImageDecodeResult};
 use protocol::{ProtocolStreamError, WorkerMessage};
+use svg::{SvgAnimationDecodeResult, SvgDecodeResult};
 use text::TextDecodeResult;
 
 #[cfg(test)]
@@ -364,6 +366,11 @@ fn preview_file_result(
     );
     let decode_started = diagnostics::counter();
     let result = match provider {
+        PreviewProvider::Svg => match svg::decode(file) {
+            Ok(SvgDecodeResult::Preview(preview)) => PreviewResult::Image(preview),
+            Ok(SvgDecodeResult::Unsupported) => PreviewResult::Status(ResolverStatus::Unsupported),
+            Err(_) => PreviewResult::Status(ResolverStatus::Unavailable),
+        },
         PreviewProvider::Text => match text::decode(file, legacy_encoding) {
             Ok(TextDecodeResult::Preview(preview)) => PreviewResult::Text(preview),
             Ok(TextDecodeResult::Unsupported) => PreviewResult::Status(ResolverStatus::Unsupported),
@@ -423,7 +430,7 @@ fn preview_animation_file_result(
             .and_then(|extension| extension.to_str())
             .map(|extension| extension.to_ascii_lowercase())
             .as_deref(),
-        Some("gif" | "webp")
+        Some("gif" | "webp" | "svg")
     ) {
         return PreviewResult::Status(ResolverStatus::Unsupported);
     }
@@ -459,13 +466,32 @@ fn preview_animation_file_result(
         ),
     );
     let decode_started = diagnostics::counter();
-    let result = match image::decode_animation(file) {
-        Ok(ImageAnimationDecodeResult::Preview(preview)) => PreviewResult::ImageAnimation(preview),
-        Ok(ImageAnimationDecodeResult::Unsupported) => {
-            PreviewResult::Status(ResolverStatus::Unsupported)
+    let result = if svg::is_eligible_path(file.final_path()) {
+        match svg::decode_animation(file) {
+            Ok(SvgAnimationDecodeResult::Preview(preview)) => {
+                PreviewResult::ImageAnimation(preview)
+            }
+            Ok(SvgAnimationDecodeResult::Unsupported) => {
+                PreviewResult::Status(ResolverStatus::Unsupported)
+            }
+            Err(error) if error.is_unsupported() => {
+                PreviewResult::Status(ResolverStatus::Unsupported)
+            }
+            Err(_) => PreviewResult::Status(ResolverStatus::Unavailable),
         }
-        Err(error) if error.is_unsupported() => PreviewResult::Status(ResolverStatus::Unsupported),
-        Err(_) => PreviewResult::Status(ResolverStatus::Unavailable),
+    } else {
+        match image::decode_animation(file) {
+            Ok(ImageAnimationDecodeResult::Preview(preview)) => {
+                PreviewResult::ImageAnimation(preview)
+            }
+            Ok(ImageAnimationDecodeResult::Unsupported) => {
+                PreviewResult::Status(ResolverStatus::Unsupported)
+            }
+            Err(error) if error.is_unsupported() => {
+                PreviewResult::Status(ResolverStatus::Unsupported)
+            }
+            Err(_) => PreviewResult::Status(ResolverStatus::Unavailable),
+        }
     };
     diagnostics::record(
         "worker.decode",
@@ -668,7 +694,7 @@ mod tests {
         settings::LegacyEncoding,
         worker::payload::{PreviewResult, ResolverStatus},
     };
-    use ::image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
+    use ::image::{DynamicImage, Frame, ImageFormat, Rgba, RgbaImage, codecs::gif::GifEncoder};
     use cursorpeek_core::{ExplorerWindowId, PhysicalScreenRect, PhysicalScreenSpan};
     use protocol::{SessionNonce, WorkerMessage};
     use std::{
@@ -976,6 +1002,75 @@ mod tests {
             ),
             PreviewResult::Status(ResolverStatus::Unavailable)
         );
+    }
+
+    #[test]
+    fn session_delivers_a_complete_gif_animation_upgrade() {
+        let path = env::temp_dir().join(format!(
+            "cursorpeek-animation-session-{}-{}.gif",
+            std::process::id(),
+            NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let first = Frame::new(RgbaImage::from_pixel(2, 1, Rgba([210, 10, 20, 255])));
+        let second = Frame::new(RgbaImage::from_pixel(2, 1, Rgba([20, 210, 10, 255])));
+        let mut encoded = Vec::new();
+        GifEncoder::new(&mut encoded)
+            .encode_frames([first, second])
+            .expect("the animated GIF fixture should encode");
+        fs::write(&path, encoded).expect("the animated GIF fixture should be written");
+
+        let PreviewResult::Image(still) = resolver_result(
+            ResolveOutcome::Resolved(resolved_target(path.clone())),
+            &LegacyEncoding::Auto,
+        ) else {
+            panic!("the animated GIF should produce an immediate still");
+        };
+        let source = still
+            .animation_source
+            .expect("the animated GIF still should carry its validated source");
+        let generation = Generation::from_raw(71);
+        let mut input = Vec::new();
+        protocol::write_message(
+            &mut input,
+            WorkerMessage::Hello {
+                nonce: NONCE,
+                cache_entries: protocol::DEFAULT_PREVIEW_CACHE_ENTRIES,
+                legacy_encoding: LegacyEncoding::Auto,
+            },
+        )
+        .unwrap();
+        protocol::write_message(
+            &mut input,
+            WorkerMessage::DecodeImageAnimation { generation, source },
+        )
+        .unwrap();
+
+        let mut output = Vec::new();
+        run_session(
+            &mut Cursor::new(input),
+            &mut output,
+            &mut UnavailableResolver,
+        )
+        .expect("the worker session should encode the animation response");
+        let mut output = output.as_slice();
+        assert_eq!(
+            protocol::read_message(&mut output).unwrap(),
+            Some(WorkerMessage::Ready { nonce: NONCE })
+        );
+        let Some(WorkerMessage::PreviewResult {
+            generation: delivered_generation,
+            target_bounds: None,
+            result: PreviewResult::ImageAnimation(animation),
+        }) = protocol::read_message(&mut output).unwrap()
+        else {
+            panic!("the worker should deliver a rectangle-free animation upgrade");
+        };
+        assert_eq!(delivered_generation, generation);
+        assert_eq!(animation.frames.len(), 2);
+        assert_ne!(animation.frames[0], animation.frames[1]);
+        assert_eq!(protocol::read_message(&mut output).unwrap(), None);
+
+        fs::remove_file(path).expect("the animated GIF fixture should be removed");
     }
 
     #[test]

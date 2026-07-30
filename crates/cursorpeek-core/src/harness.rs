@@ -10,6 +10,7 @@ use crate::{
     payload::{decode_result, encode_result},
     protocol::{read_message, write_message},
     sniff::{classify_text_prefix, sniff_image_format},
+    svg,
 };
 
 pub fn exercise_protocol(data: &[u8]) {
@@ -96,6 +97,25 @@ pub fn exercise_layout(data: &[u8]) {
     }
 }
 
+pub fn exercise_svg(data: &[u8]) {
+    let Ok(source) = std::str::from_utf8(data) else {
+        return;
+    };
+    let animation = svg::is_animated(source);
+    let Ok(rendered) = svg::render(source) else {
+        return;
+    };
+
+    assert_eq!(animation, Ok(rendered.animated));
+    assert!(!rendered.frames.is_empty());
+    assert!(rendered.frames.len() <= svg::MAX_VECTOR_FRAMES as usize);
+    for frame in &rendered.frames {
+        let (_, expected) = checked_bgra_layout(rendered.width, rendered.height)
+            .expect("an accepted SVG frame must retain a valid bounded layout");
+        assert_eq!(frame.len(), expected);
+    }
+}
+
 fn little_endian_u32(data: &[u8], offset: usize) -> u32 {
     let mut bytes = [0_u8; 4];
     if let Some(available) = data.get(offset..) {
@@ -119,7 +139,9 @@ fn check_fitted_layout(source_width: u32, source_height: u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{exercise_content_sniff, exercise_layout, exercise_payload, exercise_protocol};
+    use super::{
+        exercise_content_sniff, exercise_layout, exercise_payload, exercise_protocol, exercise_svg,
+    };
     use crate::{
         Generation, LegacyEncoding,
         payload::{PreviewResult, ResolverStatus, encode_result},
@@ -151,6 +173,11 @@ mod tests {
                 0x80, 0x07, 0, 0, 0x38, 0x04, 0, 0, 0xff, 0xff, 0xff, 0xff, 1, 0, 0, 0,
             ][..],
         );
+        exercise_svg(
+            b"<svg viewBox='0 0 16 16'><rect width='16' height='16'>\
+              <animate attributeName='x' values='0;1' dur='100ms'/></rect></svg>",
+        );
+        exercise_svg(b"<svg><script>unsafe()</script>");
 
         let mut result_frame = Vec::new();
         write_message(

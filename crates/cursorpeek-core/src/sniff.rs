@@ -9,6 +9,7 @@ const NULL_PATTERN_SAMPLE_LIMIT: usize = 4 * 1024;
 pub const IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "jpe", "jfif", "png", "gif", "webp", "bmp", "dib", "ico", "tif", "tiff",
 ];
+pub const VECTOR_EXTENSIONS: &[&str] = &["svg"];
 pub const VIDEO_EXTENSIONS: &[&str] = &[
     "mp4", "m4v", "mov", "mp4v", "3g2", "3gp", "3gp2", "3gpp", "avi", "asf", "wmv",
 ];
@@ -35,9 +36,6 @@ pub const TEXT_EXTENSIONS: &[&str] = &[
     "rst",
     "adoc",
     "tex",
-    // SVG is XML markup. The text provider previews it as inert source rather than rasterizing it,
-    // so no vector renderer, font lookup, or external reference handling enters the worker.
-    "svg",
     // Data and configuration
     "csv",
     "tsv",
@@ -228,6 +226,16 @@ pub fn is_text_eligible_path(path: &Path) -> bool {
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| {
             TEXT_EXTENSIONS
+                .iter()
+                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+        })
+}
+
+pub fn is_vector_eligible_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            VECTOR_EXTENSIONS
                 .iter()
                 .any(|candidate| extension.eq_ignore_ascii_case(candidate))
         })
@@ -477,7 +485,7 @@ mod tests {
     use super::{
         IMAGE_EXTENSIONS, TEXT_EXTENSIONS, TEXT_NAMES, TextByteKind, VIDEO_EXTENSIONS,
         classify_text_prefix, is_image_eligible_path, is_text_eligible_path,
-        is_video_eligible_path, sniff_image_format, sniff_video_container,
+        is_vector_eligible_path, is_video_eligible_path, sniff_image_format, sniff_video_container,
     };
     use crate::payload::{ImageFormat, VideoContainer};
 
@@ -617,12 +625,14 @@ mod tests {
     }
 
     #[test]
-    fn svg_markup_is_text_eligible_and_never_image_eligible() {
+    fn svg_is_visual_only_and_never_claimed_as_plain_text() {
         for path in ["logo.svg", "logo.SVG"] {
-            assert!(is_text_eligible_path(Path::new(path)));
+            assert!(is_vector_eligible_path(Path::new(path)));
+            assert!(!is_text_eligible_path(Path::new(path)));
             assert!(!is_image_eligible_path(Path::new(path)));
         }
-        // Compressed SVG is gzip, not markup, and stays outside both providers.
+        // Compressed SVG is gzip, not markup, and stays outside every provider.
+        assert!(!is_vector_eligible_path(Path::new("logo.svgz")));
         assert!(!is_text_eligible_path(Path::new("logo.svgz")));
         assert!(!is_image_eligible_path(Path::new("logo.svgz")));
     }

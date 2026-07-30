@@ -4,6 +4,22 @@ This file records user-visible changes to CursorPeek. Release dates are added on
 
 ## Unreleased
 
+### Added
+
+- Preview self-contained `.svg` files as bounded visuals, with a performance-first static render
+  followed by a contained animation upgrade for supported SMIL documents.
+
+### Fixed
+
+- Deliver decoded GIF and animated WebP frame sets through the worker protocol instead of
+  discarding the animation upgrade and leaving only the first frame visible.
+- Reserve `.svg` for the visual provider so unsupported markup no longer appears as plain text.
+
+### Security
+
+- Disable SVG filesystem and network resource resolution, system-font discovery, scripts, event
+  handlers, entities, and external references in the visual and animation paths.
+
 ## [0.3.0] - 2026-07-30
 
 This release adds native hover video playback and substantially broadens source-text preview coverage.

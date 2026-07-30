@@ -503,38 +503,18 @@ mod tests {
     }
 
     #[test]
-    fn svg_files_preview_as_inert_markup_text() {
+    fn svg_files_are_reserved_for_the_visual_provider() {
         let root = TestDirectory::new("svg");
-        let markup = concat!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
-            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 16 16\">\n",
-            "  <title>badge · 徽章</title>\n",
-            "  <script>alert(1)</script>\n",
-            "  <rect width=\"16\" height=\"16\" onload=\"alert(2)\"/>\n",
-            "</svg>\n"
-        );
+        let markup = "<svg viewBox=\"0 0 16 16\"><rect width=\"16\" height=\"16\"/></svg>";
         let path = root.path().join("logo.svg");
         fs::write(&path, markup).unwrap();
         let file = PreviewFile::open(&path).unwrap();
 
-        let TextDecodeResult::Preview(preview) = decode(&file, &LegacyEncoding::Auto).unwrap()
-        else {
-            panic!("an SVG file should produce a text preview");
-        };
-        assert_eq!(preview.text, markup);
-        assert_eq!(preview.encoding, "UTF-8");
-        assert!(!preview.truncated);
-        assert!(!preview.encoding_was_guessed);
-
-        // The extension is only the first check: gzip-compressed markup carrying an `.svg` name
-        // still fails the content check, and `.svgz` is not eligible at all.
-        let disguised_path = root.path().join("compressed.svg");
-        fs::write(&disguised_path, b"\x1f\x8b\x08\x00\x00\x00\x00\x00<svg").unwrap();
-        let disguised = PreviewFile::open(&disguised_path).unwrap();
         assert_eq!(
-            decode(&disguised, &LegacyEncoding::Auto).unwrap(),
+            decode(&file, &LegacyEncoding::Auto).unwrap(),
             TextDecodeResult::Unsupported
         );
+        assert!(!is_eligible_path(Path::new(r"C:\logo.svg")));
         assert!(!is_eligible_path(Path::new(r"C:\logo.svgz")));
     }
 

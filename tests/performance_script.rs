@@ -38,7 +38,7 @@ fn performance_gate_rejects_an_oversized_executable_before_launch() {
     let executable = fixture.path().join("CursorPeek.exe");
     File::create(&executable)
         .expect("the oversized executable fixture should be created")
-        .set_len((2 * 1024 * 1024) + 1)
+        .set_len((4 * 1024 * 1024) + 1)
         .expect("the oversized executable fixture should be extended");
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tools")
