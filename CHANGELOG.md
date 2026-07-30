@@ -4,6 +4,11 @@ This file records user-visible changes to CursorPeek. Release dates are added on
 
 ## Unreleased
 
+## [0.4.0] - 2026-07-30
+
+This release adds contained visual and animated SVG previews and restores animated GIF and WebP
+upgrades.
+
 ### Added
 
 - Preview self-contained `.svg` files as bounded visuals, with a performance-first static render
@@ -129,6 +134,7 @@ This patch release restores the notification-area menu when CursorPeek is right-
 
 Version 0.1 is intentionally narrow. See [Known limitations](docs/KNOWN_LIMITATIONS.md) before installing or running this release.
 
+[0.4.0]: https://github.com/lownamlee/CursorPeek/releases/tag/v0.4.0
 [0.3.0]: https://github.com/lownamlee/CursorPeek/releases/tag/v0.3.0
 [0.2.2]: https://github.com/lownamlee/CursorPeek/releases/tag/v0.2.2
 [0.2.1]: https://github.com/lownamlee/CursorPeek/releases/tag/v0.2.1

@@ -77,7 +77,7 @@ Requires Windows 10 22H2 x64 or supported Windows 11 x64 with Windows File Explo
 <table>
   <tr>
     <td align="center" width="50%">
-      <a href="https://github.com/lownamlee/CursorPeek/releases/latest/download/CursorPeek-0.3.0-windows-x64-setup.exe">
+      <a href="https://github.com/lownamlee/CursorPeek/releases/latest/download/CursorPeek-0.4.0-windows-x64-setup.exe">
         <img
           alt="Download the CursorPeek installer"
           src="assets/readme/CursorPeek_download_installer.png"
@@ -89,7 +89,7 @@ Requires Windows 10 22H2 x64 or supported Windows 11 x64 with Windows File Explo
       <br />
       <sub>Recommended · installs without administrator elevation</sub>
       <br /><br />
-      <a href="https://github.com/lownamlee/CursorPeek/releases/latest/download/CursorPeek-0.3.0-windows-x64-setup.exe">
+      <a href="https://github.com/lownamlee/CursorPeek/releases/latest/download/CursorPeek-0.4.0-windows-x64-setup.exe">
         <img
           alt="Download the CursorPeek installer"
           src="https://img.shields.io/badge/-Download-2563eb?style=for-the-badge"
@@ -97,7 +97,7 @@ Requires Windows 10 22H2 x64 or supported Windows 11 x64 with Windows File Explo
       </a>
     </td>
     <td align="center" width="50%">
-      <a href="https://github.com/lownamlee/CursorPeek/releases/latest/download/CursorPeek-0.3.0-windows-x64-portable.zip">
+      <a href="https://github.com/lownamlee/CursorPeek/releases/latest/download/CursorPeek-0.4.0-windows-x64-portable.zip">
         <img
           alt="Download the CursorPeek portable ZIP"
           src="assets/readme/CursorPeek_download_portable.png"
@@ -109,7 +109,7 @@ Requires Windows 10 22H2 x64 or supported Windows 11 x64 with Windows File Explo
       <br />
       <sub>Extract the archive and run CursorPeek.exe</sub>
       <br /><br />
-      <a href="https://github.com/lownamlee/CursorPeek/releases/latest/download/CursorPeek-0.3.0-windows-x64-portable.zip">
+      <a href="https://github.com/lownamlee/CursorPeek/releases/latest/download/CursorPeek-0.4.0-windows-x64-portable.zip">
         <img
           alt="Download the CursorPeek portable ZIP"
           src="https://img.shields.io/badge/-Download-2563eb?style=for-the-badge"

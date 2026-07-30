@@ -89,8 +89,8 @@ mod tests {
     #[test]
     fn redirected_messages_have_exactly_one_trailing_newline() {
         let mut line = Vec::new();
-        assert!(write_message(&mut line, "CursorPeek 0.3.0"));
-        assert_eq!(line, b"CursorPeek 0.3.0\n");
+        assert!(write_message(&mut line, "CursorPeek 0.4.0"));
+        assert_eq!(line, b"CursorPeek 0.4.0\n");
 
         let mut help = Vec::new();
         assert!(write_message(&mut help, "Usage:\n"));
